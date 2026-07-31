@@ -277,6 +277,8 @@
     viewer.addHandler("open", onViewerOpen);
     // 底图随平移/缩放实时跟随（animation 每帧触发，跟随最平滑）
     viewer.addHandler("animation", function () { syncBaseThumb(); redrawAnnoCanvas(); });
+    // 动画结束补画文本（标签/气泡）：动画期间为流畅省略了文本绘制
+    viewer.addHandler("animation-finish", function () { redrawAnnoCanvas(); });
     viewer.addHandler("rotate", function () { syncBaseThumb(); redrawAnnoCanvas(); });
     // 镜像翻转：OSD 'flip' 事件 → 同步底图 transform / 重绘标注画布 / ROI 框重对位
     viewer.addHandler("flip", function () {
@@ -1468,11 +1470,17 @@
     annoCtx.clearRect(0, 0, rect.width, rect.height);
     if (!state.showAnno && state.drawMode == null) return;
     if (!state.slide) return;
+    // 性能：缩放/平移动画期间省略文本（标签/气泡）只画矢量，
+    // 动画结束（animation-finish）再补全，避免每帧逐条 measureText/fillText
+    var animating = !!(viewer && viewer.viewport &&
+      typeof viewer.viewport.isAnimating === "function" && viewer.viewport.isAnimating());
+    // 拖动编辑中只保留选中项的气泡，其余气泡暂停（视图静止时减少文本重绘）
+    var dragging = !!(editDrag && editItem);
     // 已保存标注
     if (state.showAnno) {
       flatAnnoItems().forEach(function (it) {
         var selected = (editItem === it);
-        drawAnnoItem(it, labelColor(it.label), selected);
+        drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
     // 编辑手柄
@@ -1486,9 +1494,10 @@
     if (state.drawMode === "freehand" && drawPreview && drawPreview.type === "freehand" && drawPreview.points.length >= 2) {
       drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, "预览");
     }
-    // 备注气泡
-    if (state.showAnno) {
+    // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简）
+    if (state.showAnno && !animating) {
       flatAnnoItems().forEach(function (it) {
+        if (dragging && it !== editItem) return; // 拖动中只画选中项气泡
         var note = String(it.note || "");
         if (!note) return;
         var selected = (editItem === it);
@@ -1516,9 +1525,10 @@
     });
   }
 
-  function drawAnnoItem(it, color, selected) {
+  function drawAnnoItem(it, color, selected, showText) {
     var typ = it.type || "rect";
     var hlStroke = selected ? "#007AFF" : null;
+    var lbl = showText ? it.label : null;
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
       var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
@@ -1537,11 +1547,11 @@
       [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(function (p) {
         annoCtx.beginPath(); annoCtx.arc(p[0], p[1], 3, 0, Math.PI * 2); annoCtx.fill();
       });
-      drawLabel(it.label, x, y, it.size_mm != null ? (it.size_mm + "mm") : "");
+      if (lbl) drawLabel(it.label, x, y, it.size_mm != null ? (it.size_mm + "mm") : "");
     } else if (typ === "arrow") {
-      drawArrow(it.x1, it.y1, it.x2, it.y2, hlStroke || color.stroke, it.label);
+      drawArrow(it.x1, it.y1, it.x2, it.y2, hlStroke || color.stroke, lbl);
     } else if (typ === "freehand") {
-      drawFreehand(it.points, { fill: color.fill, stroke: hlStroke || color.stroke }, it.label);
+      drawFreehand(it.points, { fill: color.fill, stroke: hlStroke || color.stroke }, lbl);
     }
   }
 
@@ -1607,8 +1617,34 @@
   }
 
   // ---------- 备注气泡（macOS callout 风格，与 share.js 一致） ----------
+  var BUBBLE_FONT = "12px " + "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+  // 布局缓存：note 文本 → {lines, boxW, boxH}（font/maxWidth 固定，布局与视图无关，
+  // 避免每帧逐字符 measureText——标注多时这是动画卡顿的主因）
+  var _bubbleLayoutCache = {};
+  function bubbleLayout(note) {
+    var hit = _bubbleLayoutCache[note];
+    if (hit) return hit;
+    annoCtx.font = BUBBLE_FONT;
+    var maxWidth = 240;
+    var lines = wrapText(note, maxWidth);
+    var padX = 8, padY = 6, lineH = 15;
+    var textW = 0;
+    lines.forEach(function (ln) {
+      var w = annoCtx.measureText(ln).width;
+      if (w > textW) textW = w;
+    });
+    var out = {
+      lines: lines,
+      boxW: Math.min(maxWidth, Math.max(20, textW)) + padX * 2,
+      boxH: lines.length * lineH + padY * 2,
+    };
+    if (Object.keys(_bubbleLayoutCache).length > 300) _bubbleLayoutCache = {};
+    _bubbleLayoutCache[note] = out;
+    return out;
+  }
+
   function wrapText(text, maxWidth) {
-    annoCtx.font = "12px " + "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+    annoCtx.font = BUBBLE_FONT;
     var lines = [];
     String(text).split("\n").forEach(function (para) {
       if (para === "") { lines.push(""); return; }
@@ -1665,18 +1701,11 @@
     var c = els.annoCanvas;
     var canvasW = c.clientWidth, canvasH = c.clientHeight;
 
-    annoCtx.font = "12px " + "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
-    var maxWidth = 240;
-    var lines = wrapText(note, maxWidth);
-    var padX = 8, padY = 6;
-    var lineH = 15;
-    var textW = 0;
-    lines.forEach(function (ln) {
-      var w = annoCtx.measureText(ln).width;
-      if (w > textW) textW = w;
-    });
-    var boxW = Math.min(maxWidth, Math.max(20, textW)) + padX * 2;
-    var boxH = lines.length * lineH + padY * 2;
+    // 布局走缓存（避免每帧逐字符 measureText）
+    var layout = bubbleLayout(note);
+    var lines = layout.lines;
+    var boxW = layout.boxW, boxH = layout.boxH;
+    var padX = 8, padY = 6, lineH = 15;
 
     var cx = anchor.x;
     var above = true;
