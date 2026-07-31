@@ -7,3 +7,4 @@ tifffile==2024.5.22
 zarr>=2.18,<3
 imagecodecs
 numpy
+gunicorn

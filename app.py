@@ -30,11 +30,10 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-import openslide
 from openslide import OpenSlide
-from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
+import slide_cache
 import slide_io
 
 app = Flask(__name__)
@@ -78,26 +77,48 @@ def _data_dir_for_secret() -> Path:
 
 
 def _load_or_create_secret_key() -> str:
-    """优先用 SECRET_KEY env；否则在数据目录下持久化随机 secret（0600）。"""
+    """优先用 SECRET_KEY env；否则在数据目录下持久化随机 secret（0600）。
+
+    gunicorn 多 worker（-w N、不 preload）时各 worker 独立 import 本模块，
+    若不加锁会在「文件不存在」窗口各自生成不同 secret，导致 session 跨 worker
+    失效（反复跳登录）。故用 fcntl 排他锁包裹「检查+生成+写」，保证并发首次
+    生成时只写一次、其余 worker 读到同一 key。
+    """
     env_key = os.environ.get("SECRET_KEY")
     if env_key:
         return env_key
     data_dir = _data_dir_for_secret()
     data_dir.mkdir(parents=True, exist_ok=True)
     secret_file = data_dir / "flask_secret.key"
-    if secret_file.is_file():
+
+    def _read_or_create_locked():
+        """持排他锁内：双检文件，不存在才生成写入。"""
+        if secret_file.is_file():
+            try:
+                return secret_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+        key = secrets.token_hex(32)
+        secret_file.write_text(key, encoding="utf-8")
         try:
-            return secret_file.read_text(encoding="utf-8").strip()
+            os.chmod(secret_file, 0o600)
         except OSError:
             pass
-    key = secrets.token_hex(32)
-    # 0600 权限写入（先写再收紧权限）
-    secret_file.write_text(key, encoding="utf-8")
+        return key
+
     try:
-        os.chmod(secret_file, 0o600)
-    except OSError:
-        pass
-    return key
+        import fcntl  # POSIX（Linux/macOS）；gunicorn 多 worker 跨进程互斥
+
+        lock_file = data_dir / "flask_secret.lock"
+        with open(lock_file, "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                return _read_or_create_locked()
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        # 极少数无 fcntl 的平台：退回无锁逻辑（单 worker 仍正确）
+        return _read_or_create_locked()
 
 
 app.secret_key = _load_or_create_secret_key()
@@ -164,9 +185,8 @@ JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY") or 82)
 TILE_SIZE = DZ_TILE_SIZE
 OVERLAP = DZ_OVERLAP
 
-# OpenSlide 对象缓存：name -> {"osr": OpenSlide, "dz": DeepZoomGenerator, "lock": Lock}
-_slide_cache: dict = {}
-_cache_lock = threading.Lock()
+# 切片句柄池与元数据缓存已抽到 slide_cache.py（app.py 与 share_server.py 共享，
+# 各自进程独立的池与缓存）
 
 # 瓦片内存缓存（LRU）：大切片瓦片生成是 CPU 密集操作（解压+编码），
 # 缓存后平移/缩放往返时秒出，显著减少画面割裂。key=(name, level, x, y)，value=JPEG bytes
@@ -246,46 +266,18 @@ def _safe_name(name: str) -> str:
 
 
 def _get_slide(name: str):
-    """从缓存获取（或打开）OpenSlide 与 DeepZoomGenerator，返回字典。"""
-    with _cache_lock:
-        entry = _slide_cache.get(name)
-        if entry is not None:
-            return entry
+    """从缓存获取（或创建）切片的句柄池 entry。
 
-    # 缓存未命中：打开（不在全局锁内，避免阻塞其他切片）
+    打开是惰性的，真正的 slide_io.open_slide 在首次 borrow_pair 时发生；
+    多路并发读取同一切片由句柄池（SLIDE_HANDLE_POOL）保证并行。
+    """
     safe = _safe_name(name)
-    path = UPLOAD_DIR / safe
-    try:
-        osr = slide_io.open_slide(path)
-    except Exception:
-        abort(400, jsonify(error="无法打开切片文件"))
-
-    dz = DeepZoomGenerator(
-        osr, tile_size=DZ_TILE_SIZE, overlap=DZ_OVERLAP, limit_bounds=True
-    )
-    entry = {"osr": osr, "dz": dz, "lock": threading.Lock()}
-    with _cache_lock:
-        # 若并发打开了同一文件，保留先入者
-        existing = _slide_cache.get(name)
-        if existing is not None:
-            try:
-                osr.close()
-            except Exception:
-                pass
-            return existing
-        _slide_cache[name] = entry
-    return entry
+    return slide_cache.get_slide(safe, UPLOAD_DIR / safe)
 
 
 def _close_slide(name: str) -> None:
-    """关闭并移除缓存中的切片句柄，同时清掉其瓦片缓存。"""
-    with _cache_lock:
-        entry = _slide_cache.pop(name, None)
-    if entry is not None:
-        try:
-            entry["osr"].close()
-        except Exception:
-            pass
+    """关闭并移除缓存中的切片句柄池，同时清掉其瓦片缓存。"""
+    slide_cache.evict(name)
     _tile_cache_purge(name)
 
 
@@ -381,15 +373,20 @@ def _read_metadata(osr: OpenSlide, path: Path) -> dict:
 def _slide_info_dict(name: str) -> dict:
     """构建单个切片的元数据字典（用于列表与 info 接口）。
 
-    附加 alias/note（来自 slide_meta，无则空串）。
+    meta 部分（尺寸/mpp，需打开切片读取）走 mtime 感知缓存避免重复打开；
+    alias/note（来自 slide_meta，可独立于文件修改）每次现查并合并。
     """
     safe = _safe_name(name)
     path = UPLOAD_DIR / safe
     base = {"name": safe, "size_bytes": path.stat().st_size}
-    try:
+
+    def _read_meta():
         entry = _get_slide(safe)
-        with entry["lock"]:
-            meta = _read_metadata(entry["osr"], path)
+        with slide_cache.borrow_pair(entry) as pair:
+            return _read_metadata(pair["osr"], path)
+
+    try:
+        meta = slide_cache.cached_read_metadata(safe, path, _read_meta)
     except Exception as e:
         base.update(
             {
@@ -755,8 +752,8 @@ def api_slide_dzi(name):
     """手工生成 Deep Zoom XML。"""
     safe = _safe_name(name)
     entry = _get_slide(safe)
-    with entry["lock"]:
-        dz = entry["dz"]
+    with slide_cache.borrow_pair(entry) as pair:
+        dz = pair["dz"]
         # DZI Size 取最高层（level_count-1）尺寸
         width, height = dz.level_dimensions[-1]
 
@@ -776,7 +773,7 @@ def api_slide_dzi(name):
 
 @app.route("/api/slide/<name>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def api_slide_tile(name, level, x, y):
-    """返回 Deep Zoom 单张瓦片 JPEG（512×512、渐进式、q82，带 LRU 缓存）。"""
+    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU 缓存）。"""
     safe = _safe_name(name)
 
     key = (safe, level, x, y)
@@ -785,21 +782,20 @@ def api_slide_tile(name, level, x, y):
         buf = io.BytesIO(cached)
     else:
         entry = _get_slide(safe)
-        with entry["lock"]:
-            dz = entry["dz"]
+        with slide_cache.borrow_pair(entry) as pair:
+            dz = pair["dz"]
             tile = dz.get_tile(level, (x, y))
 
         # 含 alpha 通道时先转 RGB（JPEG 不支持透明度）
         if tile.mode != "RGB":
             tile = tile.convert("RGB")
         buf = io.BytesIO()
-        # 渐进式 JPEG：浏览器可在下载中途显示模糊→清晰的瓦片，便于慢网预览
+        # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
+        # 模糊→清晰的渐进预览已由切片页 base-thumb 底图层负责，瓦片无需 progressive
         tile.save(
             buf,
             format="JPEG",
             quality=JPEG_QUALITY,
-            progressive=True,
-            optimize=True,
         )
         _tile_cache_put(key, buf.getvalue())
         buf.seek(0)
@@ -830,8 +826,8 @@ def api_slide_crop(name):
     if x < 0 or y < 0 or size <= 0 or size > 40000:
         return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
 
-    with entry["lock"]:
-        osr = entry["osr"]
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
         width, height = osr.dimensions
         # clamp 到图像边界
         x2 = min(x, max(0, width - 1))
@@ -862,8 +858,8 @@ def api_slide_thumbnail(name):
     """返回缩略图 JPEG。"""
     safe = _safe_name(name)
     entry = _get_slide(safe)
-    with entry["lock"]:
-        osr = entry["osr"]
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
         thumb = osr.get_thumbnail((400, 400))
     if thumb.mode != "RGB":
         thumb = thumb.convert("RGB")

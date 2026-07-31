@@ -26,11 +26,10 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-import openslide
 from openslide import OpenSlide
-from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
+import slide_cache
 import slide_io
 
 app = Flask(__name__)
@@ -52,10 +51,7 @@ JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY") or 82)
 TILE_SIZE = DZ_TILE_SIZE
 OVERLAP = DZ_OVERLAP
 
-# OpenSlide 缓存（独立进程，与主应用各自的缓存）
-_slide_cache: dict = {}
-_cache_lock = threading.Lock()
-
+# 切片句柄池与元数据缓存（与主应用共享 slide_cache 抽象，进程独立）
 # 瓦片内存缓存（LRU + TTL）：key=(name, level, x, y)，value=(ts, JPEG bytes)
 # 分享端只读，但切片可能被管理端删除后同名重传，加 TTL 兜底避免长期服务旧图
 TILE_CACHE_MAX = int(os.environ.get("TILE_CACHE_MAX") or 3000)
@@ -108,34 +104,11 @@ def _sanitize_name(name: str) -> str:
 
 
 def _get_slide(name: str):
-    """从缓存获取（或打开）OpenSlide 与 DeepZoomGenerator，返回字典。"""
-    with _cache_lock:
-        entry = _slide_cache.get(name)
-        if entry is not None:
-            return entry
-
+    """从缓存获取（或创建）切片的句柄池 entry（惰性打开，见 slide_cache）。"""
     path = UPLOAD_DIR / name
     if not path.is_file():
         abort(404, "切片不存在")
-    try:
-        osr = slide_io.open_slide(path)
-    except Exception:
-        abort(400, "无法打开切片文件")
-
-    dz = DeepZoomGenerator(
-        osr, tile_size=DZ_TILE_SIZE, overlap=DZ_OVERLAP, limit_bounds=True
-    )
-    entry = {"osr": osr, "dz": dz, "lock": threading.Lock()}
-    with _cache_lock:
-        existing = _slide_cache.get(name)
-        if existing is not None:
-            try:
-                osr.close()
-            except Exception:
-                pass
-            return existing
-        _slide_cache[name] = entry
-    return entry
+    return slide_cache.get_slide(name, path)
 
 
 def _to_float(v):
@@ -283,10 +256,12 @@ def share_slides(token):
         info["alias"] = sm.get("alias", "")
         info["note"] = sm.get("note", "")
         if path.is_file():
-            try:
+            def _read_meta():
                 entry = _get_slide(safe)
-                with entry["lock"]:
-                    meta = _read_metadata(entry["osr"], path)
+                with slide_cache.borrow_pair(entry) as pair:
+                    return _read_metadata(pair["osr"], path)
+            try:
+                meta = slide_cache.cached_read_metadata(safe, path, _read_meta)
                 info.update(meta)
             except Exception as e:
                 info.update({
@@ -322,8 +297,8 @@ def share_slide_dzi(token, name):
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
-    with entry["lock"]:
-        dz = entry["dz"]
+    with slide_cache.borrow_pair(entry) as pair:
+        dz = pair["dz"]
         width, height = dz.level_dimensions[-1]
 
     xml = (
@@ -342,7 +317,7 @@ def share_slide_dzi(token, name):
 
 @app.route("/s/<token>/api/slide/<name>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def share_slide_tile(token, name, level, x, y):
-    """返回 Deep Zoom 单张瓦片 JPEG（512×512、渐进式、q82，带 LRU+TTL 缓存）。"""
+    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU+TTL 缓存）。"""
     share = _require_share(token)
     safe = _require_slide(share, name)
 
@@ -352,21 +327,20 @@ def share_slide_tile(token, name, level, x, y):
         buf = io.BytesIO(cached)
     else:
         entry = _get_slide(safe)
-        with entry["lock"]:
-            dz = entry["dz"]
+        with slide_cache.borrow_pair(entry) as pair:
+            dz = pair["dz"]
             tile = dz.get_tile(level, (x, y))
 
         # 含 alpha 通道时先转 RGB（JPEG 不支持透明度）
         if tile.mode != "RGB":
             tile = tile.convert("RGB")
         buf = io.BytesIO()
-        # 渐进式 JPEG：浏览器可在下载中途显示模糊→清晰的瓦片，便于慢网预览
+        # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
+        # 模糊→清晰的渐进预览已由查看器 base-thumb 底图层负责，瓦片无需 progressive
         tile.save(
             buf,
             format="JPEG",
             quality=JPEG_QUALITY,
-            progressive=True,
-            optimize=True,
         )
         _tile_cache_put(key, buf.getvalue())
         buf.seek(0)
@@ -397,8 +371,8 @@ def share_slide_crop(token, name):
     if x < 0 or y < 0 or size <= 0 or size > 40000:
         return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
 
-    with entry["lock"]:
-        osr = entry["osr"]
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
         width, height = osr.dimensions
         x2 = min(x, max(0, width - 1))
         y2 = min(y, max(0, height - 1))
@@ -429,8 +403,8 @@ def share_slide_thumbnail(token, name):
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
-    with entry["lock"]:
-        osr = entry["osr"]
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
         thumb = osr.get_thumbnail((400, 400))
     if thumb.mode != "RGB":
         thumb = thumb.convert("RGB")
@@ -565,21 +539,29 @@ def share_static(filename):
     return send_from_directory("static", filename)
 
 
+# --------------------------------------------------------------------------- #
+# 合并 WSGI 应用（模块级，供 gunicorn 直接引用 share_server:combined_app）
+# --------------------------------------------------------------------------- #
+# 同一端口按路径分流：
+# /s/...（含 /s/<token>/ 全部分享路由）→ 分享应用；
+# 其余（/、/login、/api/*、/static/*）→ 管理端应用（开启 ADMIN_PASSWORD
+# 后需登录），实现"同端口不同页面"：外网访问 18767 时，进 / 是管理员登录
+# 门户，进 /s/<token> 是正常分享页。这样 frp 不需要为管理端另开隧道，
+# 复用既有分享隧道即可。
+# import app 会触发 app.py 模块级代码，可接受——两者本就要在 gunicorn
+# 线程 worker 下共存（app 也作为 WSGI 对象被 gunicorn 引用）。
+import app as admin_app
+
+
+def combined_app(environ, start_response):
+    path = environ.get("PATH_INFO") or ""
+    if path == "/s" or path.startswith("/s/"):
+        return app(environ, start_response)  # 分享应用
+    return admin_app.app(environ, start_response)  # 管理端应用
+
+
 if __name__ == "__main__":
-    # 合并管理端门户：同一端口按路径分流。
-    # /s/...（含 /s/<token>/ 全部分享路由）→ 分享应用；
-    # 其余（/、/login、/api/*、/static/*）→ 管理端应用（开启 ADMIN_PASSWORD
-    # 后需登录），实现"同端口不同页面"：外网访问 18767 时，
-    # 进 / 是管理员登录门户，进 /s/<token> 是正常分享页。
-    # 这样 frp 不需要为管理端另开隧道，复用既有分享隧道即可。
-    import app as admin_app
-
-    def _combined_app(environ, start_response):
-        path = environ.get("PATH_INFO") or ""
-        if path == "/s" or path.startswith("/s/"):
-            return app(environ, start_response)  # 分享应用
-        return admin_app.app(environ, start_response)  # 管理端应用
-
+    # 本地开发 fallback（生产由 Containerfile 直接调 gunicorn，不走 __main__）：
     # HTTPS：提供 SHARE_TLS_CERT / SHARE_TLS_KEY 时直接以 TLS 运行
     # （frp TCP 隧道只是转发，TLS 需在本服务终止，避免被备案系统按 HTTP 拦截）
     tls_cert = os.environ.get("SHARE_TLS_CERT")
@@ -596,7 +578,7 @@ if __name__ == "__main__":
     run_simple(
         "0.0.0.0",
         int(os.environ.get("SHARE_PORT", 38000)),
-        _combined_app,
+        combined_app,
         threaded=True,
         ssl_context=ssl_context,
     )
