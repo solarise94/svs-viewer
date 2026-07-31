@@ -882,6 +882,8 @@ def annotations_by_slide():
             grp["count"] += 1
             item = {
                 "token": r.get("token"),
+                # slide 字段也带上：前端按 token+slide+ts 定位 index 时需要
+                "slide": r.get("slide"),
                 "type": r.get("type", "rect"),  # 旧数据无 type 视为 rect
                 "x": r.get("x"),
                 "y": r.get("y"),

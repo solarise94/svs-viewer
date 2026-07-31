@@ -2295,6 +2295,8 @@
   function resolveAnnoIndex(it) {
     var token = it.token;
     if (!token) return Promise.reject(new Error("缺少 token"));
+    // annotations 接口的条目可能不带 slide（旧数据），用当前切片名兜底
+    var slideName = it.slide || (state.slide ? state.slide.name : null);
     return apiFetch("/api/share/rois")
       .then(function (r) { return r.json(); })
       .then(function (rois) {
@@ -2303,12 +2305,12 @@
         var match = null;
         for (var i = 0; i < cands.length; i++) {
           var r = cands[i];
-          if (r.slide === it.slide && Number(r.ts) === Number(it.ts)) { match = r; break; }
+          if (r.slide === slideName && Number(r.ts) === Number(it.ts)) { match = r; break; }
         }
         if (!match) {
           for (var j = 0; j < cands.length; j++) {
             var rr = cands[j];
-            if (rr.slide !== it.slide || (rr.type || "rect") !== (it.type || "rect")) continue;
+            if (rr.slide !== slideName || (rr.type || "rect") !== (it.type || "rect")) continue;
             if ((rr.type || "rect") === "rect" &&
                 Number(rr.x) === Number(it.x) && Number(rr.y) === Number(it.y) &&
                 Number(rr.side_px) === Number(it.side_px)) { match = rr; break; }
