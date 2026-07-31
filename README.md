@@ -21,7 +21,7 @@ view-only share links with named ROI annotations that flow back to admins.
 
 - **WSI 查看**：OpenSlide + OpenSeadragon Deep Zoom，支持 svs / tif / tiff / ndpi / mrxs / vms / vmu / scn / bif / svslide 等格式，滚轮缩放、拖拽平移、旋转、双击放大
 - **OME-TIFF 支持**：OpenSlide 打不开的（OME-）TIFF 自动回退到内置 tifffile+zarr 阅读器（`slide_io.py`），识别 SubIFD 金字塔并解析 OME-XML 的 PhysicalSize（mpp）；MRXS 等多文件格式连同数据目录打包 zip 上传，服务端安全解压
-- **管理员登录（可选）**：设置 `ADMIN_PASSWORD` 后管理端启用账号密码登录（session 7 天、IP 防爆破锁定），可另开 TLS 监听用于外网管理员门户
+- **管理员登录（可选）**：设置 `ADMIN_PASSWORD` 后管理端启用账号密码登录（session 7 天、IP 防爆破锁定）；与分享端同端口路径分流（`/s/...` 走分享页，其余走管理门户），外网一个 HTTPS 端口即同时提供分享与管理员入口
 - **项目管理**：切片按项目分组（一个项目 = 一个用户/批次的一组切片），未归类切片单列
 - **ROI 选区**：固定物理尺寸 6mm / 6.5mm 方框（边长像素 = mm × 1000 / mpp），随缩放锚定、可拖动；一键导出 level-0 全分辨率 PNG
 - **mpp 真实坐标尺**：依次读取厂商元数据 → TIFF 分辨率标签 → 倍率估算 → 手动输入
@@ -93,7 +93,6 @@ podman run -d --name svs-share -p 38000:38000 \
 | `ADMIN_USERNAME` | `browser_admin` | 管理员登录用户名 |
 | `ADMIN_PASSWORD` | — | 设置后管理端启用登录认证（内网同样需要） |
 | `SECRET_KEY` | 自动生成并持久化到数据目录 | Flask session 密钥 |
-| `ADMIN_TLS_PORT` / `ADMIN_TLS_CERT` / `ADMIN_TLS_KEY` | — | 三者齐备时管理端额外开一个 HTTPS 监听（外网门户） |
 | `JPEG_QUALITY` | 82 | 瓦片 JPEG 质量 |
 | `TILE_CACHE_MAX` | 3000 | 服务端瓦片缓存片数 |
 | `TILE_CACHE_TTL` | 3600 | 分享端瓦片缓存 TTL（秒） |
@@ -110,7 +109,7 @@ podman run -d --name svs-share -p 38000:38000 \
 - 分享端所有路由都校验 token（存在/未撤销/未过期）且切片属于该分享，否则一律 404
 - 分享端只读：无上传、无删除、无切片列表之外的任何信息
 - 分享链接建议经 HTTPS 暴露（`SHARE_TLS_*` 或前置反代），避免明文 token 被窃听
-- 管理端暴露到公网时务必设置 `ADMIN_PASSWORD`（登录认证 + IP 连续失败锁定），并优先通过 `ADMIN_TLS_*` 以 HTTPS 提供
+- 管理端暴露到公网时务必设置 `ADMIN_PASSWORD`（登录认证 + IP 连续失败锁定），并经由分享端 TLS 监听（同端口路径分流）以 HTTPS 提供
 
 ---
 
@@ -120,7 +119,7 @@ podman run -d --name svs-share -p 38000:38000 \
 
 - **WSI viewing**: OpenSlide + OpenSeadragon Deep Zoom (svs/tif/tiff/ndpi/mrxs/vms/vmu/scn/bif/svslide), wheel zoom, pan, rotate
 - **OME-TIFF support**: (OME-)TIFF files OpenSlide cannot read fall back to a built-in tifffile+zarr reader (`slide_io.py`) with SubIFD pyramid and OME-XML PhysicalSize (mpp) parsing; multi-file formats like MRXS are uploaded as a zip and extracted safely server-side
-- **Optional admin login**: set `ADMIN_PASSWORD` to gate the admin UI behind username/password (7-day session, per-IP lockout); an extra TLS listener (`ADMIN_TLS_*`) can serve as an external admin portal
+- **Optional admin login**: set `ADMIN_PASSWORD` to gate the admin UI behind username/password (7-day session, per-IP lockout); the share server path-routes the same port (`/s/...` → share pages, everything else → admin portal), so one external HTTPS port serves both
 - **Projects**: organize slides into projects (one project = one client's slide set)
 - **Physical ROI**: fixed 6mm / 6.5mm squares anchored to image coordinates; export full-resolution PNG crops
 - **Real scale (mpp)**: vendor metadata → TIFF resolution tags → objective-power estimate → manual input
@@ -151,7 +150,7 @@ Expose the share server publicly behind any reverse proxy (frp/nginx/caddy) and 
 - The share server is strictly read-only
 - Serve shares over HTTPS to protect tokens in transit
 - When exposing the admin UI publicly, always set `ADMIN_PASSWORD` (login + per-IP
-  lockout) and prefer serving it via `ADMIN_TLS_*` HTTPS
+  lockout) and serve it via the share server's TLS listener (same port, path-routed)
 
 ## License
 

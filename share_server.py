@@ -540,6 +540,20 @@ def share_static(filename):
 
 
 if __name__ == "__main__":
+    # 合并管理端门户：同一端口按路径分流。
+    # /s/...（含 /s/<token>/ 全部分享路由）→ 分享应用；
+    # 其余（/、/login、/api/*、/static/*）→ 管理端应用（开启 ADMIN_PASSWORD
+    # 后需登录），实现"同端口不同页面"：外网访问 18767 时，
+    # 进 / 是管理员登录门户，进 /s/<token> 是正常分享页。
+    # 这样 frp 不需要为管理端另开隧道，复用既有分享隧道即可。
+    import app as admin_app
+
+    def _combined_app(environ, start_response):
+        path = environ.get("PATH_INFO") or ""
+        if path == "/s" or path.startswith("/s/"):
+            return app(environ, start_response)  # 分享应用
+        return admin_app.app(environ, start_response)  # 管理端应用
+
     # HTTPS：提供 SHARE_TLS_CERT / SHARE_TLS_KEY 时直接以 TLS 运行
     # （frp TCP 隧道只是转发，TLS 需在本服务终止，避免被备案系统按 HTTP 拦截）
     tls_cert = os.environ.get("SHARE_TLS_CERT")
@@ -551,9 +565,12 @@ if __name__ == "__main__":
     else:
         print("[share_server] WARNING: 未找到 TLS 证书，以 HTTP 运行")
 
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("SHARE_PORT", 38000)),
+    from werkzeug.serving import run_simple
+
+    run_simple(
+        "0.0.0.0",
+        int(os.environ.get("SHARE_PORT", 38000)),
+        _combined_app,
         threaded=True,
         ssl_context=ssl_context,
     )

@@ -1234,28 +1234,8 @@ def api_annotation_set_shared(token, index):
 
 
 if __name__ == "__main__":
-    # 可选 TLS 监听（外网门户）：当 ADMIN_TLS_PORT / ADMIN_TLS_CERT / ADMIN_TLS_KEY
-    # 三个 env 都存在时，起 daemon 线程以 TLS 运行，主线程保持原监听不变。
-    # 注意必须绑 0.0.0.0：rootless podman 的 PublishPort 从容器 IP 转发，
-    # 绑 127.0.0.1 会无法通过端口映射访问；宿主侧 PublishPort 已限定 127.0.0.1。
-    tls_port = os.environ.get("ADMIN_TLS_PORT")
-    tls_cert = os.environ.get("ADMIN_TLS_CERT")
-    tls_key = os.environ.get("ADMIN_TLS_KEY")
-    if tls_port and tls_cert and tls_key:
-        def _run_tls():
-            try:
-                app.run(
-                    host="0.0.0.0",
-                    port=int(tls_port),
-                    ssl_context=(tls_cert, tls_key),
-                    threaded=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"[app] TLS listener failed: {e}")
-
-        threading.Thread(target=_run_tls, daemon=True).start()
-        print(f"[app] TLS listener enabled on 127.0.0.1:{tls_port}")
-
+    # 管理端外网门户由 share_server 合并进程提供（同端口按路径分流），
+    # 本进程只保留内网 HTTP 监听；外网走 https://browser.pingoodmice.top:18767/
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
