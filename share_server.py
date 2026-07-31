@@ -481,11 +481,37 @@ def share_roi_add(token):
             label_str = " / ".join(_fmt_mm(v) for v in allowed)
             return jsonify(error="本次分享仅允许 " + label_str + " mm 标记"), 403
 
+    # note 可选（备注文本），透传给 store 校验/清洗
+    note = body.get("note", "")
+
     try:
-        roi = share_store.add_roi(token, safe, label, type=typ, **geom)
+        roi = share_store.add_roi(token, safe, label, type=typ, note=note, **geom)
     except ValueError as e:
         return jsonify(error=str(e)), 400
     return jsonify(ok=True, index=roi["index"])
+
+
+@app.route("/s/<token>/api/roi/<int:index>", methods=["PATCH"])
+def share_roi_update(token, index):
+    """编辑本 token 的标注几何与/或备注。
+
+    JSON body: {"geom": {...}, "note": "..."}（两者均可缺省）。
+    调 update_roi；update 返回 False 时 404；成功返回更新后的 roi dict（含 index）。
+    编辑允许自由调大小，不做 6/6.5mm 限制。
+    """
+    _require_share(token)
+    body = request.get_json(silent=True) or {}
+    geom = body.get("geom")
+    note = body.get("note")
+    if geom is None and note is None:
+        return jsonify(error="缺少 geom 或 note"), 400
+    try:
+        updated = share_store.update_roi(token, index, geom=geom, note=note)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    if updated is False:
+        return jsonify(error="选区不存在"), 404
+    return jsonify(updated)
 
 
 @app.route("/s/<token>/api/rois")

@@ -1179,6 +1179,8 @@ def api_annotation_add():
 
     # shared 可选，透传给 store（默认 False）
     shared = bool(body.get("shared", False))
+    # note 可选（备注文本），透传给 store 校验/清洗
+    note = body.get("note", "")
 
     # 收集几何字段（透传给 add_roi 校验）
     geom = {}
@@ -1187,7 +1189,7 @@ def api_annotation_add():
             geom[k] = body[k]
     try:
         roi = share_store.add_roi(
-            share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, **geom
+            share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note, **geom
         )
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -1216,21 +1218,57 @@ def api_annotation_delete(token, index):
 
 @app.route("/api/annotation/<token>/<int:index>", methods=["PATCH"])
 def api_annotation_set_shared(token, index):
-    """管理员策展：切换任意 token 标注的「公开」状态。
+    """管理员策展/编辑：可切换「公开」状态，或更新几何/备注。
 
-    JSON body: {"shared": bool}。允许任意 token（管理员可策展全部标注）。
-    token/index 无效返回 404；成功返回 {"ok": true, "shared": bool}。
+    JSON body 支持任意组合：
+      - {"shared": bool}：走 set_roi_shared；
+      - {"geom": {...}}：走 update_roi 更新几何（不含 type）；
+      - {"note": "..."}：走 update_roi 更新备注。
+    两者可同时传（shared 与 geom/note 独立处理）。
+    token/index 无效（shared 或 update 侧）返回 404；
+    成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>}。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
     body = request.get_json(silent=True) or {}
-    if "shared" not in body:
-        return jsonify(error="缺少 shared"), 400
-    shared = bool(body.get("shared"))
-    ok = share_store.set_roi_shared(token, index, shared)
-    if not ok:
-        return jsonify(error="标注不存在"), 404
-    return jsonify(ok=True, shared=shared)
+
+    shared_after = None
+    note_after = None
+
+    # shared 部分
+    if "shared" in body:
+        shared_target = bool(body.get("shared"))
+        ok = share_store.set_roi_shared(token, index, shared_target)
+        if not ok:
+            return jsonify(error="标注不存在"), 404
+        shared_after = shared_target
+
+    # geom / note 部分
+    if "geom" in body or "note" in body:
+        geom = body.get("geom")
+        note = body.get("note")
+        try:
+            updated = share_store.update_roi(token, index, geom=geom, note=note)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        if updated is False:
+            return jsonify(error="标注不存在"), 404
+        note_after = updated.get("note", "")
+        # 若同时没传 shared，回填当前 shared 值便于前端同步
+        if shared_after is None:
+            shared_after = updated.get("shared")
+
+    # 仅 shared 时回填 note（读当前值）
+    if note_after is None:
+        rois = share_store.list_rois(token)
+        cur = None
+        for r in rois:
+            if r.get("index") == index:
+                cur = r
+                break
+        note_after = cur.get("note", "") if cur else ""
+
+    return jsonify(ok=True, shared=shared_after, note=note_after)
 
 
 if __name__ == "__main__":

@@ -607,3 +607,89 @@ button {
   .seg-control .seg { padding: 5px 8px; }
   .tool-btn { padding: 0 9px; font-size: 12px; }
 }
+
+/* ---------- 备注输入框（工具栏第二行） ---------- */
+.roi-note-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--r-btn);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  background: #fff;
+  color: var(--text);
+}
+.roi-note-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-fill); }
+
+/* ---------- 编辑卡（选区面板顶部） ---------- */
+.roi-panel-edit {
+  padding: 8px 4px 4px;
+  flex-shrink: 0;
+}
+.anno-edit-card {
+  background: #fff;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: 12px;
+  padding: 10px;
+  box-shadow: var(--shadow-sm);
+}
+.aec-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.aec-note {
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 8px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--r-btn);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+}
+.aec-note:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-fill); }
+.aec-ops {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  justify-content: flex-end;
+}
+.aec-btn {
+  border: none;
+  background: var(--seg-bg);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: var(--r-btn);
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.aec-btn:hover { background: var(--hover-strong); }
+.aec-btn.primary { background: var(--accent); color: #fff; }
+.aec-btn.primary:hover { background: var(--accent-hover); }
+.aec-btn.danger { background: var(--danger-tint); color: var(--danger); }
+.aec-btn.danger:hover { background: rgba(255, 59, 48, 0.2); }
+
+/* 选区面板编辑钮 */
+.roi-panel-item .ri-edit {
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 15px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.roi-panel-item .ri-edit:hover { background: var(--accent-fill); color: var(--accent); }

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>病理切片查看</title>
-  <link rel="stylesheet" href="/static/share.css?v=20260731e" />
+  <link rel="stylesheet" href="/static/share.css?v=20260731g" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -59,6 +59,10 @@
       <input id="roi-label" type="text" maxlength="40"
              class="roi-label-input" placeholder="标记人/标签（如 张三 / 病理号）"
              title="保存选区前请填写标记人或标签" autocomplete="off" />
+      <input id="roi-note" type="text" maxlength="500"
+             class="roi-note-input" placeholder="备注（可选，气泡显示）"
+             title="保存选区时的备注，以气泡形式显示在标记旁"
+             autocomplete="off" />
       <button id="save-roi-btn" class="tool-btn primary" disabled>保存选区</button>
       <button id="export-btn" class="tool-btn secondary" disabled>导出图片</button>
       <button id="roi-panel-toggle" class="tool-btn">选区(0)</button>
@@ -86,6 +90,7 @@
       <span>已保存选区</span>
       <button id="roi-panel-close" class="roi-panel-close" aria-label="关闭">×</button>
     </div>
+    <div id="roi-panel-edit" class="roi-panel-edit" style="display:none;"></div>
     <div id="roi-panel-list" class="roi-panel-list">
       <div class="roi-panel-empty">暂无选区</div>
     </div>
@@ -97,6 +102,6 @@
   <script>
     window.__SHARE_TOKEN__ = "{{ token }}";
   </script>
-  <script src="/static/share.js?v=20260731e"></script>
+  <script src="/static/share.js?v=20260731g"></script>
 </body>
 </html>

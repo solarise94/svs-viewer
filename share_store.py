@@ -363,7 +363,22 @@ def _validate_geom(typ, geom):
     raise ValueError("未知标注类型")
 
 
-def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, **geom):
+def _clean_note(note):
+    """归一化备注文本：非 str 视为空串；strip 后长度 ≤ 500，否则抛 ValueError。
+
+    None → ""；非字符串 → ""。返回清洗后的字符串。
+    """
+    if note is None:
+        return ""
+    if not isinstance(note, str):
+        return ""
+    n = note.strip()
+    if len(n) > 500:
+        raise ValueError("备注过长")
+    return n
+
+
+def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     管理员标注使用 token="admin"（此时 share 校验放宽：不要求 token 命中 shares，
@@ -372,8 +387,9 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, **geom)
     label（标记人/标签）为必填，去空白后非空，否则抛 ValueError。
     type 必须是 ROI_TYPES 之一（缺省 rect，向后兼容）。
     shared 为布尔，记录该标注是否对全部分享用户公开展示（缺省 False）。
+    note 为备注文本（可选，缺省空串；strip 后 ≤ 500 字符，超出抛 ValueError）。
 
-    返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared）。
+    返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared/note）。
     若校验失败抛出 ValueError。
     """
     # type 合法性
@@ -385,6 +401,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, **geom)
     label = label.strip()
     if not label:
         raise ValueError("请填写用户名或标签")
+    # note 清洗（在锁外做即可）
+    note_clean = _clean_note(note)
 
     # 几何校验（合并 size_mm，rect 会覆盖）
     geom_full = dict(geom)
@@ -410,6 +428,7 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, **geom)
             "label": label,
             "ts": time.time(),
             "shared": bool(shared),
+            "note": note_clean,
         }
         roi.update(norm)
         data["rois"].append(roi)
@@ -420,6 +439,70 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, **geom)
         roi_out["index"] = len(same_token) - 1
         roi_out["shared"] = bool(shared)
         return roi_out
+
+    return _with_lock("r+", _do)
+
+
+def update_roi(token, index, geom=None, note=None):
+    """更新该 token 下第 index 条 roi 的几何与/或备注。
+
+    - 锁定内按 token 内序号定位（逻辑同 delete_roi：same 列表）。
+      index 越界返回 False（与 set_roi_shared 风格一致，不抛异常）。
+    - 非 admin token 时校验 share 有效（同 add_roi 的 _is_active 逻辑），
+      无效抛 ValueError("share invalid")。admin token 直接放行。
+    - geom（dict，不含 type）经 _validate_geom(原type, geom) 归一化后 merge 进 roi
+      （type 保持原值，ts 不动 → index 语义稳定）；geom 为 None/缺省时不改几何。
+    - note 为 None 时不改备注，否则按 _clean_note 规则清洗并写入。
+    - 返回更新后的 roi dict（含 index，按 token 内序号计算，同 list_rois 逻辑）。
+    """
+    # 几何基本校验（真正按原 type 归一化在锁内做，因需读取 roi 原始 type）
+    if geom is not None and not isinstance(geom, dict):
+        raise ValueError("geom 需为对象")
+
+    # note 清洗（note 非 None 时在锁外校验长度，失败早抛）
+    note_clean = "_UNSET_"  # 哨兵：不修改
+    if note is not None:
+        note_clean = _clean_note(note)
+
+    def _do(f):
+        data = _load_locked(f)
+        # 非 admin token 校验 share 有效
+        is_admin = (token == ADMIN_TOKEN)
+        if not is_admin:
+            share = data["shares"].get(token)
+            if share is None or not _is_active(share):
+                raise ValueError("share invalid")
+        # 定位该 token 下第 index 条 roi
+        same = [i for i, r in enumerate(data["rois"]) if r["token"] == token]
+        if index < 0 or index >= len(same):
+            return False
+        real_i = same[index]
+        roi = data["rois"][real_i]
+        orig_type = roi.get("type", "rect")
+
+        # 几何更新：用原 type 归一化后 merge（type 保持原值，ts 不动）
+        if geom is not None:
+            geom_full = dict(geom)
+            # 补齐 size_mm（rect 需要，缺失时用原值）
+            if orig_type == "rect" and "size_mm" not in geom_full:
+                geom_full["size_mm"] = roi.get("size_mm", 0.0)
+            norm_g = _validate_geom(orig_type, geom_full)
+            norm_g["type"] = orig_type
+            roi.update(norm_g)
+
+        # 备注更新
+        if note_clean != "_UNSET_":
+            roi["note"] = note_clean
+
+        _save_locked(f, data)
+
+        # 返回更新后的 roi dict（含 index）
+        out = dict(roi)
+        # index 按 token 内序号计算（同 list_rois 逻辑）
+        all_same = [r for r in data["rois"] if r["token"] == token]
+        out["index"] = all_same.index(roi)
+        out["shared"] = _roi_shared_compat(roi)
+        return out
 
     return _with_lock("r+", _do)
 
@@ -444,6 +527,7 @@ def list_rois(token=None):
                 rr = dict(r)
                 rr["index"] = idx_map.get(id(r), 0)
                 rr["shared"] = _roi_shared_compat(r)
+                rr["note"] = r.get("note", "")
                 out.append(rr)
             out.sort(key=lambda x: x.get("ts", 0), reverse=True)
             return out
@@ -456,6 +540,7 @@ def list_rois(token=None):
             rr["index"] = counters[r["token"]]
             counters[r["token"]] += 1
             rr["shared"] = _roi_shared_compat(r)
+            rr["note"] = r.get("note", "")
             out.append(rr)
         out.sort(key=lambda x: x.get("ts", 0), reverse=True)
         return out
@@ -538,6 +623,7 @@ def list_shared_rois_for_slides(slides):
             rr["index"] = idx
             rr["shared"] = True
             rr.setdefault("type", "rect")
+            rr["note"] = r.get("note", "")
             out.append(rr)
         out.sort(key=lambda x: x.get("ts", 0), reverse=True)
         return out
@@ -803,6 +889,7 @@ def annotations_by_slide():
                 "side_px": r.get("side_px"),
                 "ts": r.get("ts"),
                 "shared": _roi_shared_compat(r),
+                "note": r.get("note", ""),
             }
             # 带上 arrow / freehand 专属几何字段（存在则透传）
             for k in ("x1", "y1", "x2", "y2", "points"):

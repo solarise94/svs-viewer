@@ -57,6 +57,11 @@
   var annoOverlays = [];   // 兼容旧引用，已不再新增（标注改画到 canvas）
   var annoPanelOpen = false;
 
+  // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
+  // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
+  var editItem = null;
+  var editDrag = null;
+
   // 临时选择器状态
   var pickerCtx = { targetPid: null, selected: {} };
 
@@ -313,9 +318,11 @@
             els.annoBtn.disabled = false;
             els.annoAllBtn.disabled = false;
           }
+          editItem = null;
+          rebuildFlatItems();
           redrawAnnoCanvas();
         })
-        .catch(function () { currentAnnotations = null; redrawAnnoCanvas(); });
+        .catch(function () { currentAnnotations = null; editItem = null; rebuildFlatItems(); redrawAnnoCanvas(); });
     } else {
       els.annoArrowBtn.disabled = true;
       els.annoFreeBtn.disabled = true;
@@ -684,6 +691,7 @@
       side_px: Math.round(r.side),
       size_mm: state.roiMode,
       shared: false,
+      note: "",
     };
     els.saveAnnoBtn.disabled = true;
     apiFetch("/api/annotation", {
@@ -1432,18 +1440,24 @@
   }
 
   // 当前切片的标注展开为扁平 item 列表（带 label/type/几何）
+  // flatItems 为持久缓存（编辑拖动时改本地几何），每次标注刷新时重建
+  var flatItems = [];
   function flatAnnoItems() {
+    return flatItems;
+  }
+  function rebuildFlatItems() {
     var out = [];
-    if (!currentAnnotations) return out;
-    (currentAnnotations.annotations || []).forEach(function (grp) {
-      (grp.items || []).forEach(function (it) {
-        var copy = {};
-        for (var k in it) copy[k] = it[k];
-        copy.label = grp.label;
-        out.push(copy);
+    if (currentAnnotations) {
+      (currentAnnotations.annotations || []).forEach(function (grp) {
+        (grp.items || []).forEach(function (it) {
+          var copy = {};
+          for (var k in it) copy[k] = it[k];
+          copy.label = grp.label;
+          out.push(copy);
+        });
       });
-    });
-    return out;
+    }
+    flatItems = out;
   }
 
   function redrawAnnoCanvas() {
@@ -1457,8 +1471,13 @@
     // 已保存标注
     if (state.showAnno) {
       flatAnnoItems().forEach(function (it) {
-        drawAnnoItem(it, labelColor(it.label));
+        var selected = (editItem === it);
+        drawAnnoItem(it, labelColor(it.label), selected);
       });
+    }
+    // 编辑手柄
+    if (editItem && state.showAnno) {
+      drawEditHandles(editItem);
     }
     // 绘制中的预览
     if (state.drawMode === "arrow" && drawPreview && drawPreview.type === "arrow") {
@@ -1467,15 +1486,49 @@
     if (state.drawMode === "freehand" && drawPreview && drawPreview.type === "freehand" && drawPreview.points.length >= 2) {
       drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, "预览");
     }
+    // 备注气泡
+    if (state.showAnno) {
+      flatAnnoItems().forEach(function (it) {
+        var note = String(it.note || "");
+        if (!note) return;
+        var selected = (editItem === it);
+        drawNoteBubble(it, note, selected);
+      });
+    }
   }
 
-  function drawAnnoItem(it, color) {
+  // 绘制编辑手柄（管理端所有标注可编辑）
+  function drawEditHandles(it) {
+    var hs = editHandles(it);
+    annoCtx.fillStyle = "#fff";
+    annoCtx.strokeStyle = "#007AFF";
+    annoCtx.lineWidth = 2;
+    hs.forEach(function (h) {
+      var isMid = (h.id === "mid" || h.id === "fmid" || h.id === "move");
+      if (isMid) {
+        annoCtx.beginPath();
+        annoCtx.arc(h.x, h.y, 6, 0, Math.PI * 2);
+        annoCtx.fill(); annoCtx.stroke();
+      } else {
+        annoCtx.fillRect(h.x - 5, h.y - 5, 10, 10);
+        annoCtx.strokeRect(h.x - 5, h.y - 5, 10, 10);
+      }
+    });
+  }
+
+  function drawAnnoItem(it, color, selected) {
     var typ = it.type || "rect";
+    var hlStroke = selected ? "#007AFF" : null;
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
       var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+      if (hlStroke) {
+        annoCtx.lineWidth = 6;
+        annoCtx.strokeStyle = hlStroke;
+        annoCtx.strokeRect(x, y, w, h);
+      }
       annoCtx.lineWidth = 3;
       annoCtx.strokeStyle = "#FFD700";
       annoCtx.strokeRect(x, y, w, h);
@@ -1486,9 +1539,9 @@
       });
       drawLabel(it.label, x, y, it.size_mm != null ? (it.size_mm + "mm") : "");
     } else if (typ === "arrow") {
-      drawArrow(it.x1, it.y1, it.x2, it.y2, color.stroke, it.label);
+      drawArrow(it.x1, it.y1, it.x2, it.y2, hlStroke || color.stroke, it.label);
     } else if (typ === "freehand") {
-      drawFreehand(it.points, color, it.label);
+      drawFreehand(it.points, { fill: color.fill, stroke: hlStroke || color.stroke }, it.label);
     }
   }
 
@@ -1553,6 +1606,244 @@
     annoCtx.fillText(text, bx + padX, by + h / 2 + 0.5);
   }
 
+  // ---------- 备注气泡（macOS callout 风格，与 share.js 一致） ----------
+  function wrapText(text, maxWidth) {
+    annoCtx.font = "12px " + "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+    var lines = [];
+    String(text).split("\n").forEach(function (para) {
+      if (para === "") { lines.push(""); return; }
+      var cur = "";
+      for (var i = 0; i < para.length; i++) {
+        var test = cur + para[i];
+        if (annoCtx.measureText(test).width > maxWidth && cur) {
+          lines.push(cur);
+          cur = para[i];
+        } else {
+          cur = test;
+        }
+      }
+      if (cur) lines.push(cur);
+    });
+    return lines;
+  }
+
+  function annoAnchor(it) {
+    var typ = it.type || "rect";
+    if (typ === "rect") {
+      var tl = imgToCanvas(it.x, it.y);
+      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+      var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
+      return { x: x + w / 2, y: y, minSide: Math.min(w, h) };
+    } else if (typ === "arrow") {
+      var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
+      return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, minSide: 40 };
+    } else if (typ === "freehand") {
+      var pts = (it.points || []).map(function (p) { return imgToCanvas(p[0], p[1]); });
+      var xs = pts.map(function (p) { return p.x; });
+      var ys = pts.map(function (p) { return p.y; });
+      var minx = Math.min.apply(null, xs), maxx = Math.max.apply(null, xs);
+      var miny = Math.min.apply(null, ys), maxy = Math.max.apply(null, ys);
+      return { x: (minx + maxx) / 2, y: miny, minSide: Math.min(maxx - minx, maxy - miny) };
+    }
+    return { x: 0, y: 0, minSide: 0 };
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawNoteBubble(it, note, selected) {
+    var anchor = annoAnchor(it);
+    if (anchor.minSide < 24) return;
+    var c = els.annoCanvas;
+    var canvasW = c.clientWidth, canvasH = c.clientHeight;
+
+    annoCtx.font = "12px " + "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+    var maxWidth = 240;
+    var lines = wrapText(note, maxWidth);
+    var padX = 8, padY = 6;
+    var lineH = 15;
+    var textW = 0;
+    lines.forEach(function (ln) {
+      var w = annoCtx.measureText(ln).width;
+      if (w > textW) textW = w;
+    });
+    var boxW = Math.min(maxWidth, Math.max(20, textW)) + padX * 2;
+    var boxH = lines.length * lineH + padY * 2;
+
+    var cx = anchor.x;
+    var above = true;
+    var boxX = cx - boxW / 2;
+    var boxY = anchor.y - 8 - boxH;
+
+    if (boxY < 4) { above = false; boxY = anchor.y + 10; }
+    if (boxX < 4) boxX = 4;
+    if (boxX + boxW > canvasW - 4) boxX = canvasW - 4 - boxW;
+    if (boxY + boxH > canvasH - 4) boxY = Math.max(4, canvasH - 4 - boxH);
+
+    var borderColor = selected ? "#007AFF" : "rgba(0,0,0,0.15)";
+    var triSize = 6;
+    var triTipX = cx;
+    annoCtx.save();
+    annoCtx.globalAlpha = 0.85;
+    annoCtx.fillStyle = "#ffffff";
+    roundRect(annoCtx, boxX, boxY, boxW, boxH, 8);
+    annoCtx.fill();
+    annoCtx.globalAlpha = 1;
+    annoCtx.strokeStyle = borderColor;
+    annoCtx.lineWidth = 1;
+    annoCtx.stroke();
+    annoCtx.restore();
+
+    annoCtx.save();
+    annoCtx.fillStyle = "#ffffff";
+    annoCtx.strokeStyle = borderColor;
+    annoCtx.lineWidth = 1;
+    annoCtx.beginPath();
+    if (above) {
+      var baseY = boxY + boxH;
+      annoCtx.moveTo(triTipX - triSize, baseY - 0.5);
+      annoCtx.lineTo(triTipX, baseY + triSize);
+      annoCtx.lineTo(triTipX + triSize, baseY - 0.5);
+    } else {
+      var baseY2 = boxY;
+      annoCtx.moveTo(triTipX - triSize, baseY2 + 0.5);
+      annoCtx.lineTo(triTipX, baseY2 - triSize);
+      annoCtx.lineTo(triTipX + triSize, baseY2 + 0.5);
+    }
+    annoCtx.closePath();
+    annoCtx.fill();
+    annoCtx.stroke();
+    annoCtx.restore();
+
+    annoCtx.fillStyle = "#333";
+    annoCtx.font = "12px " + "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+    annoCtx.textBaseline = "top";
+    lines.forEach(function (ln, i) {
+      annoCtx.fillText(ln, boxX + padX, boxY + padY + i * lineH);
+    });
+  }
+
+  // =========================================================================
+  // 编辑模式：非绘制模式下点击标注画布层，命中检测 + 选中 + 拖动手柄
+  // （管理端所有标注可编辑）
+  // =========================================================================
+  function pointSegDist(px, py, x1, y1, x2, y2) {
+    var dx = x2 - x1, dy = y2 - y1;
+    var len2 = dx * dx + dy * dy;
+    if (len2 <= 0) return Math.hypot(px - x1, py - y1);
+    var t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+  }
+
+  function pointInPolygon(px, py, pts) {
+    var inside = false;
+    for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      var xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      var intersect = ((yi > py) !== (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / ((yj - yi) || 1e-9) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function hitAnno(sx, sy) {
+    var items = flatAnnoItems();
+    for (var i = items.length - 1; i >= 0; i--) {
+      var it = items[i];
+      var typ = it.type || "rect";
+      if (typ === "rect") {
+        var tl = imgToCanvas(it.x, it.y);
+        var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+        var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+        var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
+        if (sx >= x - 6 && sx <= x + w + 6 && sy >= y - 6 && sy <= y + h + 6) return it;
+      } else if (typ === "arrow") {
+        var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
+        if (pointSegDist(sx, sy, a.x, a.y, b.x, b.y) <= 8) return it;
+      } else if (typ === "freehand") {
+        var pts = (it.points || []).map(function (p) { return imgToCanvas(p[0], p[1]); });
+        if (pts.length >= 3 && pointInPolygon(sx, sy, pts)) return it;
+        for (var k = 0; k < pts.length - 1; k++) {
+          if (pointSegDist(sx, sy, pts[k].x, pts[k].y, pts[k + 1].x, pts[k + 1].y) <= 8) return it;
+        }
+      }
+    }
+    return null;
+  }
+
+  function editHandles(it) {
+    var typ = it.type || "rect";
+    var out = [];
+    if (typ === "rect") {
+      var tl = imgToCanvas(it.x, it.y);
+      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+      var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
+      out = [
+        { id: "tl", x: x, y: y }, { id: "t", x: x + w / 2, y: y },
+        { id: "tr", x: x + w, y: y }, { id: "r", x: x + w, y: y + h / 2 },
+        { id: "br", x: x + w, y: y + h }, { id: "b", x: x + w / 2, y: y + h },
+        { id: "bl", x: x, y: y + h }, { id: "l", x: x, y: y + h / 2 },
+      ];
+    } else if (typ === "arrow") {
+      var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
+      out = [
+        { id: "p1", x: a.x, y: a.y }, { id: "p2", x: b.x, y: b.y },
+        { id: "mid", x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      ];
+    } else if (typ === "freehand") {
+      var xs = it.points.map(function (p) { return p[0]; });
+      var ys = it.points.map(function (p) { return p[1]; });
+      var minx = Math.min.apply(null, xs), miny = Math.min.apply(null, ys);
+      var maxx = Math.max.apply(null, xs), maxy = Math.max.apply(null, ys);
+      var tl2 = imgToCanvas(minx, miny), br2 = imgToCanvas(maxx, maxy);
+      var x2 = Math.min(tl2.x, br2.x), y2 = Math.min(tl2.y, br2.y);
+      var w2 = Math.abs(br2.x - tl2.x), h2 = Math.abs(br2.y - tl2.y);
+      out = [
+        { id: "ftl", x: x2, y: y2 }, { id: "ftr", x: x2 + w2, y: y2 },
+        { id: "fbr", x: x2 + w2, y: y2 + h2 }, { id: "fbl", x: x2, y: y2 + h2 },
+        { id: "fmid", x: x2 + w2 / 2, y: y2 + h2 / 2 },
+      ];
+    }
+    return out;
+  }
+
+  function hitHandle(sx, sy, it) {
+    var hs = editHandles(it);
+    for (var i = 0; i < hs.length; i++) {
+      if (Math.hypot(sx - hs[i].x, sy - hs[i].y) <= 8) return hs[i].id;
+    }
+    return null;
+  }
+
+  function selectEditItem(it) {
+    editItem = it;
+    redrawAnnoCanvas();
+    openEditCard(it);
+  }
+
+  function clearEditItem() {
+    editItem = null;
+    closeEditCard();
+    redrawAnnoCanvas();
+  }
+
+  function moveHandleId(it) {
+    var typ = it.type || "rect";
+    if (typ === "arrow") return "mid";
+    if (typ === "freehand") return "fmid";
+    return "move";
+  }
+
   // ---------- 显示全部标记（切换画布层显隐） ----------
   function toggleAnnoAll() {
     state.showAnno = !state.showAnno;
@@ -1601,44 +1892,188 @@
   }
 
   function onAnnoPointerDown(e) {
-    if (!state.drawMode || !state.slide) return;
-    e.preventDefault(); e.stopPropagation();
-    var c = els.annoCanvas;
-    try { c.setPointerCapture(e.pointerId); } catch (err) {}
-    drawPointer = { id: e.pointerId };
-    var img = screenToImg(e);
-    if (state.drawMode === "arrow") {
-      drawPreview = { type: "arrow", x1: img.x, y1: img.y, x2: img.x, y2: img.y };
-    } else {
-      drawPreview = { type: "freehand", points: [[img.x, img.y]], lastScreen: screenPt(e) };
+    if (!state.slide) return;
+    // 绘制模式优先
+    if (state.drawMode) {
+      e.preventDefault(); e.stopPropagation();
+      var c = els.annoCanvas;
+      try { c.setPointerCapture(e.pointerId); } catch (err) {}
+      drawPointer = { id: e.pointerId };
+      var img0 = screenToImg(e);
+      if (state.drawMode === "arrow") {
+        drawPreview = { type: "arrow", x1: img0.x, y1: img0.y, x2: img0.x, y2: img0.y };
+      } else {
+        drawPreview = { type: "freehand", points: [[img0.x, img0.y]], lastScreen: screenPt(e) };
+      }
+      redrawAnnoCanvas();
+      return;
     }
-    redrawAnnoCanvas();
+    // 非绘制模式：编辑/选中
+    if (!state.showAnno) return;
+    e.preventDefault(); e.stopPropagation();
+    var sp = screenPt(e);
+    // 已选中且点中手柄 → 开始拖动手柄
+    if (editItem) {
+      var handleId = hitHandle(sp.x, sp.y, editItem);
+      if (handleId) {
+        startEditDrag(e, editItem, handleId);
+        return;
+      }
+    }
+    var hit = hitAnno(sp.x, sp.y);
+    if (hit) {
+      selectEditItem(hit);
+      var innerHandle = hitHandle(sp.x, sp.y, hit);
+      if (!innerHandle) {
+        startEditDrag(e, hit, moveHandleId(hit));
+      }
+      return;
+    }
+    clearEditItem();
   }
 
   function onAnnoPointerMove(e) {
-    if (!state.drawMode || !drawPreview) return;
+    if (state.drawMode && drawPreview) {
+      e.preventDefault(); e.stopPropagation();
+      var img = screenToImg(e);
+      if (drawPreview.type === "arrow") {
+        drawPreview.x2 = img.x; drawPreview.y2 = img.y;
+      } else {
+        var sp0 = screenPt(e);
+        var last = drawPreview.lastScreen;
+        if (Math.hypot(sp0.x - last.x, sp0.y - last.y) > 4) {
+          drawPreview.points.push([img.x, img.y]);
+          drawPreview.lastScreen = sp0;
+          if (drawPreview.points.length >= 500) { finishDraw(); return; }
+        }
+      }
+      redrawAnnoCanvas();
+      return;
+    }
+    if (!editDrag) return;
     e.preventDefault(); e.stopPropagation();
-    var img = screenToImg(e);
-    if (drawPreview.type === "arrow") {
-      drawPreview.x2 = img.x; drawPreview.y2 = img.y;
-    } else {
-      var sp = screenPt(e);
-      var last = drawPreview.lastScreen;
-      // 距上一点 > 4 屏幕像素才采样
-      if (Math.hypot(sp.x - last.x, sp.y - last.y) > 4) {
-        drawPreview.points.push([img.x, img.y]);
-        drawPreview.lastScreen = sp;
-        // 超过 500 点自动收尾
-        if (drawPreview.points.length >= 500) { finishDraw(); return; }
+    applyEditDrag(e);
+  }
+
+  function onAnnoPointerUp(e) {
+    if (state.drawMode && drawPreview) {
+      e.preventDefault(); e.stopPropagation();
+      finishDraw();
+      return;
+    }
+    if (!editDrag) return;
+    e.preventDefault(); e.stopPropagation();
+    endEditDrag(e);
+  }
+
+  // ---------- 编辑拖动会话（与 share.js 同构） ----------
+  function startEditDrag(e, it, handleId) {
+    var c = els.annoCanvas;
+    try { c.setPointerCapture(e.pointerId); } catch (err) {}
+    editDrag = {
+      pointerId: e.pointerId,
+      handle: handleId,
+      item: it,
+      start: snapshotGeom(it),
+      startImg: screenToImg(e),
+    };
+    if (viewer) viewer.setMouseNavEnabled(false);
+  }
+
+  function snapshotGeom(it) {
+    var typ = it.type || "rect";
+    if (typ === "rect") return { x: it.x, y: it.y, side_px: it.side_px };
+    if (typ === "arrow") return { x1: it.x1, y1: it.y1, x2: it.x2, y2: it.y2 };
+    if (typ === "freehand") return { points: (it.points || []).map(function (p) { return [p[0], p[1]]; }) };
+    return {};
+  }
+
+  function applyEditDrag(e) {
+    var d = editDrag;
+    var it = d.item;
+    var typ = it.type || "rect";
+    var cur = screenToImg(e);
+    var dx = cur.x - d.startImg.x;
+    var dy = cur.y - d.startImg.y;
+    var s = d.start;
+
+    if (typ === "rect") {
+      if (d.handle === "move") {
+        it.x = Math.max(0, Math.round(s.x + dx));
+        it.y = Math.max(0, Math.round(s.y + dy));
+      } else {
+        var anchorX;
+        if (d.handle === "tl" || d.handle === "bl" || d.handle === "l") anchorX = s.x + s.side_px;
+        else if (d.handle === "tr" || d.handle === "br" || d.handle === "r") anchorX = s.x;
+        else anchorX = s.x + s.side_px / 2;
+        var anchorY;
+        if (d.handle === "tl" || d.handle === "t" || d.handle === "tr") anchorY = s.y + s.side_px;
+        else if (d.handle === "bl" || d.handle === "b" || d.handle === "br") anchorY = s.y;
+        else anchorY = s.y + s.side_px / 2;
+        var spanX = Math.abs(cur.x - anchorX);
+        var spanY = Math.abs(cur.y - anchorY);
+        var side = clamp(Math.round(Math.max(spanX, spanY)), 1, 40000);
+        var nx = (cur.x <= anchorX) ? (anchorX - side) : anchorX;
+        var ny = (cur.y <= anchorY) ? (anchorY - side) : anchorY;
+        if (d.handle === "t" || d.handle === "b") nx = s.x + s.side_px / 2 - side / 2;
+        if (d.handle === "l" || d.handle === "r") ny = s.y + s.side_px / 2 - side / 2;
+        it.side_px = side;
+        it.x = Math.max(0, Math.round(nx));
+        it.y = Math.max(0, Math.round(ny));
+      }
+    } else if (typ === "arrow") {
+      if (d.handle === "p1") {
+        it.x1 = Math.max(0, Math.round(s.x1 + dx));
+        it.y1 = Math.max(0, Math.round(s.y1 + dy));
+      } else if (d.handle === "p2") {
+        it.x2 = Math.max(0, Math.round(s.x2 + dx));
+        it.y2 = Math.max(0, Math.round(s.y2 + dy));
+      } else if (d.handle === "mid") {
+        it.x1 = Math.max(0, Math.round(s.x1 + dx));
+        it.y1 = Math.max(0, Math.round(s.y1 + dy));
+        it.x2 = Math.max(0, Math.round(s.x2 + dx));
+        it.y2 = Math.max(0, Math.round(s.y2 + dy));
+      }
+    } else if (typ === "freehand") {
+      if (d.handle === "fmid") {
+        it.points = s.points.map(function (p) {
+          return [Math.max(0, Math.round(p[0] + dx)), Math.max(0, Math.round(p[1] + dy))];
+        });
+      } else {
+        var pts = s.points;
+        var xs0 = pts.map(function (p) { return p[0]; });
+        var ys0 = pts.map(function (p) { return p[1]; });
+        var minx0 = Math.min.apply(null, xs0), maxx0 = Math.max.apply(null, xs0);
+        var miny0 = Math.min.apply(null, ys0), maxy0 = Math.max.apply(null, ys0);
+        var w0 = Math.max(1, maxx0 - minx0), h0 = Math.max(1, maxy0 - miny0);
+        var aX = (d.handle === "ftl") ? maxx0 : minx0;
+        var aY = (d.handle === "ftl") ? maxy0 : miny0;
+        if (d.handle === "ftr") { aX = minx0; aY = maxy0; }
+        if (d.handle === "fbr") { aX = minx0; aY = miny0; }
+        if (d.handle === "fbl") { aX = maxx0; aY = miny0; }
+        var newW = Math.max(2, Math.abs(cur.x - aX));
+        var newH = Math.max(2, Math.abs(cur.y - aY));
+        var scale = Math.max(newW / w0, newH / h0);
+        var newPts = pts.map(function (p) {
+          return [Math.round(aX + (p[0] - aX) * scale), Math.round(aY + (p[1] - aY) * scale)];
+        });
+        var nminx = Math.min.apply(null, newPts.map(function (p) { return p[0]; }));
+        var nminy = Math.min.apply(null, newPts.map(function (p) { return p[1]; }));
+        var offX = nminx < 0 ? -nminx : 0;
+        var offY = nminy < 0 ? -nminy : 0;
+        it.points = newPts.map(function (p) { return [p[0] + offX, p[1] + offY]; });
       }
     }
     redrawAnnoCanvas();
   }
 
-  function onAnnoPointerUp(e) {
-    if (!state.drawMode || !drawPreview) return;
-    e.preventDefault(); e.stopPropagation();
-    finishDraw();
+  function endEditDrag(e) {
+    var c = els.annoCanvas;
+    if (editDrag) {
+      try { c.releasePointerCapture(editDrag.pointerId); } catch (err) {}
+    }
+    editDrag = null;
+    if (viewer) viewer.setMouseNavEnabled(true);
   }
 
   function finishDraw() {
@@ -1716,6 +2151,8 @@
         els.annoBtn.disabled = annos.length === 0;
         els.annoAllBtn.disabled = annos.length === 0;
         if (annos.length === 0) { state.showAnno = false; els.annoAllBtn.classList.remove("active"); }
+        if (editItem && flatItems.indexOf(editItem) < 0) editItem = null;
+        rebuildFlatItems();
         redrawAnnoCanvas();
       })
       .catch(function () {});
@@ -1784,9 +2221,31 @@
         });
         row.appendChild(sharedBtn);
 
+        // 编辑钮：跳转到该标注并进入选中编辑态
+        var editBtn = document.createElement("button");
+        editBtn.className = "ai-op ai-edit";
+        editBtn.textContent = "✎";
+        editBtn.title = "编辑（移动/缩放/备注）";
+        editBtn.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          jumpAndEditAnno(it);
+        });
+        row.appendChild(editBtn);
+
+        // 删除钮：调 DELETE 接口
+        var delBtn = document.createElement("button");
+        delBtn.className = "ai-op ai-del";
+        delBtn.textContent = "🗑";
+        delBtn.title = "删除标注";
+        delBtn.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          deleteAnnoItem(it);
+        });
+        row.appendChild(delBtn);
+
         row.style.cursor = "pointer";
         row.addEventListener("click", function (ev) {
-          if (ev.target === sharedBtn) return;
+          if (ev.target === sharedBtn || ev.target === editBtn || ev.target === delBtn) return;
           jumpToAnno(it);
         });
         els.annoPanelList.appendChild(row);
@@ -1895,6 +2354,151 @@
     } catch (e) {}
     // 临时 ROI 框（仅视觉，不进入保存态）
     showTempRoiBox(x, y, side, it.size_mm);
+  }
+
+  // ---------- 编辑卡（标注面板顶部） + 删除 ----------
+  function openEditCard(it) {
+    var wrap = $("anno-edit-wrap");
+    if (!wrap) return;
+    var typ = it.type || "rect";
+    var titleText = typ === "arrow" ? "编辑箭头" : (typ === "freehand" ? "编辑描图" : "编辑选区");
+    wrap.innerHTML = "";
+    var card = document.createElement("div");
+    card.className = "anno-edit-card";
+    var head = document.createElement("div");
+    head.className = "aec-head";
+    head.textContent = titleText;
+    card.appendChild(head);
+    var ta = document.createElement("textarea");
+    ta.className = "aec-note";
+    ta.maxLength = 500;
+    ta.placeholder = "备注（可选，气泡显示）";
+    ta.value = it.note || "";
+    ta.rows = 2;
+    card.appendChild(ta);
+    var ops = document.createElement("div");
+    ops.className = "aec-ops";
+    var saveB = document.createElement("button");
+    saveB.className = "btn primary small"; saveB.textContent = "保存";
+    var cancelB = document.createElement("button");
+    cancelB.className = "btn secondary small"; cancelB.textContent = "取消";
+    ops.appendChild(cancelB); ops.appendChild(saveB);
+    card.appendChild(ops);
+    wrap.appendChild(card);
+    wrap.style.display = "block";
+
+    saveB.addEventListener("click", function () { commitAdminEdit(it, ta.value); });
+    cancelB.addEventListener("click", function () { cancelAdminEdit(it); });
+    ta.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitAdminEdit(it, ta.value); }
+    });
+  }
+
+  function closeEditCard() {
+    var wrap = $("anno-edit-wrap");
+    if (wrap) { wrap.innerHTML = ""; wrap.style.display = "none"; }
+  }
+
+  // 收集编辑后几何（图片坐标，round 整数，clamp ≥0）
+  function buildEditGeom(it) {
+    var typ = it.type || "rect";
+    var g = {};
+    if (typ === "rect") {
+      g.x = Math.max(0, Math.round(it.x));
+      g.y = Math.max(0, Math.round(it.y));
+      g.side_px = clamp(Math.round(it.side_px), 1, 40000);
+    } else if (typ === "arrow") {
+      g.x1 = Math.max(0, Math.round(it.x1));
+      g.y1 = Math.max(0, Math.round(it.y1));
+      g.x2 = Math.max(0, Math.round(it.x2));
+      g.y2 = Math.max(0, Math.round(it.y2));
+    } else if (typ === "freehand") {
+      g.points = (it.points || []).map(function (p) {
+        return [Math.max(0, Math.round(p[0])), Math.max(0, Math.round(p[1]))];
+      });
+    }
+    return g;
+  }
+
+  // 提交管理员编辑：PATCH geom + note（先 resolve index 再 PATCH）
+  function commitAdminEdit(it, noteVal) {
+    var geom = buildEditGeom(it);
+    var body = { geom: geom, note: noteVal };
+    // rect 的 size_mm 前端重算
+    if ((it.type || "rect") === "rect" && state.mppX && state.mppX > 0) {
+      body.geom.size_mm = Math.round(geom.side_px * state.mppX / 1000 * 100) / 100;
+    } else if ((it.type || "rect") === "rect") {
+      body.geom.size_mm = it.size_mm != null ? it.size_mm : 0;
+    }
+    resolveAnnoIndex(it)
+      .then(function (index) {
+        return apiFetch("/api/annotation/" + encodeURIComponent(it.token) + "/" + index, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).then(function (r) {
+          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "保存失败"); });
+          return r.json();
+        });
+      })
+      .then(function () {
+        toast("已保存修改", "success");
+        editItem = null;
+        closeEditCard();
+        refreshCurrentAnnotations();
+        loadAnnotationsIndex().then(function () {
+          renderProjects(allProjects);
+          renderUnfiled();
+        });
+      })
+      .catch(function (e) { toast("保存失败: " + e.message, "error"); });
+  }
+
+  function cancelAdminEdit(it) {
+    editItem = null;
+    closeEditCard();
+    refreshCurrentAnnotations();
+  }
+
+  // 删除标注（管理员，任意来源）：先 resolve index 再 DELETE
+  function deleteAnnoItem(it) {
+    resolveAnnoIndex(it)
+      .then(function (index) {
+        return apiFetch("/api/annotation/" + encodeURIComponent(it.token) + "/" + index, {
+          method: "DELETE",
+        }).then(function (r) {
+          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "删除失败"); });
+          return r.json();
+        });
+      })
+      .then(function () {
+        toast("已删除标注", "success");
+        if (editItem === it) { editItem = null; closeEditCard(); }
+        refreshCurrentAnnotations();
+        loadAnnotationsIndex().then(function () {
+          renderProjects(allProjects);
+          renderUnfiled();
+          // 刷新标注面板
+          if (annoPanelOpen) renderAnnoPanel((currentAnnotations || {}).annotations || []);
+        });
+      })
+      .catch(function (e) { toast("删除失败: " + e.message, "error"); });
+  }
+
+  // 跳转并选中进入编辑态（标注面板"编辑"按钮）
+  function jumpAndEditAnno(it) {
+    jumpToAnno(it);
+    // 在 flatItems 中找匹配项并选中（按 token+ts+几何）
+    setTimeout(function () {
+      var match = null;
+      var items = flatAnnoItems();
+      for (var i = 0; i < items.length; i++) {
+        var f = items[i];
+        if (f.token === it.token && Number(f.ts) === Number(it.ts) &&
+            (f.type || "rect") === (it.type || "rect")) { match = f; break; }
+      }
+      if (match) selectEditItem(match);
+    }, 300);
   }
 
   function showTempRoiBox(x, y, side, sizeMm) {
