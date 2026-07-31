@@ -2290,7 +2290,8 @@
       " " + p(d.getHours()) + ":" + p(d.getMinutes());
   }
 
-  // 解析某标注条目在其 token 下的 index（annotations 接口不直接给 index，
+  // 兜底：解析某标注条目在其 token 下的 index（仅旧缓存无 index 时使用；
+  // annotations 接口现已直接带 index，正常路径走 resolveIndexFast 不会到这。
   // 通过 /api/share/rois 取该 token 列表，按 slide+ts+几何匹配）
   function resolveAnnoIndex(it) {
     var token = it.token;
@@ -2326,13 +2327,21 @@
       });
   }
 
+  // 快速取 index：新数据（annotations 接口已带 index）直接用本地 it.index，
+  // 省掉一次 /api/share/rois 全量拉取；仅极端旧缓存（无 index）才回退
+  // resolveAnnoIndex 全量反推。
+  function resolveIndexFast(it) {
+    if (it && it.index != null) return Promise.resolve(it.index);
+    return resolveAnnoIndex(it);
+  }
+
   // 切换某标注的「公开」状态（策展）
   function toggleAnnoShared(it, btnEl, rowEl) {
     var token = it.token;
     if (!token) { toast("缺少来源 token", "error"); return; }
     var target = !it.shared;
     btnEl.disabled = true;
-    resolveAnnoIndex(it)
+    resolveIndexFast(it)
       .then(function (index) {
         return apiFetch("/api/annotation/" + encodeURIComponent(token) + "/" + index, {
           method: "PATCH",
@@ -2451,7 +2460,7 @@
     return g;
   }
 
-  // 提交管理员编辑：PATCH geom + note（先 resolve index 再 PATCH）
+  // 提交管理员编辑：PATCH geom + note（index 直接用 it.index，无则兜底反推）
   function commitAdminEdit(it, noteVal) {
     var geom = buildEditGeom(it);
     var body = { geom: geom, note: noteVal };
@@ -2461,7 +2470,7 @@
     } else if ((it.type || "rect") === "rect") {
       body.geom.size_mm = it.size_mm != null ? it.size_mm : 0;
     }
-    resolveAnnoIndex(it)
+    resolveIndexFast(it)
       .then(function (index) {
         return apiFetch("/api/annotation/" + encodeURIComponent(it.token) + "/" + index, {
           method: "PATCH",
@@ -2491,9 +2500,11 @@
     refreshCurrentAnnotations();
   }
 
-  // 删除标注（管理员，任意来源）：先 resolve index 再 DELETE
+  // 删除标注（管理员，任意来源）：
+  // index 直接用 it.index（annotations 接口已带），DELETE 成功后立即乐观从本地
+  // 移除并重绘（用户立刻看到消失），真实状态放后台异步同步，不与反馈串行。
   function deleteAnnoItem(it) {
-    resolveAnnoIndex(it)
+    resolveIndexFast(it)
       .then(function (index) {
         return apiFetch("/api/annotation/" + encodeURIComponent(it.token) + "/" + index, {
           method: "DELETE",
@@ -2503,17 +2514,50 @@
         });
       })
       .then(function () {
+        // ---- 乐观更新（同步执行，立即反馈）----
+        // 1) flatItems 按引用移除（画布数据源）
+        var items = flatAnnoItems();
+        var fi = items.indexOf(it);
+        if (fi >= 0) items.splice(fi, 1);
+        // 2) currentAnnotations 分组中按引用移除，grp.count--，空组剔除
+        if (currentAnnotations && currentAnnotations.annotations) {
+          var groups = currentAnnotations.annotations;
+          for (var gi = groups.length - 1; gi >= 0; gi--) {
+            var g = groups[gi];
+            var ii = (g.items || []).indexOf(it);
+            if (ii >= 0) {
+              g.items.splice(ii, 1);
+              g.count = Math.max(0, (g.count || 1) - 1);
+              if (g.items.length === 0) groups.splice(gi, 1);
+            }
+          }
+        }
+        // 3) 若当前编辑/选中项正是它，清选中并关编辑卡
+        //    （editItem 多为 flatItems 副本，引用不等时按 token+ts+type 判定）
+        if (editItem && (editItem === it ||
+            (editItem.token === it.token && Number(editItem.ts) === Number(it.ts) &&
+             (editItem.type || "rect") === (it.type || "rect")))) {
+          editItem = null;
+          closeEditCard();
+        }
+        // 4) 重建扁平缓存 + 重绘 + 面板即时重渲 + 立即 toast
+        rebuildFlatItems();
+        redrawAnnoCanvas();
+        if (annoPanelOpen) renderAnnoPanel((currentAnnotations || {}).annotations || []);
         toast("已删除标注", "success");
-        if (editItem === it) { editItem = null; closeEditCard(); }
+        // ---- 后台异步同步（不阻塞上面的即时反馈）----
         refreshCurrentAnnotations();
+        // 全量索引只影响项目/未归类行的计数徽章，后台慢慢同步即可
         loadAnnotationsIndex().then(function () {
           renderProjects(allProjects);
           renderUnfiled();
-          // 刷新标注面板
-          if (annoPanelOpen) renderAnnoPanel((currentAnnotations || {}).annotations || []);
         });
       })
-      .catch(function (e) { toast("删除失败: " + e.message, "error"); });
+      .catch(function (e) {
+        toast("删除失败: " + e.message, "error");
+        // 失败恢复：重新拉取真实状态
+        refreshCurrentAnnotations();
+      });
   }
 
   // 跳转并选中进入编辑态（标注面板"编辑"按钮）

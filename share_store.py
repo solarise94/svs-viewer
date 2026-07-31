@@ -864,11 +864,17 @@ def annotations_by_slide():
     """把全部 rois 按 slide 分组聚合。
 
     返回 {slide: {label: {"label","count","items":[...]}, ...}}，items 含
-    token/x/y/size_mm/side_px/ts/type 及 arrow/freehand 的几何字段。结构是嵌套：
-    slide -> label -> group。为方便前端，外层每个 slide 的值是按 label 的分组列表。
+    index/token/slide/x/y/size_mm/side_px/ts/type 及 arrow/freehand 的几何字段。
+    index 为该 token 的 rois 按文件插入顺序的序号（同 list_rois 的 counters
+    逻辑），与 delete_roi / set_roi_shared / update_roi 的 index 语义完全一致，
+    前端可直接用于 DELETE/PATCH /api/annotation/<token>/<index>。
+    结构是嵌套：slide -> label -> group。为方便前端，外层每个 slide 的值是按
+    label 的分组列表。
     """
     def _do(f):
         data = _load_locked(f)
+        from collections import defaultdict
+        counters = defaultdict(int)  # token -> 下一个 index（按文件内出现顺序）
         # slide -> label -> {label, count, items}
         by_slide = {}
         for r in data["rois"]:
@@ -880,9 +886,14 @@ def annotations_by_slide():
                 grp = {"label": lbl, "count": 0, "items": []}
                 grp_map[lbl] = grp
             grp["count"] += 1
+            # index：该 token 下按文件插入顺序的序号（同 list_rois 的 counters 逻辑）
+            tok = r.get("token")
+            idx = counters[tok]
+            counters[tok] += 1
             item = {
-                "token": r.get("token"),
-                # slide 字段也带上：前端按 token+slide+ts 定位 index 时需要
+                "index": idx,
+                "token": tok,
+                # slide 字段也带上：前端兜底反推 index（旧缓存无 index 时）需要
                 "slide": r.get("slide"),
                 "type": r.get("type", "rect"),  # 旧数据无 type 视为 rect
                 "x": r.get("x"),

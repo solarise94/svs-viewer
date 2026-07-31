@@ -638,8 +638,7 @@
       })
       .then(function () {
         toast("选区已保存", "success");
-        loadRoiPanel();
-        loadCurrentRois();
+        refreshRoisOnce();
       })
       .catch(function (e) { toast("保存失败: " + e.message, "error"); });
   }
@@ -1281,8 +1280,7 @@
         toast("已保存修改", "success");
         editItem = null;
         closeEditCard();
-        loadRoiPanel();
-        loadCurrentRois();
+        refreshRoisOnce();
       })
       .catch(function (e) { toast("保存失败: " + e.message, "error"); });
   }
@@ -1621,8 +1619,7 @@
       .then(function () {
         toast("标注已保存", "success");
         exitDrawMode();
-        loadRoiPanel();
-        loadCurrentRois();
+        refreshRoisOnce();
       })
       .catch(function (e) { toast("保存失败: " + e.message, "error"); exitDrawMode(); });
   }
@@ -1650,6 +1647,32 @@
       })
       .then(function (rois) {
         renderRoiPanel(rois || []);
+      })
+      .catch(function (e) { toast(e.message, "error"); });
+  }
+
+  // 一次拉取 /api/rois，同时刷新面板与画布层 currentRois。
+  // 合并原先 loadRoiPanel + loadCurrentRois 的两次重复请求为一次拉取、两路渲染
+  // （慢网/外网通道下每省一次请求就省一个 RTT）。
+  function refreshRoisOnce() {
+    return fetch(API + "/api/rois")
+      .then(function (r) {
+        if (!r.ok) throw new Error("加载选区失败");
+        return r.json();
+      })
+      .then(function (rois) {
+        rois = rois || [];
+        // 面板渲染（原 loadRoiPanel 逻辑）
+        renderRoiPanel(rois);
+        // 画布层数据（原 loadCurrentRois 逻辑）
+        if (state.slide) {
+          currentRois = rois.filter(function (r) { return r.slide === state.slide.name; });
+        } else {
+          currentRois = [];
+        }
+        // 若 editItem 已不在新列表，清除选中
+        if (editItem && currentRois.indexOf(editItem) < 0) { editItem = null; closeEditCard(); }
+        redrawAnnoCanvas();
       })
       .catch(function (e) { toast(e.message, "error"); });
   }
@@ -1755,11 +1778,27 @@
         return r.json();
       })
       .then(function () {
+        // ---- 乐观更新（同步执行，立即反馈）----
+        // 从 currentRois 移除该项（仅本人 source==="me" 的可删；
+        // 按 source 限定避免与 admin/shared 条目的 index 数值冲突误删）
+        for (var i = currentRois.length - 1; i >= 0; i--) {
+          var it = currentRois[i];
+          if (it.index === index && it.source === "me") {
+            if (editItem === it) editItem = null;
+            currentRois.splice(i, 1);
+          }
+        }
+        closeEditCard();
+        redrawAnnoCanvas();
         toast("已删除选区", "success");
-        loadRoiPanel();
-        loadCurrentRois();
+        // ---- 后台异步同步真实状态（一次拉取，面板与画布同时刷新）----
+        refreshRoisOnce();
       })
-      .catch(function (e) { toast(e.message, "error"); });
+      .catch(function (e) {
+        toast(e.message, "error");
+        // 失败恢复：重新拉取真实状态
+        refreshRoisOnce();
+      });
   }
 
   // 跳转到指定 ROI：切到对应切片，OSD open 后定位
