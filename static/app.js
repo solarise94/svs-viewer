@@ -14,6 +14,7 @@
     flipped: false,       // 是否水平翻转（镜像）
     drawMode: null,       // null | "arrow" | "freehand"（与 roiMode 互斥）
     showAnno: false,      // 是否在画布层显示已保存标注
+    focusAnno: null,      // null=显示全部；否则只显示该条标注（flatItems 中的引用）
   };
 
   // ---------- 401 认证处理 ----------
@@ -108,6 +109,8 @@
     logoutBtn: $("logout-btn"),
     tbbMoreBtn: $("tbb-more-btn"),
     tbbMore: $("tbb-more"),
+    roiBoxBtn: $("roi-box-btn"),
+    annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
     sidebar: $("sidebar"),
@@ -312,8 +315,9 @@
     els.annoAllBtn.disabled = true;
     els.annoPanel.style.display = "none";
     annoPanelOpen = false;
-    els.annoAllBtn.classList.remove("active");
+    syncAnnoAllBtns();
     state.showAnno = false;
+    state.focusAnno = null;
     if (state.slide) {
       // 管理员标注工具在任意打开的切片上可用（箭头/描图不依赖 mpp）
       els.annoArrowBtn.disabled = false;
@@ -329,11 +333,12 @@
             els.annoAllBtn.disabled = false;
           }
           editItem = null;
+          state.focusAnno = null;
           editing = false;
           rebuildFlatItems();
           redrawAnnoCanvas();
         })
-        .catch(function () { currentAnnotations = null; editItem = null; editing = false; rebuildFlatItems(); redrawAnnoCanvas(); });
+        .catch(function () { currentAnnotations = null; editItem = null; state.focusAnno = null; editing = false; rebuildFlatItems(); redrawAnnoCanvas(); });
     } else {
       els.annoArrowBtn.disabled = true;
       els.annoFreeBtn.disabled = true;
@@ -565,6 +570,31 @@
   function updateRoiButtons() {
     els.roi6.classList.toggle("active", state.roiMode === 6);
     els.roi65.classList.toggle("active", state.roiMode === 6.5);
+    syncRoiSlider(); // 同步移动端滑块分段 + 滑动拇指
+  }
+
+  // ---------- 移动端 ROI 滑块分段（取代旧弹窗选择器） ----------
+  // 管理端固定 6 / 6.5 两段；#roi-box-btn 为分段容器，滑块拇指滑到激活段。
+  function syncRoiSlider() {
+    var box = els.roiBoxBtn;
+    if (!box) return;
+    var segs = box.querySelectorAll(".roi-slider-seg");
+    if (!segs.length) return;
+    var activeIdx = -1;
+    segs.forEach(function (seg, i) {
+      var sz = Number(seg.getAttribute("data-size"));
+      var on = state.roiMode === sz;
+      seg.classList.toggle("active", on);
+      if (on) activeIdx = i;
+    });
+    box.classList.toggle("active", activeIdx >= 0);
+    var thumb = box.querySelector(".roi-slider-thumb");
+    if (thumb) {
+      var n = segs.length || 1;
+      thumb.style.width = (100 / n) + "%";
+      thumb.style.transform = "translateX(" + (activeIdx >= 0 ? activeIdx * 100 : 0) + "%)";
+      thumb.style.opacity = activeIdx >= 0 ? "1" : "0";
+    }
   }
 
   function createRoiBox() {
@@ -1557,9 +1587,10 @@
       typeof viewer.viewport.isAnimating === "function" && viewer.viewport.isAnimating());
     // 拖动编辑中只保留选中项的气泡，其余气泡暂停（视图静止时减少文本重绘）
     var dragging = !!(editDrag && editItem);
-    // 已保存标注
+    // 已保存标注（focus 过滤：有 focusAnno 时只画它）
     if (state.showAnno) {
       flatAnnoItems().forEach(function (it) {
+        if (state.focusAnno && it !== state.focusAnno) return;
         var selected = (editItem === it);
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
@@ -1575,9 +1606,10 @@
     if (state.drawMode === "freehand" && drawPreview && drawPreview.type === "freehand" && drawPreview.points.length >= 2) {
       drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, "预览");
     }
-    // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简）
+    // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简；focus 过滤同步）
     if (state.showAnno && !animating) {
       flatAnnoItems().forEach(function (it) {
+        if (state.focusAnno && it !== state.focusAnno) return; // focus 模式只显示该条气泡
         if (dragging && it !== editItem) return; // 拖动中只画选中项气泡
         var note = String(it.note || "");
         if (!note) return;
@@ -1937,6 +1969,7 @@
 
   function selectEditItem(it) {
     editItem = it;
+    state.focusAnno = it; // 选中某条 → 只显示它（focus 可见性）
     editing = false;  // 选中只是查看，不进入可拖动编辑态
     redrawAnnoCanvas();
     openEditCard(it);
@@ -1944,15 +1977,32 @@
 
   function clearEditItem() {
     editItem = null;
+    state.focusAnno = null; // 取消选中 → 恢复显示全部
     editing = false;
     closeEditCard();
     redrawAnnoCanvas();
   }
 
   // ---------- 显示全部标记（切换画布层显隐） ----------
+  // 同步所有相关按钮的 active 态：旧 #anno-all-btn + 新面板头部 #anno-all-toggle
+  function syncAnnoAllBtns() {
+    if (els.annoAllBtn) els.annoAllBtn.classList.toggle("active", state.showAnno);
+    if (els.annoAllToggle) {
+      els.annoAllToggle.classList.toggle("active", state.showAnno);
+      els.annoAllToggle.setAttribute("aria-pressed", state.showAnno ? "true" : "false");
+    }
+  }
   function toggleAnnoAll() {
-    state.showAnno = !state.showAnno;
-    els.annoAllBtn.classList.toggle("active", state.showAnno);
+    // 👁 =「显示全部标记」语义：若当前处于"只看选中那条"的 focus 状态，
+    // 先清空 focus 恢复显示全部；否则在「显示全部 ↔ 全部隐藏」之间切换。
+    // （画布层非绘制时 pointer-events:none，无法点空白取消 focus，故由该钮兜底。）
+    if (state.focusAnno) {
+      state.focusAnno = null;
+      state.showAnno = true;
+    } else {
+      state.showAnno = !state.showAnno;
+    }
+    syncAnnoAllBtns();
     redrawAnnoCanvas();
   }
   // 旧函数别名（兼容）
@@ -1975,7 +2025,7 @@
     c.classList.add("drawing");
     if (viewer) viewer.setMouseNavEnabled(false);
     state.showAnno = true;
-    els.annoAllBtn.classList.add("active");
+    syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();
     toast(mode === "arrow" ? "箭头模式：拖动绘制" : "描图模式：沿边缘描绘", "info");
@@ -2255,8 +2305,10 @@
         var annos = data.annotations || [];
         els.annoBtn.disabled = annos.length === 0;
         els.annoAllBtn.disabled = annos.length === 0;
-        if (annos.length === 0) { state.showAnno = false; els.annoAllBtn.classList.remove("active"); }
+        if (annos.length === 0) { state.showAnno = false; syncAnnoAllBtns(); }
         if (editItem && flatItems.indexOf(editItem) < 0) { editItem = null; editing = false; }
+        // focusAnno 引用失效（flatItems 重建）→ 清空，恢复显示全部
+        if (state.focusAnno && flatItems.indexOf(state.focusAnno) < 0) { state.focusAnno = null; }
         rebuildFlatItems();
         redrawAnnoCanvas();
       })
@@ -2477,7 +2529,7 @@
     // 引用不同，需按 token+ts+type 在 flatAnnoItems() 里找到匹配副本再选中。
     if (!state.showAnno) {
       state.showAnno = true;
-      if (els.annoAllBtn) els.annoAllBtn.classList.add("active");
+      syncAnnoAllBtns();
     }
     var match = null;
     var items = flatAnnoItems();
@@ -2488,6 +2540,7 @@
     }
     if (match) {
       editItem = match;     // 选中态：drawAnnoItem 会给蓝色描边
+      state.focusAnno = match; // 跳转/选中该条 → 只显示它
       editing = false;      // 只高亮，不开可拖动编辑态
       closeEditCard();      // 不弹编辑卡（仅点击行，非"编辑"按钮）
       redrawAnnoCanvas();
@@ -2691,6 +2744,12 @@
         editing = false;
         closeEditCard();
       }
+      // focusAnno 若指向被删项（按引用或 token+ts+type 判定）→ 清空恢复显示全部
+      if (state.focusAnno && (state.focusAnno === it ||
+          (state.focusAnno.token === it.token && Number(state.focusAnno.ts) === Number(it.ts) &&
+           (state.focusAnno.type || "rect") === (it.type || "rect")))) {
+        state.focusAnno = null;
+      }
       // 4) 重建扁平缓存 + 重绘 + 面板即时重渲 + 立即 toast
       rebuildFlatItems();
       redrawAnnoCanvas();
@@ -2847,8 +2906,20 @@
     });
     els.annoPanelClose.addEventListener("click", closeAnnoPanel);
     els.annoAllBtn.addEventListener("click", toggleAnnoAll);
+    // 面板头部「显示全部标记」切换钮（与 toggleAnnoAll 同一逻辑）
+    if (els.annoAllToggle) els.annoAllToggle.addEventListener("click", toggleAnnoAll);
     els.annoArrowBtn.addEventListener("click", function () { toggleDrawMode("arrow"); });
     els.annoFreeBtn.addEventListener("click", function () { toggleDrawMode("freehand"); });
+    // 移动端 ROI 滑块分段：点一段切换该尺寸，再点同段退出
+    if (els.roiBoxBtn) {
+      els.roiBoxBtn.querySelectorAll(".roi-slider-seg").forEach(function (seg) {
+        seg.addEventListener("click", function () {
+          if (seg.classList.contains("disabled")) return;
+          toggleRoi(Number(seg.getAttribute("data-size")));
+        });
+      });
+      syncRoiSlider();
+    }
 
     // 标注画布层绘制事件
     var c = els.annoCanvas;

@@ -24,6 +24,7 @@
     flipped: false,      // 是否水平翻转（镜像）
     drawMode: null,      // null | "arrow" | "freehand"（与 roiMode 互斥）
     showAnno: true,      // 默认始终显示（用户需要看到管理员标记）
+    focusAnno: null,     // null=显示全部；否则只显示该条标注（currentRois 中的引用）
     roiSizes: [6, 6.5],  // 本次分享允许的矩形标记尺寸（fetch config 后填充）
   };
 
@@ -76,6 +77,8 @@
     panelEdit: $("roi-panel-edit"),
     tbbMoreBtn: $("tbb-more-btn"),
     tbbMore: $("tbb-more"),
+    roiBoxBtn: $("roi-box-btn"),
+    annoAllToggle: $("anno-all-toggle"),
   };
 
   // ---------- 工具函数 ----------
@@ -249,6 +252,8 @@
     }
     setBtn(els.roi6, 6);
     setBtn(els.roi65, 6.5);
+    // 同步移动端滑块（disabled 段 + 拇指定位）
+    syncRoiSlider();
     // 若当前 roiMode 被禁则退出 ROI 模式
     if (state.roiMode != null && !allowed[state.roiMode]) {
       exitRoi();
@@ -493,6 +498,45 @@
   function updateRoiButtons() {
     els.roi6.classList.toggle("active", state.roiMode === 6);
     els.roi65.classList.toggle("active", state.roiMode === 6.5);
+    syncRoiSlider(); // 同步移动端滑块分段 + 滑动拇指
+  }
+
+  // ---------- 移动端 ROI 滑块分段（取代旧弹窗选择器） ----------
+  // #roi-box-btn 现为分段容器：滑块拇指滑到激活段；点一段切换/再点退出。
+  // 段集合由 state.roiSizes 决定，不支持的尺寸置 disabled（拇指跳过该段）。
+  function syncRoiSlider() {
+    var box = els.roiBoxBtn;
+    if (!box) return;
+    var segs = box.querySelectorAll(".roi-slider-seg");
+    if (!segs.length) return;
+    var allowed = {};
+    state.roiSizes.forEach(function (s) { allowed[Number(s)] = true; });
+    var activeIdx = -1;
+    segs.forEach(function (seg, i) {
+      var sz = Number(seg.getAttribute("data-size"));
+      var ok = !!allowed[sz];
+      seg.classList.toggle("disabled", !ok);
+      seg.disabled = !ok;
+      var on = state.roiMode === sz;
+      seg.classList.toggle("active", on);
+      if (on) activeIdx = i;
+    });
+    box.classList.toggle("active", activeIdx >= 0);
+    // 滑动拇指：定位到激活段，按"可用段"等分宽度（跳过 disabled 段）
+    var thumb = box.querySelector(".roi-slider-thumb");
+    if (thumb) {
+      var usable = Array.prototype.filter.call(segs, function (s) { return !s.classList.contains("disabled"); });
+      var n = usable.length || 1;
+      var uIdx = 0;
+      for (var k = 0; k < segs.length; k++) {
+        if (segs[k].classList.contains("disabled")) continue;
+        if (k === activeIdx) break;
+        uIdx++;
+      }
+      thumb.style.width = (100 / n) + "%";
+      thumb.style.transform = "translateX(" + (uIdx * 100) + "%)";
+      thumb.style.opacity = activeIdx >= 0 ? "1" : "0";
+    }
   }
 
   function createRoiBox() {
@@ -755,9 +799,10 @@
       typeof viewer.viewport.isAnimating === "function" && viewer.viewport.isAnimating());
     // 拖动编辑中只保留选中项的气泡，其余气泡暂停（视图静止时减少文本重绘）
     var dragging = !!(editDrag && editItem);
-    // 已保存标注
+    // 已保存标注（focus 过滤：有 focusAnno 时只画它）
     if (state.showAnno) {
       currentRois.forEach(function (it) {
+        if (state.focusAnno && it !== state.focusAnno) return;
         var selected = (editItem === it);
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
@@ -773,9 +818,10 @@
     if (state.drawMode === "freehand" && drawPreview && drawPreview.type === "freehand" && drawPreview.points.length >= 2) {
       drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, "预览");
     }
-    // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简）
+    // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简；focus 过滤同步）
     if (state.showAnno && !animating) {
       currentRois.forEach(function (it) {
+        if (state.focusAnno && it !== state.focusAnno) return; // focus 模式只显示该条气泡
         if (dragging && it !== editItem) return; // 拖动中只画选中项气泡
         var note = String(it.note || "");
         if (!note) return;
@@ -1053,9 +1099,25 @@
   }
 
   // ---------- 显示/隐藏标记（默认开） ----------
+  // 同步所有相关按钮的 active 态：旧 #anno-all-btn + 新面板头部 #anno-all-toggle
+  function syncAnnoAllBtns() {
+    if (els.annoAllBtn) els.annoAllBtn.classList.toggle("active", state.showAnno);
+    if (els.annoAllToggle) {
+      els.annoAllToggle.classList.toggle("active", state.showAnno);
+      els.annoAllToggle.setAttribute("aria-pressed", state.showAnno ? "true" : "false");
+    }
+  }
   function toggleAnnoAll() {
-    state.showAnno = !state.showAnno;
-    els.annoAllBtn.classList.toggle("active", state.showAnno);
+    // 👁 =「显示全部标记」语义：若当前处于"只看选中那条"的 focus 状态，
+    // 先清空 focus 恢复显示全部；否则在「显示全部 ↔ 全部隐藏」之间切换。
+    // （画布层非绘制时 pointer-events:none，无法点空白取消 focus，故由该钮兜底。）
+    if (state.focusAnno) {
+      state.focusAnno = null;
+      state.showAnno = true;
+    } else {
+      state.showAnno = !state.showAnno;
+    }
+    syncAnnoAllBtns();
     redrawAnnoCanvas();
   }
 
@@ -1176,6 +1238,7 @@
   // 要移动/缩放必须先点编辑卡上的「✎ 编辑」。
   function selectEditItem(it) {
     editItem = it;
+    state.focusAnno = it; // 选中某条 → 只显示它（focus 可见性）
     state.editing = false;
     redrawAnnoCanvas();
     if (isEditable(it)) {
@@ -1187,6 +1250,7 @@
 
   function clearEditItem() {
     editItem = null;
+    state.focusAnno = null; // 取消选中 → 恢复显示全部
     state.editing = false;
     closeEditCard();
     redrawAnnoCanvas();
@@ -1349,7 +1413,7 @@
     els.annoCanvas.classList.add("drawing");
     if (viewer) viewer.setMouseNavEnabled(false);
     state.showAnno = true;
-    els.annoAllBtn.classList.add("active");
+    syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();
     toast(mode === "arrow" ? "箭头模式：拖动绘制" : "描图模式：沿边缘描绘", "info");
@@ -1656,16 +1720,17 @@
 
   // 加载当前切片的标注（本 token + 管理员）供画布层绘制
   function loadCurrentRois() {
-    if (!state.slide) { currentRois = []; editItem = null; state.editing = false; closeEditCard(); redrawAnnoCanvas(); return; }
+    if (!state.slide) { currentRois = []; editItem = null; state.focusAnno = null; state.editing = false; closeEditCard(); redrawAnnoCanvas(); return; }
     fetch(API + "/api/rois")
       .then(function (r) { return r.json(); })
       .then(function (rois) {
         currentRois = (rois || []).filter(function (r) { return r.slide === state.slide.name; });
         // 若 editItem 已不在新列表，清除选中
         if (editItem && currentRois.indexOf(editItem) < 0) { editItem = null; state.editing = false; closeEditCard(); }
+        if (state.focusAnno && currentRois.indexOf(state.focusAnno) < 0) { state.focusAnno = null; }
         redrawAnnoCanvas();
       })
-      .catch(function () { currentRois = []; editItem = null; state.editing = false; closeEditCard(); redrawAnnoCanvas(); });
+      .catch(function () { currentRois = []; editItem = null; state.editing = false; closeEditCard(); state.focusAnno = null; redrawAnnoCanvas(); });
   }
 
   // ---------- 选区面板 ----------
@@ -1702,6 +1767,7 @@
         }
         // 若 editItem 已不在新列表，清除选中
         if (editItem && currentRois.indexOf(editItem) < 0) { editItem = null; state.editing = false; closeEditCard(); }
+        if (state.focusAnno && currentRois.indexOf(state.focusAnno) < 0) { state.focusAnno = null; }
         redrawAnnoCanvas();
       })
       .catch(function (e) { toast(e.message, "error"); });
@@ -1815,6 +1881,7 @@
           var it = currentRois[i];
           if (it.index === index && it.source === "me") {
             if (editItem === it) { editItem = null; state.editing = false; }
+            if (state.focusAnno === it) { state.focusAnno = null; }
             currentRois.splice(i, 1);
           }
         }
@@ -1834,16 +1901,32 @@
   // 跳转到指定 ROI：切到对应切片，OSD open 后定位
   function jumpToRoi(r) {
     var needSwitch = !(state.slide && state.slide.name === r.slide);
+    // 跳转后聚焦该标注（focusAnno = 该条引用），让画布只显示它
+    var focusAfter = function () {
+      var match = null;
+      for (var i = 0; i < currentRois.length; i++) {
+        var it = currentRois[i];
+        if (it.index === r.index && it.token === r.token) { match = it; break; }
+      }
+      state.focusAnno = match || null;
+      editItem = match || null;
+      state.editing = false;
+      closeEditCard();
+      redrawAnnoCanvas();
+    };
     if (needSwitch) {
       // 一次性监听 open 完成后定位
       var handler = function () {
         viewer.removeHandler("open", handler);
         doJump(r);
+        // 等标注加载完再聚焦
+        setTimeout(focusAfter, 300);
       };
       viewer.addHandler("open", handler);
       openSlide(r.slide);
     } else {
       doJump(r);
+      focusAfter();
     }
   }
 
@@ -1975,6 +2058,18 @@
     els.annoArrowBtn.addEventListener("click", function () { toggleDrawMode("arrow"); });
     els.annoFreeBtn.addEventListener("click", function () { toggleDrawMode("freehand"); });
     els.annoAllBtn.addEventListener("click", toggleAnnoAll);
+    // 面板头部「显示全部标记」切换钮（与 toggleAnnoAll 同一逻辑）
+    if (els.annoAllToggle) els.annoAllToggle.addEventListener("click", toggleAnnoAll);
+    // 移动端 ROI 滑块分段：点一段切换该尺寸，再点同段退出（toggleRoi 自带切换语义）
+    if (els.roiBoxBtn) {
+      els.roiBoxBtn.querySelectorAll(".roi-slider-seg").forEach(function (seg) {
+        seg.addEventListener("click", function () {
+          if (seg.classList.contains("disabled")) return;
+          toggleRoi(Number(seg.getAttribute("data-size")));
+        });
+      });
+      syncRoiSlider();
+    }
 
     // 标注画布层绘制事件
     var c = els.annoCanvas;

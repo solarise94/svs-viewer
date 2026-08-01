@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260801b" />
+  <link rel="stylesheet" href="/static/style.css?v=20260801c" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -26,10 +26,23 @@
         <button id="zoom-in" class="icon-btn" title="放大" aria-label="放大">+</button>
       </div>
 
-      <!-- ROI 分段控件（NSSegmentedControl 风格） -->
+      <!-- 视图变换：旋转/镜像/复位 —— 常驻主栏（桌面内联、移动端底栏直接可达） -->
+      <div class="btn-group view-tools">
+        <button id="rotate-btn" class="icon-btn" title="顺时针旋转 90°" aria-label="旋转">↻</button>
+        <button id="flip-btn" class="icon-btn" title="水平翻转（镜像）" aria-label="镜像">⇋</button>
+        <button id="reset-btn" class="tool-btn" title="复位">Reset</button>
+      </div>
+
+      <!-- ROI 分段控件（NSSegmentedControl 风格；仅桌面端显示） -->
       <div class="seg-control roi-group" role="group" aria-label="ROI 分段">
         <button id="roi-6" class="seg roi-btn" data-size="6"><span class="tb-txt">ROI </span>6mm</button>
         <button id="roi-6-5" class="seg roi-btn" data-size="6.5"><span class="tb-txt">ROI </span>6.5mm</button>
+      </div>
+      <!-- 移动端 ROI 滑块分段（桌面隐藏）：滑动拇指 + 点选切换尺寸，再点退出 -->
+      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸">
+        <span class="roi-slider-thumb" aria-hidden="true"></span>
+        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记">6</button>
+        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记">6.5</button>
       </div>
 
       <!-- 标注绘制工具：箭头 / 描图（与 ROI 模式互斥） -->
@@ -41,7 +54,7 @@
       <!-- 标记：打开当前切片标注面板 -->
       <button id="anno-btn" class="tool-btn" disabled>标记</button>
 
-      <!-- 更多（移动端溢出动作面板触发钮，桌面隐藏） -->
+      <!-- 更多（移动端溢出面板触发钮，桌面隐藏） -->
       <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多">⋯</button>
 
       <!-- 上下文动作条：桌面 display:contents（内联）；移动端仅在 ROI/绘制激活时显示 -->
@@ -56,13 +69,10 @@
         <button id="save-btn" class="tool-btn primary" disabled>保存图片</button>
       </div>
 
-      <!-- 次要按钮：桌面 display:contents（内联）；移动端进 ⋯ 面板 -->
+      <!-- ⋯ 溢出面板：旋转/镜像/复位已迁出，仅余 显示全部标记(桌面内联) + mpp 设置 -->
       <div class="tbb-more" id="tbb-more">
-        <button id="rotate-btn" class="icon-btn" title="顺时针旋转 90°" aria-label="旋转">↻<span class="tbb-lbl"> 旋转</span></button>
-        <button id="flip-btn" class="icon-btn" title="水平翻转（镜像）" aria-label="镜像">⇋<span class="tbb-lbl"> 镜像</span></button>
-        <!-- 显示全部标记叠加层（切换标注画布层显隐） -->
+        <!-- 「显示全部标记」桌面内联钮：合并进标注面板头部，移动端 CSS 隐藏 -->
         <button id="anno-all-btn" class="tool-btn" disabled>显示全部标记</button>
-        <button id="reset-btn" class="tool-btn">Reset</button>
         <!-- mpp 手动设置区（仅 mpp 缺失或估算时显示） -->
         <div id="mpp-setter" class="mpp-setter" style="display:none;">
           <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
@@ -200,7 +210,11 @@
       <div id="anno-panel" class="anno-panel" style="display:none;">
         <div class="anno-panel-header">
           <span id="anno-panel-title">标注</span>
-          <button id="anno-panel-close" class="icon-btn close" aria-label="关闭">×</button>
+          <div class="anno-panel-header-actions">
+            <!-- 显示/隐藏全部标记：与 state.showAnno 联动（active = 显示全部） -->
+            <button id="anno-all-toggle" class="panel-eye-btn" title="显示/隐藏全部标记" aria-label="显示/隐藏全部标记" aria-pressed="false">👁</button>
+            <button id="anno-panel-close" class="icon-btn close" aria-label="关闭">×</button>
+          </div>
         </div>
         <div id="anno-edit-wrap" class="anno-edit-wrap" style="display:none;"></div>
         <div id="anno-panel-list" class="anno-panel-list">
@@ -213,6 +227,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260801b"></script>
+  <script src="/static/app.js?v=20260801c"></script>
 </body>
 </html>
