@@ -177,20 +177,35 @@
     viewer.addHandler("close", clearBaseThumb);
   }
 
+  // 把"图像缩放比"换算成读片软件常用的物镜等效倍率（如 20× / 40×）。
+  // 约定屏幕 96 DPI（1 屏像素 ≈ 25400/96 µm）；缺 mpp 时无法换算，回退百分比。
+  function formatMag(mag) {
+    if (mag >= 10000) return (Math.round(mag / 100) * 100) + "×";
+    if (mag >= 10) return Math.round(mag) + "×";
+    if (mag >= 1) return mag.toFixed(1) + "×";
+    return mag.toFixed(2) + "×";
+  }
   function updateZoomBadge() {
     try {
       if (!viewer || !viewer.viewport || !viewer.source) {
-        els.zoomBadge.textContent = "100%";
+        els.zoomBadge.textContent = "—";
         return;
       }
       var zoom = viewer.viewport.getZoom(true);
       var containerW = viewer.viewport.getContainerSize().x;
       var imgW = viewer.source.dimensions.x;
-      // 真实图像缩放 = 视口缩放 × 容器宽 / 图像宽（100% = 1 图像像素对应 1 屏幕像素）
+      // 真实图像缩放 = 视口缩放 × 容器宽 / 图像宽（1 = 1 图像像素对应 1 屏幕像素）
       var imageZoom = (zoom * containerW) / imgW;
-      els.zoomBadge.textContent = Math.round(imageZoom * 100) + "%";
+      var mpp = state.mppX;
+      if (mpp && mpp > 0 && imageZoom > 0) {
+        // 物镜等效倍率 = 屏幕像素物理尺寸(µm) / 当前每屏像素对应的标本 µm
+        var mag = (25400 / 96) / (mpp * imageZoom);
+        els.zoomBadge.textContent = formatMag(mag);
+      } else {
+        els.zoomBadge.textContent = Math.round(imageZoom * 100) + "%";
+      }
     } catch (e) {
-      els.zoomBadge.textContent = "100%";
+      els.zoomBadge.textContent = "—";
     }
   }
 
