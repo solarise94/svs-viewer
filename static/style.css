@@ -297,6 +297,16 @@ button {
   min-height: 0;
 }
 
+/* 侧栏抽屉遮罩（手机端）：默认隐藏，抽屉打开时 .open 显示 */
+.sidebar-mask {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  z-index: 290;
+}
+.sidebar-mask.open { display: block; }
+
 /* ---------- 左侧边栏：Finder 源列表风 ---------- */
 #sidebar {
   width: 320px;
@@ -988,6 +998,14 @@ button {
   height: 24px;
   font-size: 18px;
 }
+/* 菜单按钮（汉堡）：仅手机端显示，用于打开侧栏抽屉；桌面默认隐藏 */
+.icon-btn.menu-btn {
+  display: none;
+  width: 32px;
+  height: 32px;
+  font-size: 18px;
+  flex-shrink: 0;
+}
 .picker-list {
   flex: 1;
   overflow-y: auto;
@@ -1385,11 +1403,73 @@ button {
    响应式
    ========================================================================= */
 @media (max-width: 768px) {
-  #sidebar { width: 100%; }
+  /* 菜单按钮：手机端可见 */
+  .icon-btn.menu-btn { display: inline-flex; }
+
+  /* 侧栏改为抽屉：默认滑出屏外，.open 时滑入；桌面端布局完全不受影响 */
+  #sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: min(85vw, 340px);
+    max-width: 340px;
+    transform: translateX(-105%);
+    transition: transform 0.22s ease;
+    z-index: 300;
+  }
+  #sidebar.open { transform: none; }
+
+  /* 标题栏折行：让工具栏落到第二行，避免与标题挤一行 */
+  #app-header {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 52px;
+    padding: 6px 12px;
+    row-gap: 4px;
+    column-gap: 10px;
+  }
+  .title-group {
+    flex: 1;
+    min-width: 0;
+    order: 0;
+  }
+  /* 手机端隐藏长标题文字，仅保留当前切片名，给工具栏腾位 */
+  .header-title,
+  .title-sep { display: none; }
+  #toolbar {
+    order: 1;
+    flex-basis: 100%;
+    width: 100%;
+  }
+
+  /* 工具栏按钮/输入框：缩小尺寸，保证最小触控高度约 32px、不溢出 */
+  .icon-btn { width: 32px; height: 32px; font-size: 16px; }
+  .tool-btn { padding: 6px 9px; font-size: 12px; min-height: 32px; }
+  .seg-control .seg { padding: 5px 9px; font-size: 12px; }
+  .anno-label-input { width: 90px; font-size: 12px; }
+  #mpp-input { width: 64px; }
+
+  /* 查看器占满剩余宽度与高度（侧栏已脱离文档流） */
+  #main { flex: 1; }
+  #viewer-wrap,
+  #viewer { width: 100%; height: 100%; }
+
+  /* 标注面板：手机端贴底显示，避免遮挡 viewer */
   .anno-panel {
     right: 8px; left: 8px; top: auto; bottom: 8px;
     width: auto; max-height: 55%;
   }
-  .title-group { flex-shrink: 1; }
-  .header-current { max-width: 100px; }
+}
+
+/* 更窄屏（≤480px）：进一步收紧工具栏，避免横向溢出 */
+@media (max-width: 480px) {
+  #app-header { padding: 6px 10px; gap: 8px; }
+  /* 工具栏自身允许横向滚动，按钮排不下时滑动而非撑破页面 */
+  #toolbar { gap: 4px; }
+  .tool-btn { padding: 5px 7px; font-size: 11px; }
+  .icon-btn { width: 30px; height: 30px; font-size: 15px; }
+  .seg-control .seg { padding: 5px 7px; font-size: 11px; }
+  .anno-label-input { width: 72px; font-size: 11px; }
+  .header-current { max-width: 56vw; }
 }

@@ -4,13 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260731k" />
+  <link rel="stylesheet" href="/static/style.css?v=20260801a" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
 <body>
   <!-- 统一标题栏 + 工具栏（macOS unified titlebar-toolbar） -->
   <header id="app-header">
+    <!-- 菜单按钮：仅手机端显示，打开侧栏抽屉 -->
+    <button id="menu-btn" class="icon-btn menu-btn" aria-label="菜单">☰</button>
     <div class="title-group">
       <span class="header-title">SVS 病理图像查看器</span>
       <span class="title-sep">·</span>
@@ -70,6 +72,8 @@
 
   <!-- 主体：左侧边栏 + 右侧查看器 -->
   <div id="main">
+    <!-- 侧栏抽屉遮罩（手机端，打开抽屉时显示，点击关闭） -->
+    <div id="sidebar-mask" class="sidebar-mask"></div>
     <!-- 左侧边栏：Finder 源列表风 -->
     <aside id="sidebar">
       <div class="sidebar-top">
@@ -203,6 +207,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260731k"></script>
+  <script src="/static/app.js?v=20260801a"></script>
 </body>
 </html>

@@ -106,6 +106,10 @@
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
     logoutBtn: $("logout-btn"),
+    // 手机端侧栏抽屉
+    menuBtn: $("menu-btn"),
+    sidebar: $("sidebar"),
+    sidebarMask: $("sidebar-mask"),
     // 项目
     newProjectBtn: $("new-project-btn"),
     newProjectForm: $("new-project-form"),
@@ -422,6 +426,13 @@
         document.querySelectorAll(".slide-row").forEach(function (it) {
           it.classList.toggle("active", it.dataset.name === name);
         });
+        // 手机端：打开切片后自动收起侧栏抽屉，让用户立刻看到查看器；
+        // 抽屉收起会改变 viewer 容器宽度，这里补一次画布尺寸同步。
+        if (isMobileWidth()) {
+          closeSidebarDrawer();
+          resizeAnnoCanvas();
+          redrawAnnoCanvas();
+        }
       })
       .catch(function (e) { toast("获取切片信息失败: " + e, "error"); });
   }
@@ -574,8 +585,7 @@
     var r = state.roi;
     if (r.side <= 0) return;
     var label = roiBox.querySelector(".roi-label");
-    // 仅在 ROI 模式下刷新标签；标注跳转的临时框标签由 showTempRoiBox 自写，
-    // 避免 roiMode 为 null 时显示 "nullmm × nullmm"
+    // 仅在 ROI 模式下刷新标签，避免 roiMode 为 null 时显示 "nullmm × nullmm"
     if (label && state.roiMode != null) label.textContent = state.roiMode + "mm × " + state.roiMode + "mm";
     var rect = viewer.viewport.imageToViewportRectangle(r.x, r.y, r.side, r.side);
     var existing = viewer.getOverlayById(roiBox);
@@ -1416,6 +1426,30 @@
     var p = function (n) { return n < 10 ? "0" + n : n; };
     return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
       " " + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+
+  // =========================================================================
+  // 手机端侧栏抽屉
+  // =========================================================================
+  // 仅手机端（≤768px）启用抽屉行为；桌面端 sidebar 始终静态可见，
+  // open/close 在桌面下也是 no-op（CSS 不生效，DOM class 无副作用）。
+  function isMobileWidth() {
+    return window.matchMedia && window.matchMedia("(max-width: 768px)").matches;
+  }
+  function openSidebarDrawer() {
+    if (!els.sidebar || !els.sidebarMask) return;
+    els.sidebar.classList.add("open");
+    els.sidebarMask.classList.add("open");
+  }
+  function closeSidebarDrawer() {
+    if (!els.sidebar || !els.sidebarMask) return;
+    els.sidebar.classList.remove("open");
+    els.sidebarMask.classList.remove("open");
+  }
+  function toggleSidebarDrawer() {
+    if (!els.sidebar) return;
+    if (els.sidebar.classList.contains("open")) { closeSidebarDrawer(); }
+    else { openSidebarDrawer(); }
   }
 
   // =========================================================================
@@ -2364,7 +2398,10 @@
       .finally(function () { btnEl.disabled = false; });
   }
 
-  // 点击标注条目：fitBounds（按类型算包围盒）+ 临时重建黄色 ROI 框
+  // 点击标注条目：fitBounds（按类型算包围盒）+ 在画布上选中高亮该标注。
+  // 不再画黄色临时 ROI 框（旧实现会残留且对箭头/描图显示 "0mm × 0mm"，
+  // 还会覆盖 state.roi 破坏 ROI 模式选区）。改为复用既有的"选中态高亮"：
+  // 被 editItem 选中的标注在 redrawAnnoCanvas/drawAnnoItem 中以蓝色描边。
   function jumpToAnno(it) {
     if (!state.slide || !viewer || !viewer.viewport) return;
     var typ = it.type || "rect";
@@ -2389,8 +2426,27 @@
         x - pad, y - pad, side + pad * 2, side + pad * 2);
       viewer.viewport.fitBounds(rect);
     } catch (e) {}
-    // 临时 ROI 框（仅视觉，不进入保存态）
-    showTempRoiBox(x, y, side, it.size_mm);
+
+    // 选中高亮：flatItems 是 rebuildFlatItems 生成的副本，it 来自面板分组，
+    // 引用不同，需按 token+ts+type 在 flatAnnoItems() 里找到匹配副本再选中。
+    if (!state.showAnno) {
+      state.showAnno = true;
+      if (els.annoAllBtn) els.annoAllBtn.classList.add("active");
+    }
+    var match = null;
+    var items = flatAnnoItems();
+    for (var i = 0; i < items.length; i++) {
+      var f = items[i];
+      if (f.token === it.token && Number(f.ts) === Number(it.ts) &&
+          (f.type || "rect") === (it.type || "rect")) { match = f; break; }
+    }
+    if (match) {
+      editItem = match;     // 选中态：drawAnnoItem 会给蓝色描边
+      editing = false;      // 只高亮，不开可拖动编辑态
+      closeEditCard();      // 不弹编辑卡（仅点击行，非"编辑"按钮）
+      redrawAnnoCanvas();
+    }
+    return match;           // 供 jumpAndEditAnno 复用匹配结果
   }
 
   // ---------- 编辑卡（标注面板顶部） + 删除 ----------
@@ -2538,92 +2594,117 @@
   }
 
   // 删除标注（管理员，任意来源）：
-  // index 直接用 it.index（annotations 接口已带），DELETE 成功后立即乐观从本地
-  // 移除并重绘（用户立刻看到消失），真实状态放后台异步同步，不与反馈串行。
+  // 幂等 + 过期自动重试。后端 index 是该 token 下按插入序的序号，数据变动后
+  // 本地缓存 index（it.index）可能过期 → 后端 404「标注不存在」。处理：
+  //   1) 先按 resolveIndexFast（优先 it.index）发 DELETE；
+  //   2) 若 404：改用 resolveAnnoIndex（重新拉 /api/share/rois 按 slide+ts+几何
+  //      反推最新 index）重试 DELETE 一次；
+  //   3) 若 resolveAnnoIndex 也找不到（抛"未找到对应标注"）或重试仍 404 → 说明
+  //      该标注在服务端已不存在，删除本就幂等，视为成功，走乐观移除 + toast；
+  //   4) 非 404 错误（网络/403 等）按原逻辑 toast「删除失败」并刷新恢复。
   function deleteAnnoItem(it) {
-    resolveIndexFast(it)
-      .then(function (index) {
-        return apiFetch("/api/annotation/" + encodeURIComponent(it.token) + "/" + index, {
-          method: "DELETE",
-        }).then(function (r) {
-          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "删除失败"); });
-          return r.json();
+    // 发 DELETE，返回 { ok, status }：成功 ok=true；失败携带 HTTP status 供上层
+    // 区分 404（幂等可放过）与其他错误（需报错恢复）。
+    function sendDelete(index) {
+      return apiFetch("/api/annotation/" + encodeURIComponent(it.token) + "/" + index, {
+        method: "DELETE",
+      }).then(function (r) {
+        if (r.ok) return { ok: true, status: r.status };
+        // 消费 body 以释放流，失败也无所谓（仅取 status）
+        return r.json().catch(function () { return {}; }).then(function () {
+          return { ok: false, status: r.status };
         });
-      })
-      .then(function () {
-        // ---- 乐观更新（同步执行，立即反馈）----
-        // 1) flatItems 按引用移除（画布数据源）
-        var items = flatAnnoItems();
-        var fi = items.indexOf(it);
-        if (fi >= 0) items.splice(fi, 1);
-        // 2) currentAnnotations 分组中按引用移除，grp.count--，空组剔除
-        if (currentAnnotations && currentAnnotations.annotations) {
-          var groups = currentAnnotations.annotations;
-          for (var gi = groups.length - 1; gi >= 0; gi--) {
-            var g = groups[gi];
-            var ii = (g.items || []).indexOf(it);
-            if (ii >= 0) {
-              g.items.splice(ii, 1);
-              g.count = Math.max(0, (g.count || 1) - 1);
-              if (g.items.length === 0) groups.splice(gi, 1);
-            }
+      });
+    }
+
+    // 乐观更新：成功路径与"视为已删除"路径共用，立即反馈 + 后台异步同步。
+    function applyAnnoRemoved() {
+      // 1) flatItems 按引用移除（画布数据源）
+      var items = flatAnnoItems();
+      var fi = items.indexOf(it);
+      if (fi >= 0) items.splice(fi, 1);
+      // 2) currentAnnotations 分组中按引用移除，grp.count--，空组剔除
+      if (currentAnnotations && currentAnnotations.annotations) {
+        var groups = currentAnnotations.annotations;
+        for (var gi = groups.length - 1; gi >= 0; gi--) {
+          var g = groups[gi];
+          var ii = (g.items || []).indexOf(it);
+          if (ii >= 0) {
+            g.items.splice(ii, 1);
+            g.count = Math.max(0, (g.count || 1) - 1);
+            if (g.items.length === 0) groups.splice(gi, 1);
           }
         }
-        // 3) 若当前编辑/选中项正是它，清选中并关编辑卡
-        //    （editItem 多为 flatItems 副本，引用不等时按 token+ts+type 判定）
-        if (editItem && (editItem === it ||
-            (editItem.token === it.token && Number(editItem.ts) === Number(it.ts) &&
-             (editItem.type || "rect") === (it.type || "rect")))) {
-          editItem = null;
-          editing = false;
-          closeEditCard();
-        }
-        // 4) 重建扁平缓存 + 重绘 + 面板即时重渲 + 立即 toast
-        rebuildFlatItems();
-        redrawAnnoCanvas();
-        if (annoPanelOpen) renderAnnoPanel((currentAnnotations || {}).annotations || []);
-        toast("已删除标注", "success");
-        // ---- 后台异步同步（不阻塞上面的即时反馈）----
-        refreshCurrentAnnotations();
-        // 全量索引只影响项目/未归类行的计数徽章，后台慢慢同步即可
-        loadAnnotationsIndex().then(function () {
-          renderProjects(allProjects);
-          renderUnfiled();
+      }
+      // 3) 若当前编辑/选中项正是它，清选中并关编辑卡
+      //    （editItem 多为 flatItems 副本，引用不等时按 token+ts+type 判定）
+      if (editItem && (editItem === it ||
+          (editItem.token === it.token && Number(editItem.ts) === Number(it.ts) &&
+           (editItem.type || "rect") === (it.type || "rect")))) {
+        editItem = null;
+        editing = false;
+        closeEditCard();
+      }
+      // 4) 重建扁平缓存 + 重绘 + 面板即时重渲 + 立即 toast
+      rebuildFlatItems();
+      redrawAnnoCanvas();
+      if (annoPanelOpen) renderAnnoPanel((currentAnnotations || {}).annotations || []);
+      toast("已删除标注", "success");
+      // ---- 后台异步同步（不阻塞上面的即时反馈）----
+      refreshCurrentAnnotations();
+      // 全量索引只影响项目/未归类行的计数徽章，后台慢慢同步即可
+      loadAnnotationsIndex().then(function () {
+        renderProjects(allProjects);
+        renderUnfiled();
+      });
+    }
+
+    resolveIndexFast(it)
+      .then(function (index) {
+        return sendDelete(index).then(function (res) {
+          if (res.ok) return { treated: true };
+          // 第一次 404：index 可能过期，用 resolveAnnoIndex 反推最新 index 重试一次
+          if (res.status === 404) {
+            return resolveAnnoIndex(it)
+              .then(function (freshIndex) { return sendDelete(freshIndex); })
+              .then(function (res2) {
+                if (res2.ok) return { treated: true };
+                // 重试仍 404 → 服务端已无此标注，删除幂等，视为成功
+                if (res2.status === 404) return { treated: true, alreadyGone: true };
+                // 其他错误冒泡到 catch
+                throw new Error("删除失败 (" + res2.status + ")");
+              })
+              .catch(function (e) {
+                // resolveAnnoIndex 抛"未找到对应标注" → 服务端已无此标注，视为成功
+                if (e && /未找到对应标注/.test(e.message)) {
+                  return { treated: true, alreadyGone: true };
+                }
+                throw e; // 其余错误继续冒泡
+              });
+          }
+          // 非 404 错误：报错并在 catch 中刷新恢复
+          throw new Error("删除失败 (" + res.status + ")");
         });
       })
+      .then(function (outcome) {
+        // 成功或"已不存在视为成功"，统一走乐观移除
+        applyAnnoRemoved();
+      })
       .catch(function (e) {
-        toast("删除失败: " + e.message, "error");
+        toast("删除失败: " + (e && e.message ? e.message : "未知错误"), "error");
         // 失败恢复：重新拉取真实状态
         refreshCurrentAnnotations();
       });
   }
 
-  // 跳转并选中进入编辑态（标注面板"编辑"按钮）
+  // 跳转并打开编辑卡（标注面板"编辑"按钮）：
+  // 复用 jumpToAnno 的定位 + 选中高亮，再对匹配项打开编辑卡。
   function jumpAndEditAnno(it) {
-    jumpToAnno(it);
-    // 在 flatItems 中找匹配项并选中（按 token+ts+几何）
-    setTimeout(function () {
-      var match = null;
-      var items = flatAnnoItems();
-      for (var i = 0; i < items.length; i++) {
-        var f = items[i];
-        if (f.token === it.token && Number(f.ts) === Number(it.ts) &&
-            (f.type || "rect") === (it.type || "rect")) { match = f; break; }
-      }
-      if (match) selectEditItem(match);
-    }, 300);
-  }
-
-  function showTempRoiBox(x, y, side, sizeMm) {
-    if (!viewer || !state.slide) return;
-    // 复用 roiBox（若不在 ROI 模式则临时建一个，但不启用保存按钮）
-    state.roi.x = Math.round(x);
-    state.roi.y = Math.round(y);
-    state.roi.side = Math.round(side);
-    createRoiBox();
-    var lbl = roiBox.querySelector(".roi-label");
-    if (lbl && sizeMm != null) lbl.textContent = sizeMm + "mm × " + sizeMm + "mm";
-    updateRoiOverlay();
+    var match = jumpToAnno(it);
+    if (match) {
+      editing = false;        // 打开"查看态"编辑卡（含 ✎ 编辑入口）
+      openEditCard(match);
+    }
   }
 
   // ---------- 删除切片 ----------
@@ -2730,6 +2811,14 @@
     c.addEventListener("pointerup", onAnnoPointerUp);
     c.addEventListener("pointercancel", onAnnoPointerUp);
     window.addEventListener("resize", function () { resizeAnnoCanvas(); redrawAnnoCanvas(); });
+
+    // 手机端侧栏抽屉：菜单按钮切换、遮罩点击关闭
+    if (els.menuBtn) {
+      els.menuBtn.addEventListener("click", toggleSidebarDrawer);
+    }
+    if (els.sidebarMask) {
+      els.sidebarMask.addEventListener("click", closeSidebarDrawer);
+    }
 
     // 新建项目
     els.newProjectBtn.addEventListener("click", function () {
