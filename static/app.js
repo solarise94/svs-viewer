@@ -106,6 +106,8 @@
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
     logoutBtn: $("logout-btn"),
+    tbbMoreBtn: $("tbb-more-btn"),
+    tbbMore: $("tbb-more"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
     sidebar: $("sidebar"),
@@ -544,6 +546,7 @@
     updateRoiButtons();
     els.saveBtn.disabled = false;
     els.saveAnnoBtn.disabled = false;
+    updateCtxBar();
   }
 
   function exitRoi() {
@@ -556,6 +559,7 @@
     updateRoiButtons();
     els.saveBtn.disabled = true;
     els.saveAnnoBtn.disabled = true;
+    updateCtxBar();
   }
 
   function updateRoiButtons() {
@@ -1452,6 +1456,46 @@
     else { openSidebarDrawer(); }
   }
 
+  // ---------- 移动端上下文动作条显隐 ----------
+  // ROI 模式或箭头/描图绘制模式任一激活时，显示底部主栏上方的上下文条
+  // （标注人输入 + 保存标记/保存图片）。桌面端不受影响（display:contents）。
+  function updateCtxBar() {
+    var on = state.roiMode != null || state.drawMode != null;
+    document.body.classList.toggle("ctx-on", on);
+  }
+
+  // ---------- 移动端 ⋯ 溢出动作面板 ----------
+  function bindTbbMore() {
+    if (!els.tbbMoreBtn || !els.tbbMore) return;
+    // 动态创建背景遮罩（点外关闭）
+    var mask = document.createElement("div");
+    mask.id = "tbb-more-mask";
+    document.body.appendChild(mask);
+
+    function closeMore() {
+      els.tbbMore.classList.remove("open");
+      mask.classList.remove("open");
+    }
+    function openMore() {
+      els.tbbMore.classList.add("open");
+      mask.classList.add("open");
+    }
+    els.tbbMoreBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (els.tbbMore.classList.contains("open")) { closeMore(); }
+      else { openMore(); }
+    });
+    mask.addEventListener("click", closeMore);
+    // 点面板内任一按钮后自动关闭（mpp 输入/设置除外，保留操作空间）
+    els.tbbMore.addEventListener("click", function (e) {
+      var t = e.target;
+      if (t && (t.id === "mpp-input" || t.id === "mpp-set-btn")) return;
+      if (t && (t.tagName === "BUTTON" || t.closest("button"))) {
+        setTimeout(closeMore, 0);
+      }
+    });
+  }
+
   // =========================================================================
   // 标注画布层（rect/arrow/freehand 统一绘制）
   // =========================================================================
@@ -1933,6 +1977,7 @@
     state.showAnno = true;
     els.annoAllBtn.classList.add("active");
     redrawAnnoCanvas();
+    updateCtxBar();
     toast(mode === "arrow" ? "箭头模式：拖动绘制" : "描图模式：沿边缘描绘", "info");
   }
 
@@ -1945,6 +1990,7 @@
     if (els.annoCanvas) els.annoCanvas.classList.remove("drawing");
     if (viewer) viewer.setMouseNavEnabled(true);
     redrawAnnoCanvas();
+    updateCtxBar();
   }
 
   function toggleDrawMode(mode) {
@@ -2819,6 +2865,9 @@
     if (els.sidebarMask) {
       els.sidebarMask.addEventListener("click", closeSidebarDrawer);
     }
+
+    // 移动端 ⋯ 溢出动作面板
+    bindTbbMore();
 
     // 新建项目
     els.newProjectBtn.addEventListener("click", function () {

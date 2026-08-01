@@ -2,9 +2,9 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260801a" />
+  <link rel="stylesheet" href="/static/style.css?v=20260801b" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -26,42 +26,48 @@
         <button id="zoom-in" class="icon-btn" title="放大" aria-label="放大">+</button>
       </div>
 
-      <button id="rotate-btn" class="icon-btn" title="顺时针旋转 90°" aria-label="旋转">↻</button>
-      <button id="flip-btn" class="icon-btn" title="水平翻转（镜像）" aria-label="镜像">⇋</button>
-
       <!-- ROI 分段控件（NSSegmentedControl 风格） -->
       <div class="seg-control roi-group" role="group" aria-label="ROI 分段">
-        <button id="roi-6" class="seg roi-btn" data-size="6">ROI 6mm</button>
-        <button id="roi-6-5" class="seg roi-btn" data-size="6.5">ROI 6.5mm</button>
+        <button id="roi-6" class="seg roi-btn" data-size="6"><span class="tb-txt">ROI </span>6mm</button>
+        <button id="roi-6-5" class="seg roi-btn" data-size="6.5"><span class="tb-txt">ROI </span>6.5mm</button>
       </div>
-
-      <!-- 保存当前矩形选区为标注（仅 ROI 模式可用，与「保存图片」区分） -->
-      <button id="save-anno-btn" class="tool-btn anno-save" disabled title="把当前矩形选区保存为标注">保存标记</button>
 
       <!-- 标注绘制工具：箭头 / 描图（与 ROI 模式互斥） -->
       <div class="btn-group anno-tools">
-        <button id="anno-arrow-btn" class="tool-btn" title="绘制箭头标注" disabled>↗ 箭头</button>
-        <button id="anno-free-btn" class="tool-btn" title="绘制描图标注" disabled>〰 描图</button>
+        <button id="anno-arrow-btn" class="tool-btn" title="绘制箭头标注" disabled>↗<span class="tb-txt"> 箭头</span></button>
+        <button id="anno-free-btn" class="tool-btn" title="绘制描图标注" disabled>〰<span class="tb-txt"> 描图</span></button>
       </div>
-      <!-- 标注人（管理员标注用，默认"管理员"） -->
-      <input id="anno-label-input" type="text" maxlength="40"
-             class="anno-label-input" placeholder="默认 管理员"
-             title="标注人（留空则用「管理员」）" autocomplete="off" />
-
-      <!-- 主操作 -->
-      <button id="save-btn" class="tool-btn primary" disabled>保存图片</button>
 
       <!-- 标记：打开当前切片标注面板 -->
       <button id="anno-btn" class="tool-btn" disabled>标记</button>
-      <!-- 显示全部标记叠加层（切换标注画布层显隐） -->
-      <button id="anno-all-btn" class="tool-btn" disabled>显示全部标记</button>
 
-      <button id="reset-btn" class="tool-btn">Reset</button>
+      <!-- 更多（移动端溢出动作面板触发钮，桌面隐藏） -->
+      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多">⋯</button>
 
-      <!-- mpp 手动设置区（仅 mpp 缺失或估算时显示） -->
-      <div id="mpp-setter" class="mpp-setter" style="display:none;">
-        <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
-        <button id="mpp-set-btn" class="tool-btn">设置</button>
+      <!-- 上下文动作条：桌面 display:contents（内联）；移动端仅在 ROI/绘制激活时显示 -->
+      <div class="tbb-context" id="tbb-context">
+        <!-- 标注人（管理员标注用，默认"管理员"） -->
+        <input id="anno-label-input" type="text" maxlength="40"
+               class="anno-label-input" placeholder="默认 管理员"
+               title="标注人（留空则用「管理员」）" autocomplete="off" />
+        <!-- 保存当前矩形选区为标注（仅 ROI 模式可用，与「保存图片」区分） -->
+        <button id="save-anno-btn" class="tool-btn anno-save" disabled title="把当前矩形选区保存为标注">保存标记</button>
+        <!-- 主操作 -->
+        <button id="save-btn" class="tool-btn primary" disabled>保存图片</button>
+      </div>
+
+      <!-- 次要按钮：桌面 display:contents（内联）；移动端进 ⋯ 面板 -->
+      <div class="tbb-more" id="tbb-more">
+        <button id="rotate-btn" class="icon-btn" title="顺时针旋转 90°" aria-label="旋转">↻<span class="tbb-lbl"> 旋转</span></button>
+        <button id="flip-btn" class="icon-btn" title="水平翻转（镜像）" aria-label="镜像">⇋<span class="tbb-lbl"> 镜像</span></button>
+        <!-- 显示全部标记叠加层（切换标注画布层显隐） -->
+        <button id="anno-all-btn" class="tool-btn" disabled>显示全部标记</button>
+        <button id="reset-btn" class="tool-btn">Reset</button>
+        <!-- mpp 手动设置区（仅 mpp 缺失或估算时显示） -->
+        <div id="mpp-setter" class="mpp-setter" style="display:none;">
+          <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
+          <button id="mpp-set-btn" class="tool-btn">设置</button>
+        </div>
       </div>
 
       <div class="spacer"></div>
@@ -207,6 +213,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260801a"></script>
+  <script src="/static/app.js?v=20260801b"></script>
 </body>
 </html>

@@ -603,29 +603,11 @@ button {
   to   { opacity: 1; transform: translateY(0); }
 }
 
-/* ---------- 手机端微调 ---------- */
-/* 中窄屏（≤480px）：工具栏换行后收紧，输入框防溢出，整页无横向滚动 */
+/* ---------- 手机端微调（旧两行工具栏规则已由 768px iOS 底栏模块接管，此处仅保留不冲突项） ---------- */
 @media (max-width: 480px) {
-  .header-current { max-width: 42%; }
-  #toolbar { padding: 6px 8px; gap: 5px; }
-  .tb-row { gap: 5px; row-gap: 5px; }
-  /* 第二行输入框换行后各自占满，最小宽度 0 防止撑破容器 */
+  /* 第二行输入框最小宽度防溢出（仅桌面/未重构前残留选择器兼容） */
   .roi-label-input,
-  .roi-note-input { flex: 1 1 45%; min-width: 0; }
-  .icon-btn { width: 30px; height: 30px; font-size: 15px; }
-  .tool-btn { padding: 0 8px; font-size: 12px; height: 30px; }
-  .seg-control .seg { padding: 4px 8px; font-size: 11px; }
-  .zoom-badge { padding: 3px 7px; min-width: 44px; }
-  #mpp-input { width: 60px; height: 30px; }
-}
-/* 更窄屏（≤380px）：进一步压缩 */
-@media (max-width: 380px) {
-  .header-current { max-width: 40%; }
-  .seg-control .seg { padding: 4px 7px; }
-  .tool-btn { padding: 0 7px; font-size: 11px; }
-  /* 极窄屏输入框各占整行，避免并列时被压到无法输入 */
-  .roi-label-input,
-  .roi-note-input { flex: 1 1 100%; }
+  .roi-note-input { min-width: 0; }
 }
 
 /* ---------- 备注输入框（工具栏第二行） ---------- */
@@ -713,3 +695,262 @@ button {
   transition: background 0.12s ease, color 0.12s ease;
 }
 .roi-panel-item .ri-edit:hover { background: var(--accent-fill); color: var(--accent); }
+
+/* =========================================================================
+   桌面端：溢出/上下文分组透明（display:contents），按钮照常内联
+   （仅当移动端媒体查询生效时才把它们变成弹层/底栏）
+   ========================================================================= */
+.tbb-more,
+.tbb-context { display: contents; }
+/* ⋯ 溢出钮：桌面隐藏，仅移动端出现 */
+.tbb-more-btn { display: none; }
+/* 按钮内文字标签（如 ↻ 旋转）：桌面隐藏保持 32px 图标钮，仅移动端 ⋯ 面板显示 */
+.tbb-lbl { display: none; }
+
+/* =========================================================================
+   移动端 iOS 风重设计（≤768px）
+   - 工具栏移到屏幕底部固定（拇指可达区）
+   - 主力按钮平铺可见，无横向滚动
+   - 次要按钮收进 ⋯ 动作面板（iOS action sheet）
+   - 上下文输入（标记人/备注/保存）在 ROI/绘制激活时浮于底栏上方
+   ========================================================================= */
+@media (max-width: 768px) {
+  /* 底栏高度变量：viewer / 上下文条 / 动作面板据此让位 */
+  :root {
+    --tbb-bar-h: 52px;
+    --tbb-ctx-h: 52px;
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  html, body { overflow: hidden; }
+
+  /* ---------- 顶部栏瘦身 ---------- */
+  #app-header {
+    height: auto;
+    min-height: 44px;
+    padding: 8px 14px;
+    padding-top: calc(8px + env(safe-area-inset-top, 0px));
+    gap: 8px;
+  }
+  .header-title { font-size: 14px; }
+  .header-current {
+    flex: 1;
+    max-width: none;
+    text-align: left;
+    font-size: 12px;
+  }
+
+  /* ---------- 工具栏变底部固定主栏 ---------- */
+  #toolbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    height: calc(var(--tbb-bar-h) + var(--safe-bottom));
+    padding: 6px 10px;
+    padding-bottom: calc(6px + var(--safe-bottom));
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 4px;
+    border-top: 0.5px solid var(--separator);
+    border-bottom: none;
+    z-index: 400;
+    overflow: visible;
+  }
+  /* 工具栏内部：主行正常参与底栏布局；第二行容器自身不产生盒子（display:contents），
+     让其内 #tbb-context 能作为固定上下文条渲染（display:none 会连带隐藏子树）。 */
+  .tb-row.tb-row2 { display: contents; }
+  .tb-row.tb-main {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: nowrap;
+    overflow: visible;
+    min-width: 0;
+  }
+  .tb-main .spacer { flex: 1 1 auto; }
+  /* 主栏按钮收紧：仅图标，等宽分布，触控高度 ≥40px */
+  #toolbar .icon-btn {
+    width: 40px;
+    height: 40px;
+    font-size: 18px;
+    flex-shrink: 0;
+  }
+  #toolbar .tool-btn {
+    height: 36px;
+    padding: 0 10px;
+    font-size: 12px;
+    min-height: 36px;
+    flex-shrink: 0;
+  }
+  /* anno-tools 在主栏只显图标：把「↗」「〰」这类短符号收紧 */
+  #toolbar .anno-tools { gap: 2px; }
+  #toolbar .anno-tools .tool-btn { padding: 0 8px; font-size: 15px; }
+  /* ROI 分段收紧 */
+  #toolbar .seg-control .seg { padding: 6px 8px; font-size: 11px; }
+  #toolbar .roi-panel-toggle,
+  #toolbar #roi-panel-toggle { padding: 0 10px; font-size: 12px; }
+  /* zoom-badge 收紧，靠右（spacer 之后） */
+  #toolbar .zoom-badge {
+    flex-shrink: 0;
+    padding: 3px 8px;
+    min-width: 44px;
+    font-size: 11px;
+  }
+
+  /* ⋯ 溢出钮：移动端可见（在 zoom-badge 之后，spacer 推到右侧） */
+  .tbb-more-btn {
+    display: inline-flex;
+    width: 40px;
+    height: 40px;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  /* ---------- ⋯ 溢出动作面板（iOS action sheet） ---------- */
+  #tbb-more {
+    display: none;
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    bottom: calc(var(--tbb-bar-h) + 8px + var(--safe-bottom));
+    z-index: 410;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px;
+    background: rgba(255, 255, 255, 0.86);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-radius: 14px;
+    box-shadow: var(--shadow-float);
+    border: 0.5px solid var(--separator);
+    animation: sheet-up 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  #tbb-more.open { display: flex; }
+  /* 面板内按钮：全宽列表行，高度 ≥44px。
+     用 #toolbar #tbb-more 提高优先级，避免被 ≤480px/≤380px 的 #toolbar .icon-btn 宽度覆盖。 */
+  #toolbar #tbb-more .icon-btn,
+  #toolbar #tbb-more .tool-btn {
+    width: 100%;
+    height: 44px;
+    min-height: 44px;
+    font-size: 15px;
+    justify-content: flex-start;
+    padding: 0 14px;
+    border-radius: 9px;
+    box-shadow: none;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    gap: 10px;
+  }
+  #tbb-more .icon-btn:active,
+  #tbb-more .tool-btn:active { background: var(--hover-strong); }
+  #tbb-more .tool-btn.active { color: var(--accent); background: var(--accent-fill); }
+  /* ⋯ 面板内显示按钮文字标签（↻ 旋转 / ⇋ 镜像） */
+  #tbb-more .tbb-lbl { display: inline; }
+  /* mpp 设置在面板内横排 */
+  #tbb-more .mpp-setter {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 0 14px;
+    height: 44px;
+  }
+  #tbb-more .mpp-setter .tool-btn { width: auto; height: 34px; padding: 0 12px; }
+  #tbb-more #mpp-input { width: 90px; height: 34px; }
+
+  /* ⋯ 面板背景遮罩（点外关闭） */
+  #tbb-more-mask {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 405;
+    background: rgba(0, 0, 0, 0.18);
+  }
+  #tbb-more-mask.open { display: block; }
+
+  /* ---------- 上下文动作条（ROI/绘制激活时出现） ---------- */
+  #tbb-context {
+    display: none;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(var(--tbb-bar-h) + var(--safe-bottom));
+    z-index: 399;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    padding-bottom: 8px;
+    background: var(--toolbar-bg);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-top: 0.5px solid var(--separator);
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+  /* 仅当 ROI 或绘制模式激活时显示（body.ctx-on） */
+  body.ctx-on #tbb-context {
+    display: flex;
+    animation: sheet-up 0.18s cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  #tbb-context .roi-label-input,
+  #tbb-context .roi-note-input {
+    flex: 1 1 0;
+    min-width: 0;
+    height: 36px;
+    font-size: 13px;
+  }
+  #tbb-context .tool-btn {
+    height: 36px;
+    min-height: 36px;
+    padding: 0 12px;
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  /* ---------- viewer 让位底栏 + 上下文条 ---------- */
+  #viewer-wrap {
+    padding-bottom: calc(var(--tbb-bar-h) + var(--safe-bottom));
+  }
+  body.ctx-on #viewer-wrap {
+    padding-bottom: calc(var(--tbb-bar-h) + var(--tbb-ctx-h) + var(--safe-bottom));
+  }
+
+  /* ---------- 选区面板：贴底时上移到底栏之上 ---------- */
+  .roi-panel {
+    bottom: calc(var(--tbb-bar-h) + var(--safe-bottom));
+    max-height: 55vh;
+  }
+  body.ctx-on .roi-panel {
+    bottom: calc(var(--tbb-bar-h) + var(--tbb-ctx-h) + var(--safe-bottom));
+  }
+  .roi-panel-mask { z-index: 50; }
+
+  /* ---------- 切片切换条：左右渐隐引导 ---------- */
+  .slide-chips {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+  }
+
+  /* toast 上移，避开底栏 */
+  #toast-container { top: calc(54px + env(safe-area-inset-top, 0px)); }
+}
+
+/* 极窄屏（≤380px）：主栏按钮进一步压缩，防溢出 */
+@media (max-width: 380px) {
+  #toolbar .icon-btn { width: 36px; height: 36px; font-size: 16px; }
+  #toolbar .tool-btn { padding: 0 7px; font-size: 11px; }
+  #toolbar .seg-control .seg { padding: 5px 6px; font-size: 10px; }
+  .tbb-more-btn { width: 36px; height: 36px; font-size: 20px; }
+  /* 极窄屏隐藏缩放百分比，保证 ⋯ 溢出钮始终可见可达 */
+  #toolbar .zoom-badge { display: none; }
+}
