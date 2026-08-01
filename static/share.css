@@ -732,10 +732,7 @@ button {
    桌面端：溢出/上下文分组透明（display:contents），按钮照常内联
    （仅当移动端媒体查询生效时才把它们变成弹层/底栏）
    ========================================================================= */
-.tbb-more,
 .tbb-context { display: contents; }
-/* ⋯ 溢出钮：桌面隐藏，仅移动端出现 */
-.tbb-more-btn { display: none; }
 /* 桌面端隐藏移动端 ROI 滑块分段（桌面用 #roi-6/#roi-6-5 分段） */
 .roi-slider { display: none; }
 
@@ -895,87 +892,19 @@ button {
   #toolbar .view-tools .icon-btn { width: 32px; height: 32px; font-size: 16px; }
   #toolbar #reset-btn { padding: 0 8px; font-size: 11px; height: 32px; min-height: 32px; }
 
-  /* ⋯ 溢出钮：移动端可见（在 zoom-badge 之后，spacer 推到右侧） */
-  .tbb-more-btn {
-    display: inline-flex;
-    width: 40px;
-    height: 40px;
-    font-size: 22px;
-    font-weight: 700;
-    color: var(--accent);
-    flex-shrink: 0;
-  }
-
-  /* ---------- ⋯ 溢出动作面板（iOS action sheet）：需求3 改横向图标钮 ---------- */
-  #tbb-more {
-    display: none;
-    position: fixed;
-    left: 8px;
-    right: 8px;
-    bottom: calc(var(--tbb-bar-h) + 8px + var(--safe-bottom));
-    z-index: 410;
-    flex-direction: row;
-    flex-wrap: wrap;
-    justify-content: space-evenly;
-    align-items: stretch;
-    gap: 4px;
-    padding: 8px 6px;
-    background: rgba(255, 255, 255, 0.86);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
-    border-radius: 14px;
-    box-shadow: var(--shadow-float);
-    border: 0.5px solid var(--separator);
-    animation: sheet-up 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
-  }
-  #tbb-more.open { display: flex; }
-  /* 面板内按钮：等宽图标钮，图标在上、文字在下，宽度自适应。
-     用 #toolbar #tbb-more 提高优先级，避免被 ≤480px/≤380px 的 #toolbar .icon-btn 宽度覆盖。 */
-  #toolbar #tbb-more .icon-btn,
-  #toolbar #tbb-more .tool-btn {
-    flex: 1 1 64px;
-    min-width: 56px;
-    width: auto;
-    height: auto;
-    min-height: 56px;
-    font-size: 20px;
-    flex-direction: column;
-    justify-content: center;
-    align-items: center;
-    padding: 6px 4px;
-    border-radius: 10px;
-    box-shadow: none;
-    border: none;
-    background: transparent;
-    color: var(--text);
-    gap: 2px;
-    line-height: 1.1;
-  }
-  /* ⋯ 面板现仅余 mpp 手动设置（旋转/镜像/复位/标记已迁至底栏或面板头）；
-     无 mpp 时面板为空，JS 仍可在需要时切换 open。 */
-  #tbb-more .mpp-setter {
-    display: flex;
+  /* ---------- mpp 手动设置（⋯ 移除后归入上下文条；JS 控制显隐，缺省隐藏） ---------- */
+  #tbb-context .mpp-setter {
+    flex: 1 1 100%;
     flex-direction: row;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    width: 100%;
-    padding: 4px 8px;
+    padding: 2px 0 0;
     height: auto;
-    min-height: 40px;
+    min-height: 36px;
   }
-  #tbb-more .mpp-setter .tool-btn { width: auto; height: 32px; padding: 0 12px; font-size: 12px; }
-  #tbb-more #mpp-input { width: 96px; height: 32px; }
-
-  /* ⋯ 面板背景遮罩（点外关闭） */
-  #tbb-more-mask {
-    display: none;
-    position: fixed;
-    inset: 0;
-    z-index: 405;
-    background: rgba(0, 0, 0, 0.18);
-  }
-  #tbb-more-mask.open { display: block; }
+  #tbb-context .mpp-setter .tool-btn { width: auto; height: 32px; padding: 0 12px; font-size: 12px; flex-shrink: 0; }
+  #tbb-context #mpp-input { width: 96px; height: 32px; }
 
   /* ---------- 上下文动作条（ROI/绘制激活时出现） ---------- */
   #tbb-context {
@@ -994,7 +923,7 @@ button {
     backdrop-filter: blur(20px) saturate(180%);
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     border-top: 0.5px solid var(--separator);
-    flex-wrap: nowrap;
+    flex-wrap: wrap; /* mpp 设置出现时独占换行 */
     overflow: hidden;
   }
   /* 仅当 ROI 或绘制模式激活时显示（body.ctx-on） */
@@ -1050,7 +979,6 @@ button {
   #toolbar .icon-btn { width: 36px; height: 36px; font-size: 16px; }
   #toolbar .tool-btn { padding: 0 7px; font-size: 11px; }
   #toolbar .seg-control .seg { padding: 5px 6px; font-size: 10px; }
-  .tbb-more-btn { width: 36px; height: 36px; font-size: 20px; }
-  /* 极窄屏隐藏缩放百分比，保证 ⋯ 溢出钮始终可见可达 */
+  /* 极窄屏隐藏缩放百分比，给底栏主操作腾位 */
   #toolbar .zoom-badge { display: none; }
 }

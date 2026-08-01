@@ -57,22 +57,11 @@
         <button id="anno-free-btn" class="tool-btn" title="绘制描图标注">〰</button>
       </div>
 
-      <!-- 标记：打开选区面板；「显示/隐藏全部」已并入面板头部，桌面另保留内联钮 -->
+      <!-- 标记：打开选区面板 -->
       <button id="roi-panel-toggle" class="tool-btn">标记</button>
 
-      <!-- 更多（移动端溢出面板触发钮，桌面隐藏） -->
-      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多">⋯</button>
-
-      <!-- ⋯ 溢出面板：旋转/镜像/复位/标记已迁出，仅余 mpp 手动设置 -->
-      <div class="tbb-more" id="tbb-more">
-        <!-- 「标记」桌面内联钮：合并进选区面板头部，移动端 CSS 隐藏 -->
-        <button id="anno-all-btn" class="tool-btn active" title="显示/隐藏标记">标记</button>
-        <!-- mpp 手动设置区（仅 mpp 缺失或估算时显示） -->
-        <div id="mpp-setter" class="mpp-setter" style="display:none;">
-          <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
-          <button id="mpp-set-btn" class="tool-btn">设置</button>
-        </div>
-      </div>
+      <!-- 显示/隐藏全部标记：移动端已并入选区面板头部；桌面端在此内联保留 -->
+      <button id="anno-all-btn" class="tool-btn active" title="显示/隐藏标记">标记</button>
 
       <div class="spacer"></div>
       <span id="zoom-badge" class="zoom-badge">100%</span>
@@ -91,6 +80,12 @@
                autocomplete="off" />
         <button id="save-roi-btn" class="tool-btn primary" disabled>保存选区</button>
         <button id="export-btn" class="tool-btn secondary" disabled>导出图片</button>
+        <!-- mpp 手动设置区（仅 mpp 缺失/估算时由 JS 显示）：⋯ 移除后改置于此，
+             桌面内联、移动端随上下文条出现 -->
+        <div id="mpp-setter" class="mpp-setter" style="display:none;">
+          <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
+          <button id="mpp-set-btn" class="tool-btn">设置</button>
+        </div>
       </div>
     </div>
   </div>

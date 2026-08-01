@@ -107,8 +107,6 @@
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
     logoutBtn: $("logout-btn"),
-    tbbMoreBtn: $("tbb-more-btn"),
-    tbbMore: $("tbb-more"),
     roiBoxBtn: $("roi-box-btn"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
@@ -1492,38 +1490,6 @@
   function updateCtxBar() {
     var on = state.roiMode != null || state.drawMode != null;
     document.body.classList.toggle("ctx-on", on);
-  }
-
-  // ---------- 移动端 ⋯ 溢出动作面板 ----------
-  function bindTbbMore() {
-    if (!els.tbbMoreBtn || !els.tbbMore) return;
-    // 动态创建背景遮罩（点外关闭）
-    var mask = document.createElement("div");
-    mask.id = "tbb-more-mask";
-    document.body.appendChild(mask);
-
-    function closeMore() {
-      els.tbbMore.classList.remove("open");
-      mask.classList.remove("open");
-    }
-    function openMore() {
-      els.tbbMore.classList.add("open");
-      mask.classList.add("open");
-    }
-    els.tbbMoreBtn.addEventListener("click", function (e) {
-      e.stopPropagation();
-      if (els.tbbMore.classList.contains("open")) { closeMore(); }
-      else { openMore(); }
-    });
-    mask.addEventListener("click", closeMore);
-    // 点面板内任一按钮后自动关闭（mpp 输入/设置除外，保留操作空间）
-    els.tbbMore.addEventListener("click", function (e) {
-      var t = e.target;
-      if (t && (t.id === "mpp-input" || t.id === "mpp-set-btn")) return;
-      if (t && (t.tagName === "BUTTON" || t.closest("button"))) {
-        setTimeout(closeMore, 0);
-      }
-    });
   }
 
   // =========================================================================
@@ -2936,9 +2902,6 @@
     if (els.sidebarMask) {
       els.sidebarMask.addEventListener("click", closeSidebarDrawer);
     }
-
-    // 移动端 ⋯ 溢出动作面板
-    bindTbbMore();
 
     // 新建项目
     els.newProjectBtn.addEventListener("click", function () {
