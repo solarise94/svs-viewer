@@ -59,8 +59,10 @@
 
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
+  // editing：是否处于「显式编辑态」（进入后画手柄、可拖动，防误挪位置）
   var editItem = null;
   var editDrag = null;
+  var editing = false;
 
   // 临时选择器状态
   var pickerCtx = { targetPid: null, selected: {} };
@@ -321,10 +323,11 @@
             els.annoAllBtn.disabled = false;
           }
           editItem = null;
+          editing = false;
           rebuildFlatItems();
           redrawAnnoCanvas();
         })
-        .catch(function () { currentAnnotations = null; editItem = null; rebuildFlatItems(); redrawAnnoCanvas(); });
+        .catch(function () { currentAnnotations = null; editItem = null; editing = false; rebuildFlatItems(); redrawAnnoCanvas(); });
     } else {
       els.annoArrowBtn.disabled = true;
       els.annoFreeBtn.disabled = true;
@@ -1483,8 +1486,8 @@
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
-    // 编辑手柄
-    if (editItem && state.showAnno) {
+    // 编辑手柄（仅显式编辑态才画，纯选中不画，防误挪位置）
+    if (editItem && editing && state.showAnno) {
       drawEditHandles(editItem);
     }
     // 绘制中的预览
@@ -1856,21 +1859,16 @@
 
   function selectEditItem(it) {
     editItem = it;
+    editing = false;  // 选中只是查看，不进入可拖动编辑态
     redrawAnnoCanvas();
     openEditCard(it);
   }
 
   function clearEditItem() {
     editItem = null;
+    editing = false;
     closeEditCard();
     redrawAnnoCanvas();
-  }
-
-  function moveHandleId(it) {
-    var typ = it.type || "rect";
-    if (typ === "arrow") return "mid";
-    if (typ === "freehand") return "fmid";
-    return "move";
   }
 
   // ---------- 显示全部标记（切换画布层显隐） ----------
@@ -1941,23 +1939,21 @@
     if (!state.showAnno) return;
     e.preventDefault(); e.stopPropagation();
     var sp = screenPt(e);
-    // 已选中且点中手柄 → 开始拖动手柄
-    if (editItem) {
+    // 显式编辑态且点中手柄 → 拖动手柄（平移/缩放必须先进入编辑态）
+    if (editItem && editing) {
       var handleId = hitHandle(sp.x, sp.y, editItem);
       if (handleId) {
         startEditDrag(e, editItem, handleId);
         return;
       }
     }
+    // 命中标注 → 重新选中查看（editing 复位，不直接平移；要改需先点"✎ 编辑"）
     var hit = hitAnno(sp.x, sp.y);
     if (hit) {
       selectEditItem(hit);
-      var innerHandle = hitHandle(sp.x, sp.y, hit);
-      if (!innerHandle) {
-        startEditDrag(e, hit, moveHandleId(hit));
-      }
       return;
     }
+    // 点空白 → 取消选中
     clearEditItem();
   }
 
@@ -2180,7 +2176,7 @@
         els.annoBtn.disabled = annos.length === 0;
         els.annoAllBtn.disabled = annos.length === 0;
         if (annos.length === 0) { state.showAnno = false; els.annoAllBtn.classList.remove("active"); }
-        if (editItem && flatItems.indexOf(editItem) < 0) editItem = null;
+        if (editItem && flatItems.indexOf(editItem) < 0) { editItem = null; editing = false; }
         rebuildFlatItems();
         redrawAnnoCanvas();
       })
@@ -2235,7 +2231,8 @@
           '<div class="ai-title"><span class="ai-type-icon">' + typIcon + "</span>" +
           '<span class="ai-label">' + esc(grp.label) + "</span>" + sizeStr + "</div>" +
           '<div class="ai-sub">' + fmtTime(it.ts) +
-          (it.token ? " · 来源 " + String(it.token).slice(0, 6) : "") + "</div>";
+          (it.token ? " · 来源 " + String(it.token).slice(0, 6) : "") +
+          (it.visitor ? " · 设备 " + esc(String(it.visitor).slice(0, 6)) : "") + "</div>";
         row.appendChild(left);
 
         // 「公开」切换钮：管理员可策展任意来源标注
@@ -2397,6 +2394,8 @@
   }
 
   // ---------- 编辑卡（标注面板顶部） + 删除 ----------
+  // 显式编辑态：非编辑态只显示「✎ 编辑」入口，点它才进入可拖动编辑态；
+  // 备注 textarea 两种状态下都可直接改（备注改动不属于"移动"）。
   function openEditCard(it) {
     var wrap = $("anno-edit-wrap");
     if (!wrap) return;
@@ -2418,20 +2417,56 @@
     card.appendChild(ta);
     var ops = document.createElement("div");
     ops.className = "aec-ops";
-    var saveB = document.createElement("button");
-    saveB.className = "btn primary small"; saveB.textContent = "保存";
-    var cancelB = document.createElement("button");
-    cancelB.className = "btn secondary small"; cancelB.textContent = "取消";
-    ops.appendChild(cancelB); ops.appendChild(saveB);
-    card.appendChild(ops);
-    wrap.appendChild(card);
-    wrap.style.display = "block";
+    if (editing) {
+      // 编辑态：保存 / 取消 / 删除
+      var saveB = document.createElement("button");
+      saveB.className = "btn primary small"; saveB.textContent = "保存";
+      var cancelB = document.createElement("button");
+      cancelB.className = "btn secondary small"; cancelB.textContent = "取消";
+      var delB = document.createElement("button");
+      delB.className = "btn danger small"; delB.textContent = "删除";
+      ops.appendChild(delB); ops.appendChild(cancelB); ops.appendChild(saveB);
+      card.appendChild(ops);
+      wrap.appendChild(card);
+      wrap.style.display = "block";
 
-    saveB.addEventListener("click", function () { commitAdminEdit(it, ta.value); });
-    cancelB.addEventListener("click", function () { cancelAdminEdit(it); });
-    ta.addEventListener("keydown", function (e) {
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitAdminEdit(it, ta.value); }
-    });
+      saveB.addEventListener("click", function () { commitAdminEdit(it, ta.value); });
+      cancelB.addEventListener("click", function () { cancelAdminEdit(it); });
+      delB.addEventListener("click", function () {
+        delB.disabled = true;
+        deleteAnnoItem(it);
+      });
+      ta.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitAdminEdit(it, ta.value); }
+      });
+    } else {
+      // 非编辑态：✎ 编辑 / 保存 / 删除
+      var editB = document.createElement("button");
+      editB.className = "btn small"; editB.textContent = "✎ 编辑";
+      editB.title = "进入可拖动编辑态";
+      var saveB2 = document.createElement("button");
+      saveB2.className = "btn primary small"; saveB2.textContent = "保存";
+      var delB2 = document.createElement("button");
+      delB2.className = "btn danger small"; delB2.textContent = "删除";
+      ops.appendChild(delB2); ops.appendChild(editB); ops.appendChild(saveB2);
+      card.appendChild(ops);
+      wrap.appendChild(card);
+      wrap.style.display = "block";
+
+      editB.addEventListener("click", function () {
+        editing = true;
+        redrawAnnoCanvas();
+        openEditCard(it);
+      });
+      saveB2.addEventListener("click", function () { commitAdminEdit(it, ta.value); });
+      delB2.addEventListener("click", function () {
+        delB2.disabled = true;
+        deleteAnnoItem(it);
+      });
+      ta.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitAdminEdit(it, ta.value); }
+      });
+    }
   }
 
   function closeEditCard() {
@@ -2484,6 +2519,7 @@
       .then(function () {
         toast("已保存修改", "success");
         editItem = null;
+        editing = false;
         closeEditCard();
         refreshCurrentAnnotations();
         loadAnnotationsIndex().then(function () {
@@ -2496,6 +2532,7 @@
 
   function cancelAdminEdit(it) {
     editItem = null;
+    editing = false;
     closeEditCard();
     refreshCurrentAnnotations();
   }
@@ -2538,6 +2575,7 @@
             (editItem.token === it.token && Number(editItem.ts) === Number(it.ts) &&
              (editItem.type || "rect") === (it.type || "rect")))) {
           editItem = null;
+          editing = false;
           closeEditCard();
         }
         // 4) 重建扁平缓存 + 重绘 + 面板即时重渲 + 立即 toast

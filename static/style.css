@@ -228,6 +228,11 @@ button {
   box-shadow: var(--shadow-sm);
 }
 .btn.secondary:hover { background: var(--hover); }
+.btn.danger {
+  background: var(--danger-tint);
+  color: var(--danger);
+}
+.btn.danger:hover:not(:disabled) { background: rgba(255, 59, 48, 0.2); }
 .btn.block { display: block; width: 100%; }
 .btn.small { padding: 4px 10px; font-size: 12px; }
 

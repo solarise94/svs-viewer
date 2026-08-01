@@ -378,7 +378,7 @@ def _clean_note(note):
     return n
 
 
-def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", **geom):
+def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     管理员标注使用 token="admin"（此时 share 校验放宽：不要求 token 命中 shares，
@@ -388,6 +388,7 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
     type 必须是 ROI_TYPES 之一（缺省 rect，向后兼容）。
     shared 为布尔，记录该标注是否对全部分享用户公开展示（缺省 False）。
     note 为备注文本（可选，缺省空串；strip 后 ≤ 500 字符，超出抛 ValueError）。
+    visitor 为创建设备的访客标识（可选，None 存空串）——分享端按设备归属校验用。
 
     返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared/note）。
     若校验失败抛出 ValueError。
@@ -429,6 +430,7 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
             "ts": time.time(),
             "shared": bool(shared),
             "note": note_clean,
+            "visitor": visitor or "",
         }
         roi.update(norm)
         data["rois"].append(roi)
@@ -543,6 +545,29 @@ def list_rois(token=None):
             rr["note"] = r.get("note", "")
             out.append(rr)
         out.sort(key=lambda x: x.get("ts", 0), reverse=True)
+        return out
+
+    return _with_lock("r+", _do)
+
+
+def get_roi(token, index):
+    """返回该 token 下第 index 条 roi 的 dict 副本；不存在返回 None。
+
+    供分享端做设备归属校验（visitor 字段）使用。index 语义与 list_rois 的
+    counters 完全一致（该 token 下按文件插入顺序的序号）。
+    返回副本含 visitor 字段（旧数据缺省空串），含 index。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        same = [i for i, r in enumerate(data["rois"]) if r["token"] == token]
+        if index < 0 or index >= len(same):
+            return None
+        roi = data["rois"][same[index]]
+        out = dict(roi)
+        out["index"] = index
+        out["shared"] = _roi_shared_compat(roi)
+        out["visitor"] = roi.get("visitor", "") or ""
+        out["note"] = roi.get("note", "")
         return out
 
     return _with_lock("r+", _do)
@@ -903,6 +928,8 @@ def annotations_by_slide():
                 "ts": r.get("ts"),
                 "shared": _roi_shared_compat(r),
                 "note": r.get("note", ""),
+                # 设备标识短码：同链接不同设备在管理端可区分（旧数据缺省空）
+                "visitor": (r.get("visitor") or "")[:8],
             }
             # 带上 arrow / freehand 专属几何字段（存在则透传）
             for k in ("x1", "y1", "x2", "y2", "points"):

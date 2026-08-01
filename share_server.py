@@ -9,6 +9,7 @@
 
 import io
 import os
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -185,6 +186,55 @@ def _read_metadata(osr: OpenSlide, path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # 安全核心：token 与 slide 校验
 # --------------------------------------------------------------------------- #
+# 设备级访客身份：为每个访问 /s/* 的设备静默分配一个 cookie（svs_visitor）。
+# 该设备创建的标注会记录 visitor，仅允许同一 visitor 编辑/删除自己新建的标记，
+# 避免同链接其他设备（或其他分享用户）误改他人标记。
+VISITOR_COOKIE = "svs_visitor"
+
+
+def _is_secure():
+    """按 SHARE_TLS_CERT 是否配置判定当前部署是否走 HTTPS（cookie secure 用）。"""
+    cert = os.environ.get("SHARE_TLS_CERT")
+    return bool(cert) and os.path.exists(cert)
+
+
+def _visitor_id():
+    """返回当前请求的访客标识（cookie）；无 cookie 时返回 None。
+
+    首次访问 /s/* 的请求由 _ensure_visitor_cookie 在响应阶段补 cookie；
+    该请求本身没有 visitor，属于"游客"（不持有任何可编辑标注的归属）。
+    """
+    return request.cookies.get(VISITOR_COOKIE)
+
+
+@app.after_request
+def _ensure_visitor_cookie(resp):
+    """对 /s/ 开头的响应静默补发访客 cookie（仅首次，无 cookie 时）。"""
+    path = request.path
+    if path == "/s" or path.startswith("/s/"):
+        if not request.cookies.get(VISITOR_COOKIE):
+            vid = secrets.token_urlsafe(8)
+            resp.set_cookie(
+                VISITOR_COOKIE,
+                vid,
+                path="/s",
+                httponly=True,
+                samesite="Lax",
+                secure=_is_secure(),
+            )
+    return resp
+
+
+def _roi_owned_by(r, visitor):
+    """判断某 roi 是否归当前访客所有（用于编辑/删除的归属校验）。
+
+    无 visitor 字段 = 旧数据（本轮改造前创建）：按链接级共享，任意访客可编辑
+    （兼容历史行为）；有 visitor 字段则必须与当前访客一致才可编辑。
+    """
+    v = r.get("visitor") or ""
+    return (not v) or (v == visitor)
+
+
 def _require_share(token):
     """校验 token 有效，返回 share dict；无效则 404（不泄露信息）。"""
     share = share_store.get_share(token)
@@ -459,7 +509,9 @@ def share_roi_add(token):
     note = body.get("note", "")
 
     try:
-        roi = share_store.add_roi(token, safe, label, type=typ, note=note, **geom)
+        roi = share_store.add_roi(
+            token, safe, label, type=typ, note=note, visitor=_visitor_id(), **geom
+        )
     except ValueError as e:
         return jsonify(error=str(e)), 400
     return jsonify(ok=True, index=roi["index"])
@@ -470,6 +522,8 @@ def share_roi_update(token, index):
     """编辑本 token 的标注几何与/或备注。
 
     JSON body: {"geom": {...}, "note": "..."}（两者均可缺省）。
+    设备归属校验：只有创建该标注的访客可编辑（_roi_owned_by）；旧数据
+    （无 visitor）按链接级共享允许编辑。越权返回 403。
     调 update_roi；update 返回 False 时 404；成功返回更新后的 roi dict（含 index）。
     编辑允许自由调大小，不做 6/6.5mm 限制。
     """
@@ -479,6 +533,11 @@ def share_roi_update(token, index):
     note = body.get("note")
     if geom is None and note is None:
         return jsonify(error="缺少 geom 或 note"), 400
+    r = share_store.get_roi(token, index)
+    if r is None:
+        return jsonify(error="选区不存在"), 404
+    if not _roi_owned_by(r, _visitor_id()):
+        return jsonify(error="只能编辑自己创建的标记"), 403
     try:
         updated = share_store.update_roi(token, index, geom=geom, note=note)
     except ValueError as e:
@@ -493,28 +552,36 @@ def share_roi_list(token):
     """返回本 token 可见的全部标注（仅本分享切片内）。
 
     组装三类来源：
-      - source="me"：本 token 自己的全部标注（不受 shared 影响，始终可见，可删）
+      - source="me"：本 token 且归当前访客所有的标注（本设备新建，可编辑）
       - source="admin"：管理员(admin)被公开的标注
-      - source="shared"：其他用户被管理员公开的标注（非本 token、非 admin）
-    后两类来自 list_shared_rois_for_slides(本分享切片)，且排除本 token 自身。
+      - source="shared"：其他用户被管理员公开的标注（含本 token 其他设备
+        被公开的标注，排除已归当前访客的"me"项）
+    后两类来自 list_shared_rois_for_slides(本分享切片)；本 token 其他设备未
+    公开的私有标注对当前设备不可见（既不在 me 也不在 shared）。
+    admin（token==ADMIN_TOKEN）为管理端特权视角，返回本 token 全部标注。
     每项的 index 沿用 list_rois 的 token+index 语义（按 token 归组）。
     """
     share = _require_share(token)
     share_slides = share.get("slides", [])
+    visitor = _visitor_id()
 
-    # 1) 本 token 全部标注（含未公开，source=me）
+    # 1) 本 token 且归当前访客所有的标注（含未公开，source=me）
     mine = share_store.list_rois(token)
     out = []
     for r in mine:
-        rr = dict(r)
-        rr["source"] = "me"
-        out.append(rr)
+        if token == share_store.ADMIN_TOKEN or _roi_owned_by(r, visitor):
+            rr = dict(r)
+            rr["source"] = "me"
+            out.append(rr)
 
-    # 2) 管理员策展公开的他人/admin 标注（排除本 token 自身）
+    # 2) 管理员策展公开的他人/admin 标注（排除已是 me 的条目）
     shared_all = share_store.list_shared_rois_for_slides(share_slides)
     for r in shared_all:
         if r.get("token") == token:
-            continue  # 本人的公开标注已在 me 中，不重复
+            # 本 token 的公开标注：仅当非 me（其他设备的 shared 标注）才作为
+            # shared 只读显示；me 已在上面列出，不重复
+            if _roi_owned_by(r, visitor):
+                continue
         rr = dict(r)
         rr["source"] = "admin" if r.get("token") == share_store.ADMIN_TOKEN else "shared"
         out.append(rr)
@@ -526,8 +593,17 @@ def share_roi_list(token):
 
 @app.route("/s/<token>/api/roi/<int:index>", methods=["DELETE"])
 def share_roi_delete(token, index):
-    """删除本 token 的标注；管理员标注不可由分享端删除。"""
+    """删除本 token 的标注；管理员标注不可由分享端删除。
+
+    设备归属校验：只有创建该标注的访客可删除（_roi_owned_by）；旧数据
+    （无 visitor）按链接级共享允许删除。越权返回 403。
+    """
     _require_share(token)
+    r = share_store.get_roi(token, index)
+    if r is None:
+        return jsonify(error="选区不存在"), 404
+    if not _roi_owned_by(r, _visitor_id()):
+        return jsonify(error="只能编辑自己创建的标记"), 403
     ok = share_store.delete_roi(token, index)
     if not ok:
         return jsonify(error="选区不存在"), 404
