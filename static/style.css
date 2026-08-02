@@ -1702,3 +1702,208 @@ button {
   /* 极窄屏隐藏缩放百分比，保证 ⋯ 溢出钮始终可见可达 */
   #toolbar .zoom-badge { display: none; }
 }
+
+/* =========================================================================
+   AI 读片助手面板（管理员）—— 仿 anno-panel 的浮动面板风
+   ========================================================================= */
+.ai-btn { color: var(--accent); }
+.ai-btn:disabled { color: var(--text-3); opacity: 0.5; }
+
+.ai-panel {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  bottom: 14px;
+  width: 340px;
+  max-width: 90%;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-float);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 56;
+}
+.ai-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 0.5px solid var(--separator);
+  font-size: 13px;
+  font-weight: 600;
+}
+.ai-panel-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 1. 设置区 */
+.ai-config-wrap {
+  padding: 10px 12px;
+  border-bottom: 0.5px solid var(--separator);
+}
+.ai-config-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+.ai-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.ai-field input {
+  padding: 6px 8px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-btn);
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--text);
+}
+.ai-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-fill);
+}
+.ai-config-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.ai-config-hint { font-size: 11px; color: var(--text-3); }
+
+.ai-config-collapsed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 0.5px solid var(--separator);
+  font-size: 12px;
+}
+.ai-config-summary {
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  text-decoration: underline;
+  white-space: nowrap;
+}
+.link-btn:hover { opacity: 0.8; }
+
+/* 2. 任务输入 */
+.ai-task-wrap {
+  padding: 10px 12px;
+  border-bottom: 0.5px solid var(--separator);
+}
+.ai-task {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-btn);
+  font-size: 13px;
+  resize: vertical;
+  min-height: 48px;
+  font-family: inherit;
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--text);
+}
+.ai-task:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-fill);
+}
+.ai-task-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+/* 3. 轨迹流 */
+.ai-trace {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+.ai-trace-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 20px 8px; }
+.ai-trace-row {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  border-radius: var(--r-row);
+  word-break: break-word;
+  animation: ai-fade-in 0.18s ease;
+}
+@keyframes ai-fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.ai-trace-row.info { color: var(--text-2); }
+.ai-trace-row.thinking { color: var(--text-3); font-style: italic; }
+.ai-trace-row.tool {
+  color: var(--text-2);
+  background: var(--hover);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+.ai-trace-row.snapshot {
+  color: #0099A8;
+  background: rgba(0, 229, 255, 0.08);
+  cursor: pointer;
+}
+.ai-trace-row.snapshot:hover { background: rgba(0, 229, 255, 0.16); }
+.ai-trace-row.observation { color: var(--text-2); background: var(--hover); }
+.ai-trace-row.annotation {
+  color: #B8860B;
+  background: rgba(255, 215, 0, 0.1);
+}
+.ai-trace-row.bubble {
+  color: var(--text);
+  background: var(--accent-fill);
+  border-left: 3px solid var(--accent);
+}
+.ai-trace-row.finished {
+  color: #1a7d34;
+  background: rgba(40, 167, 69, 0.1);
+  border-left: 3px solid #28a745;
+}
+.ai-trace-row.error {
+  color: #c0392b;
+  background: rgba(231, 76, 60, 0.1);
+  border-left: 3px solid #e74c3c;
+}
+
+/* 手机端：AI 面板贴底显示 */
+@media (max-width: 768px) {
+  .ai-panel {
+    right: 8px; left: 8px; top: auto;
+    bottom: calc(var(--tbb-bar-h) + 8px + var(--safe-bottom));
+    width: auto; max-height: 60%;
+    animation: sheet-up 0.22s cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  body.ctx-on .ai-panel {
+    bottom: calc(var(--tbb-bar-h) + var(--tbb-ctx-h) + 8px + var(--safe-bottom));
+  }
+}
+

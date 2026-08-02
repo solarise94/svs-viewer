@@ -5,8 +5,10 @@
 运行：.venv/bin/python app.py   监听 0.0.0.0:8000
 """
 
+import base64
 import hmac
 import io
+import json
 import os
 import secrets
 import shutil
@@ -27,14 +29,17 @@ from flask import (
     request,
     send_file,
     session,
+    stream_with_context,
 )
 from werkzeug.utils import secure_filename
 
 from openslide import OpenSlide
+from PIL import Image
 
 import share_store
 import slide_cache
 import slide_io
+import ai_agent
 
 app = Flask(__name__)
 
@@ -867,6 +872,379 @@ def api_slide_thumbnail(name):
     thumb.save(buf, format="JPEG", quality=90)
     buf.seek(0)
     return send_file(buf, mimetype="image/jpeg")
+
+
+# --------------------------------------------------------------------------- #
+# AI 读片助手相关 API（管理员，走 _require_auth）
+# --------------------------------------------------------------------------- #
+# AI 配置文件：与 flask_secret 同目录（SHARE_DATA_DIR），0600 权限
+def _ai_config_path() -> Path:
+    return _data_dir_for_secret() / "ai_config.json"
+
+
+def _mask_api_key(key: str) -> str:
+    """api_key 掩码：前4 + **** + 后4；过短则全掩。"""
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return key[:4] + "****" + key[-4:]
+
+
+def _load_ai_config() -> dict:
+    """读取 ai_config.json（0600）；不存在返回空 dict。"""
+    p = _ai_config_path()
+    if not p.is_file():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ai_config(cfg: dict) -> None:
+    """写 ai_config.json（0600）。api_key 不入日志。"""
+    p = _ai_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+
+
+@app.route("/api/slide/<name>/region", methods=["GET"])
+def api_slide_region(name):
+    """裁剪 level-0 区域为 JPEG base64（非附件下载，供 AI/前端按需取图）。
+
+    参数：x,y,w,h（level-0 整数，必填，x,y>=0，w,h>0）；
+         out_w,out_h 可选（默认保持宽高比、最长边 1568，上限各 4096）。
+    返回 JSON：{image_base64, mime, width, height, src:{x,y,w,h}, magnification}。
+    src 是 clamp 到边界后的实际区域。
+    """
+    safe = _safe_name(name)
+    entry = _get_slide(safe)
+
+    def _parse_int(key):
+        try:
+            return int(request.args.get(key, ""))
+        except (TypeError, ValueError):
+            return None
+
+    x = _parse_int("x")
+    y = _parse_int("y")
+    w = _parse_int("w")
+    h = _parse_int("h")
+    if x is None or y is None or w is None or h is None:
+        return jsonify(error="x/y/w/h 参数需为整数"), 400
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return jsonify(error="参数越界（0<=x,y，0<w,h）"), 400
+
+    out_w = _parse_int("out_w")
+    out_h = _parse_int("out_h")
+
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        width, height = osr.dimensions
+        # clamp 到图像边界
+        x2 = min(x, max(0, width - 1))
+        y2 = min(y, max(0, height - 1))
+        max_w = max(0, width - x2)
+        max_h = max(0, height - y2)
+        w2 = min(w, max_w)
+        h2 = min(h, max_h)
+        if w2 <= 0 or h2 <= 0:
+            return jsonify(error="裁剪区域超出图像边界"), 400
+        # 选最佳金字塔层（按 downsample）以加速 read_region。
+        # read_region 的 location 是 level-0 坐标，但 size 是该层像素尺寸，
+        # 故需把 level-0 尺寸 (w2,h2) 除以该层 downsample 得层内尺寸。
+        ds = max(w2, h2) / 1568.0 if max(w2, h2) > 1568 else 1.0
+        try:
+            lvl = osr.get_best_level_for_downsample(ds) if ds > 1 else 0
+        except Exception:
+            lvl = 0
+        try:
+            ds_lvl = float(osr.level_downsamples[lvl]) if lvl < len(osr.level_downsamples) else 1.0
+        except Exception:
+            ds_lvl = 1.0
+        rw = max(1, int(round(w2 / ds_lvl)))
+        rh = max(1, int(round(h2 / ds_lvl)))
+        region = osr.read_region((x2, y2), lvl, (rw, rh))
+        if region.mode != "RGB":
+            region = region.convert("RGB")
+
+        # 计算输出尺寸：默认保持宽高比、最长边 1568
+        if out_w and out_w > 0 and out_h and out_h > 0:
+            ow = min(out_w, 4096)
+            oh = min(out_h, 4096)
+        else:
+            longest = max(w2, h2)
+            if longest <= 1568:
+                ow, oh = w2, h2
+            else:
+                scale = 1568.0 / longest
+                ow = max(1, int(round(w2 * scale)))
+                oh = max(1, int(round(h2 * scale)))
+        if (ow, oh) != (w2, h2):
+            region = region.resize((ow, oh), Image.LANCZOS)
+
+        # 读取 mpp 算放大倍率（供前端展示）
+        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        mpp = meta.get("mpp_x")
+        mag = None
+        if mpp and mpp > 0:
+            try:
+                level_ds = osr.level_downsamples
+                ds_lvl = float(level_ds[lvl]) if lvl < len(level_ds) else 1.0
+            except Exception:
+                ds_lvl = 1.0
+            base = 10.0 / mpp
+            mag = base / ds_lvl if ds_lvl > 0 else base
+
+    buf = io.BytesIO()
+    region.save(buf, format="JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return jsonify({
+        "image_base64": img_b64,
+        "mime": "image/jpeg",
+        "width": ow,
+        "height": oh,
+        "src": {"x": x2, "y": y2, "w": w2, "h": h2},
+        "magnification": mag,
+    })
+
+
+@app.route("/api/ai/config", methods=["GET", "PUT"])
+def api_ai_config():
+    """读写 AI 配置（base_url/api_key/model/max_tokens）。
+
+    GET：api_key 脱敏为 api_key_set:bool + 掩码（前4后4），不回显明文。
+    PUT：空串=清除 api_key；与掩码同值=不变；其他=覆盖。
+    api_key 不入日志。
+    """
+    if request.method == "GET":
+        cfg = _load_ai_config()
+        key = cfg.get("api_key") or ""
+        out = {
+            "base_url": cfg.get("base_url") or "",
+            "api_key_set": bool(key),
+            "api_key_mask": _mask_api_key(key),
+            "model": cfg.get("model") or "",
+            "max_tokens": cfg.get("max_tokens") or 2048,
+        }
+        return jsonify(out)
+
+    body = request.get_json(silent=True) or {}
+    cfg = _load_ai_config()
+    # base_url / model / max_tokens 直接覆盖（字符串/数字）
+    if "base_url" in body:
+        cfg["base_url"] = str(body.get("base_url") or "").strip()
+    if "model" in body:
+        cfg["model"] = str(body.get("model") or "").strip()
+    if "max_tokens" in body:
+        try:
+            cfg["max_tokens"] = int(body.get("max_tokens"))
+        except (TypeError, ValueError):
+            return jsonify(error="max_tokens 需为整数"), 400
+    # api_key：空串=清除；与掩码同值=不变；其他=覆盖
+    if "api_key" in body:
+        new_key = body.get("api_key")
+        if new_key is None:
+            pass  # 不传不动
+        else:
+            new_key = str(new_key)
+            if new_key == "":
+                cfg.pop("api_key", None)
+            elif new_key == _mask_api_key(cfg.get("api_key") or ""):
+                pass  # 与掩码同值，不变
+            else:
+                cfg["api_key"] = new_key
+    _save_ai_config(cfg)
+    # 回显脱敏
+    key = cfg.get("api_key") or ""
+    return jsonify({
+        "base_url": cfg.get("base_url") or "",
+        "api_key_set": bool(key),
+        "api_key_mask": _mask_api_key(key),
+        "model": cfg.get("model") or "",
+        "max_tokens": cfg.get("max_tokens") or 2048,
+    })
+
+
+def _ai_slide_ctx(slide_name: str):
+    """构造 ai_agent.run_agent 需要的 get_slide_ctx 闭包。
+
+    封装 region 裁剪 + add_roi + slide info + config，让 ai_agent 不直接
+    import Flask 全局。region 调本进程内的 slide_cache 读图（不走 HTTP）。
+    """
+    safe = _safe_name(slide_name)
+    entry = _get_slide(safe)
+    cfg = _load_ai_config()
+
+    def get_ctx():
+        with slide_cache.borrow_pair(entry) as pair:
+            osr = pair["osr"]
+            width, height = osr.dimensions
+            try:
+                level_downsamples = tuple(osr.level_downsamples)
+            except Exception:
+                level_downsamples = (1.0,)
+            meta = _read_metadata(osr, UPLOAD_DIR / safe)
+            mpp = meta.get("mpp_x")
+        # 把读图与落标注的闭包也带上（run_agent 内部按需调用）
+        def region_fn(x, y, w, h, out_w, out_h):
+            return _read_region_b64(entry, int(x), int(y), int(w), int(h),
+                                    int(out_w), int(out_h), safe, mpp)
+
+        def add_annotation_fn(label, x, y, side_px, note):
+            roi = share_store.add_roi(
+                share_store.ADMIN_TOKEN, safe, label, type="rect",
+                note=note, x=float(x), y=float(y), side_px=int(side_px),
+            )
+            return {"index": roi.get("index", -1)}
+
+        return {
+            "config": cfg,
+            "info": {
+                "width": width, "height": height,
+                "level_downsamples": level_downsamples, "mpp": mpp,
+            },
+            "region": region_fn,
+            "add_annotation": add_annotation_fn,
+        }
+
+    return get_ctx
+
+
+def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
+    """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。"""
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        width, height = osr.dimensions
+        x2 = max(0, min(x, max(0, width - 1)))
+        y2 = max(0, min(y, max(0, height - 1)))
+        w2 = max(0, min(w, max(0, width - x2)))
+        h2 = max(0, min(h, max(0, height - y2)))
+        if w2 <= 0 or h2 <= 0:
+            w2, h2 = 1, 1
+        ds = max(w2, h2) / 1568.0 if max(w2, h2) > 1568 else 1.0
+        try:
+            lvl = osr.get_best_level_for_downsample(ds) if ds > 1 else 0
+        except Exception:
+            lvl = 0
+        try:
+            ds_lvl = float(osr.level_downsamples[lvl]) if lvl < len(osr.level_downsamples) else 1.0
+        except Exception:
+            ds_lvl = 1.0
+        rw = max(1, int(round(w2 / ds_lvl)))
+        rh = max(1, int(round(h2 / ds_lvl)))
+        region = osr.read_region((x2, y2), lvl, (rw, rh))
+        if region.mode != "RGB":
+            region = region.convert("RGB")
+        ow = max(1, min(out_w, 4096))
+        oh = max(1, min(out_h, 4096))
+        if (ow, oh) != (w2, h2):
+            region = region.resize((ow, oh), Image.LANCZOS)
+        mag = None
+        if mpp and mpp > 0:
+            try:
+                level_ds = osr.level_downsamples
+                ds_lvl = float(level_ds[lvl]) if lvl < len(level_ds) else 1.0
+            except Exception:
+                ds_lvl = 1.0
+            base = 10.0 / mpp
+            mag = base / ds_lvl if ds_lvl > 0 else base
+    buf = io.BytesIO()
+    region.save(buf, format="JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {
+        "image_base64": img_b64,
+        "mime": "image/jpeg",
+        "width": ow, "height": oh,
+        "src": {"x": x2, "y": y2, "w": w2, "h": h2},
+        "magnification": mag,
+    }
+
+
+@app.route("/api/ai/run", methods=["POST"])
+def api_ai_run():
+    """AI 读片助手 SSE 流。body: {slide, task}。
+
+    校验 slide 存在、AI 已配置；以 text/event-stream 逐事件推送：
+    slide_opened / agent_thinking / text_delta / tool_started /
+    snapshot_captured / observation / annotation_created /
+    agent_finished / agent_error。客户端断开时 break loop。
+    """
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    task = body.get("task") or ""
+    if not isinstance(slide, str) or not slide:
+        return jsonify(error="缺少 slide"), 400
+    safe = _sanitize_name(slide)
+    if not safe or safe != slide:
+        return jsonify(error="非法文件名"), 400
+    if not (UPLOAD_DIR / safe).is_file():
+        return jsonify(error="切片不存在"), 404
+
+    cfg = _load_ai_config()
+    if not cfg.get("base_url") or not cfg.get("api_key"):
+        return jsonify(error="AI 未配置：请先在面板里填写 base_url 与 api_key"), 400
+
+    get_ctx = _ai_slide_ctx(safe)
+
+    def gen():
+        """SSE 生成器：把 ai_agent.emit 的事件 yield 为 SSE 帧。
+
+        通过 queue 把 emit 回调（在 run_agent 同步循环里调用）与生成器
+        解耦：emit 把事件入队，生成器逐个 yield；客户端断开（生成器被
+        关闭/GC）时把 client_alive=False，让 run_agent 的 emit 返回 False
+        从而 break 其 tool-call 循环。
+        """
+        import queue
+
+        q: "queue.Queue" = queue.Queue()
+        state = {"alive": True}
+
+        def emit(event_type, payload):
+            # 客户端已断开：返回 False 让 ai_agent 中断循环
+            if not state["alive"]:
+                return False
+            q.put((event_type, payload))
+            return None
+
+        def worker():
+            try:
+                ai_agent.run_agent(safe, task, emit, get_ctx)
+            except Exception as e:  # noqa: BLE001
+                q.put(("agent_error", {"error": "读片助手异常：{}".format(e)}))
+            finally:
+                q.put((None, None))  # 结束 sentinel
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        try:
+            while True:
+                try:
+                    event_type, payload = q.get(timeout=600)
+                except Exception:
+                    # 超时无事件，发心跳保活
+                    yield ": ping\n\n"
+                    continue
+                if event_type is None:
+                    break
+                data = json.dumps(payload, ensure_ascii=False)
+                yield "event: {}\ndata: {}\n\n".format(event_type, data)
+        finally:
+            # 生成器被关闭（客户端断开）：标记断开，run_agent 下次 emit 会感知
+            state["alive"] = False
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
 
 
 # --------------------------------------------------------------------------- #

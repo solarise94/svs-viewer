@@ -104,6 +104,30 @@ podman run -d --name svs-share -p 38000:38000 \
 3. **分享**：项目行悬停点 ↗（或勾选切片分享）→ 选时效 → 复制链接发给用户
 4. **标注回流**：用户打开链接 → 填"标记人/标签" → 框 ROI → 保存选区；管理员在切片行看到"标记 N·M 人"徽章，点"标记"面板跳转定位，或"显示全部标记"叠加全部框
 
+### AI 读片助手（仅管理员）
+
+工具栏的「✨ AI」按钮打开 AI 读片助手面板，让大模型通过 OpenAI 兼容的 function-calling 接口操控虚拟显微镜：自动从低倍概览扫描、抓取快照、落矩形标注并给出中文总结。
+
+**配置**（首次使用）：
+1. 在 AI 面板的「设置区」填写：
+   - **Base URL**：OpenAI 兼容端点，如 `https://api.openai.com/v1`、`https://api.deepseek.com/v1` 等（不含 `/chat/completions` 后缀，程序会自动拼接）
+   - **API Key**：对应服务的密钥（如 `sk-...`）
+   - **模型**：支持 vision + tool-calling 的模型，如 `gpt-4o`、`gpt-4o-mini` 等
+2. 点「保存配置」。配置写入数据目录下的 `ai_config.json`（与 `flask_secret.key` 同目录，即 `SHARE_DATA_DIR` 或 `~/svs-viewer/share-data/`），文件权限 `0600`，**API Key 不入日志**。
+3. GET `/api/ai/config` 回显时 API Key 脱敏为「前4 + \*\*\*\* + 后4」掩码（`api_key_set: true` + `api_key_mask`），不回显明文；PUT 时空串=清除、与掩码同值=不变。
+
+**使用**：
+- 打开任一切片后，在 AI 面板的任务框输入指令（如「扫一遍这张片，标出可疑区域并总结」），点「开始」。
+- 「判读当前选区」快捷钮会把当前 ROI 框或选中标注的 level-0 坐标写进任务前缀，引导 AI 重点看该区域。
+- 运行中以 SSE（`text/event-stream`）实时推送轨迹：`slide_opened` / `agent_thinking` / `text_delta` / `tool_started` / `snapshot_captured` / `observation` / `annotation_created` / `agent_finished` / `agent_error`。`snapshot_captured` 只推 bbox 与放大倍率（不推图像 base64，省带宽），点击该行可跳转到对应区域。
+- AI 的每个视口在画布上以**青色虚线框**叠加（区别于人工标注的金色实线框）；AI 落的标注会写入标注库（label「AI 建议」），出现在现有标注层与「标记」面板，管理员可正常编辑/删除。
+- 「开始」可切为「停止」中途中断（AbortController）；同时只允许一个 run。
+
+**约束**：
+- 所有 `/api/ai/*` 与 `/api/slide/<name>/region` 走现有 `_require_auth`，仅管理员可用。
+- AI 调用 OpenAI 兼容端点的请求在服务端发出（`requests` 库），不暴露 Key 给前端。
+- 图像预算：messages 中只保留最近 3 张快照的 image content，更早的降级为 `[image omitted]`，控制 token 消耗。
+
 ### 安全说明
 
 - 分享端所有路由都校验 token（存在/未撤销/未过期）且切片属于该分享，否则一律 404

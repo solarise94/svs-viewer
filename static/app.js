@@ -58,6 +58,14 @@
   var annoOverlays = [];   // 兼容旧引用，已不再新增（标注改画到 canvas）
   var annoPanelOpen = false;
 
+  // ---------- AI 读片助手状态 ----------
+  var aiPanelOpen = false;
+  var aiOverlay = [];        // canvas 叠加：agent 的 bbox（goto/snapshot），青色虚线框
+  var aiConfig = null;       // {base_url, api_key_set, api_key_mask, model, max_tokens}
+  var aiRunning = false;     // 是否有进行中的 run（同时只允一个）
+  var aiAbortCtrl = null;    // AbortController，停止用
+  var aiTextBubbleEl = null; // 当前 text_delta 增量气泡（append 用）
+
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
   // editing：是否处于「显式编辑态」（进入后画手柄、可拖动，防误挪位置）
@@ -150,6 +158,24 @@
     annoPanelTitle: $("anno-panel-title"),
     annoPanelClose: $("anno-panel-close"),
     annoPanelList: $("anno-panel-list"),
+    // AI 读片助手
+    aiBtn: $("ai-btn"),
+    aiPanel: $("ai-panel"),
+    aiPanelClose: $("ai-panel-close"),
+    aiConfigWrap: $("ai-config-wrap"),
+    aiConfigCollapsed: $("ai-config-collapsed"),
+    aiConfigSummary: $("ai-config-summary"),
+    aiReconfigBtn: $("ai-reconfig-btn"),
+    aiBaseUrl: $("ai-base-url"),
+    aiApiKey: $("ai-api-key"),
+    aiModel: $("ai-model"),
+    aiConfigSave: $("ai-config-save"),
+    aiConfigHint: $("ai-config-hint"),
+    aiTask: $("ai-task"),
+    aiTaskJump: $("ai-task-jump"),
+    aiStartBtn: $("ai-start-btn"),
+    aiStopBtn: $("ai-stop-btn"),
+    aiTrace: $("ai-trace"),
   };
 
   var roiBox = null;
@@ -313,6 +339,10 @@
     els.annoAllBtn.disabled = true;
     els.annoPanel.style.display = "none";
     annoPanelOpen = false;
+    // AI 助手：打开新切片时 enable 按钮、清空 overlay、关面板（保留配置）
+    els.aiBtn.disabled = false;
+    aiOverlay = [];
+    redrawAnnoCanvas();
     syncAnnoAllBtns();
     state.showAnno = false;
     state.focusAnno = null;
@@ -806,12 +836,13 @@
   // 项目渲染与管理
   // =========================================================================
   function loadAll() {
-    // 并行加载切片、项目、分享、标注索引
+    // 并行加载切片、项目、分享、标注索引、AI 配置
     return Promise.all([
       fetch("/api/slides").then(function (r) { return r.json(); }),
       fetch("/api/projects").then(function (r) { return r.json(); }),
       fetch("/api/share/list").then(function (r) { return r.json(); }),
       loadAnnotationsIndex(),
+      loadAiConfig(),
     ]).then(function (results) {
       allSlides = results[0] || [];
       allProjects = results[1] || [];
@@ -1560,7 +1591,9 @@
     if (!annoCtx) return;
     var rect = viewer ? viewer.container.getBoundingClientRect() : { width: c.clientWidth, height: c.clientHeight };
     annoCtx.clearRect(0, 0, rect.width, rect.height);
-    if (!state.showAnno && state.drawMode == null) return;
+    // AI overlay（青色虚线框）独立于 showAnno：agent 进行中/完成后始终画
+    var hasAiOverlay = aiOverlay && aiOverlay.length > 0;
+    if (!state.showAnno && state.drawMode == null && !hasAiOverlay) return;
     if (!state.slide) return;
     // 性能：缩放/平移动画期间省略文本（标签/气泡）只画矢量，
     // 动画结束（animation-finish）再补全，避免每帧逐条 measureText/fillText
@@ -1574,6 +1607,27 @@
         if (state.focusAnno && it !== state.focusAnno) return;
         var selected = (editItem === it);
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
+      });
+    }
+    // AI overlay（agent 的 goto/snapshot bbox）：青色虚线框，区别于人工标注
+    if (hasAiOverlay) {
+      aiOverlay.forEach(function (bb) {
+        var tl = imgToCanvas(bb.x, bb.y);
+        var br = imgToCanvas(bb.x + bb.w, bb.y + bb.h);
+        var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+        var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
+        annoCtx.save();
+        annoCtx.lineWidth = 2;
+        annoCtx.strokeStyle = "#00E5FF";
+        annoCtx.setLineDash([6, 4]);
+        annoCtx.strokeRect(x, y, w, h);
+        annoCtx.setLineDash([]);
+        if (!animating && bb.magnification) {
+          annoCtx.fillStyle = "rgba(0,229,255,0.9)";
+          annoCtx.font = "12px -apple-system, sans-serif";
+          annoCtx.fillText("AI · " + bb.magnification, x + 4, y + 14);
+        }
+        annoCtx.restore();
       });
     }
     // 编辑手柄（仅显式编辑态才画，纯选中不画，防误挪位置）
@@ -2960,6 +3014,349 @@
     els.pickerMask.addEventListener("click", function (e) {
       if (e.target === els.pickerMask) closeSlidePicker();
     });
+
+    // AI 读片助手
+    els.aiBtn.addEventListener("click", function () {
+      if (aiPanelOpen) { closeAiPanel(); } else { openAiPanel(); }
+    });
+    els.aiPanelClose.addEventListener("click", closeAiPanel);
+    els.aiConfigSave.addEventListener("click", saveAiConfig);
+    els.aiReconfigBtn.addEventListener("click", function () {
+      els.aiConfigCollapsed.style.display = "none";
+      els.aiConfigWrap.style.display = "block";
+      // 把掩码回填到 api_key 输入框（占位提示），明文不回填
+      if (aiConfig && aiConfig.api_key_mask) {
+        els.aiApiKey.value = aiConfig.api_key_mask;
+        els.aiApiKey.placeholder = "与掩码同值=不变，清空=删除";
+      }
+    });
+    els.aiStartBtn.addEventListener("click", startAiRun);
+    els.aiStopBtn.addEventListener("click", stopAiRun);
+    els.aiTaskJump.addEventListener("click", function () {
+      var bbox = currentSelectionBbox();
+      if (!bbox) { toast("请先用 ROI 框选区域或选中一个标注", "info"); return; }
+      var prefix = "重点看 level-0 区域 (x=" + bbox.x + ",y=" + bbox.y +
+                   ",w=" + bbox.w + ",h=" + bbox.h + ")：";
+      var cur = els.aiTask.value || "";
+      els.aiTask.value = prefix + cur;
+      els.aiTask.focus();
+    });
+  }
+
+  // =========================================================================
+  // AI 读片助手（仅管理员）
+  // =========================================================================
+  // 加载 AI 配置（GET /api/ai/config，api_key 脱敏）
+  function loadAiConfig() {
+    return apiFetch("/api/ai/config").then(function (r) { return r.json(); }).then(function (cfg) {
+      aiConfig = cfg;
+      renderAiConfigState();
+      return cfg;
+    }).catch(function () { /* 静默，面板里会提示未配置 */ });
+  }
+
+  // 根据配置渲染设置区/折叠区
+  function renderAiConfigState() {
+    if (!aiConfig) return;
+    var configured = !!(aiConfig.base_url && aiConfig.api_key_set);
+    if (configured) {
+      els.aiConfigWrap.style.display = "none";
+      els.aiConfigCollapsed.style.display = "flex";
+      els.aiConfigSummary.textContent =
+        (aiConfig.model || "(未设模型)") + " @ " + aiConfig.base_url;
+    } else {
+      els.aiConfigWrap.style.display = "block";
+      els.aiConfigCollapsed.style.display = "none";
+      // 回填已知的非敏感字段
+      els.aiBaseUrl.value = aiConfig.base_url || "";
+      els.aiModel.value = aiConfig.model || "";
+    }
+  }
+
+  // 保存配置（PUT /api/ai/config）
+  function saveAiConfig() {
+    var payload = {
+      base_url: els.aiBaseUrl.value.trim(),
+      model: els.aiModel.value.trim(),
+    };
+    var keyVal = els.aiApiKey.value;
+    // 空串或与掩码同值都不传（后端按规则处理）；这里显式传让后端判断
+    if (keyVal !== "") { payload.api_key = keyVal; }
+    els.aiConfigHint.textContent = "保存中…";
+    els.aiConfigSave.disabled = true;
+    apiFetch("/api/ai/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function (r) { return r.json(); }).then(function (cfg) {
+      aiConfig = cfg;
+      renderAiConfigState();
+      els.aiApiKey.value = "";
+      els.aiConfigHint.textContent = "已保存";
+      toast("AI 配置已保存", "success");
+    }).catch(function (e) {
+      els.aiConfigHint.textContent = "";
+      toast("保存失败: " + (e && e.message ? e.message : e), "error");
+    }).then(function () { els.aiConfigSave.disabled = false; });
+  }
+
+  function openAiPanel() {
+    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    aiPanelOpen = true;
+    els.aiPanel.style.display = "flex";
+  }
+
+  function closeAiPanel() {
+    aiPanelOpen = false;
+    els.aiPanel.style.display = "none";
+    // 关面板不停止进行中的 run（后台继续，结果仍落标注）
+  }
+
+  // 当前选区 bbox（ROI 框 或 选中标注），用于"判读当前选区"快捷钮
+  function currentSelectionBbox() {
+    // 优先 ROI 框
+    if (state.roi && state.roi.side > 0) {
+      return { x: state.roi.x, y: state.roi.y, w: state.roi.side, h: state.roi.side };
+    }
+    // 选中标注（rect）
+    if (editItem && editItem.type === "rect" && editItem.side_px) {
+      return { x: editItem.x, y: editItem.y, w: editItem.side_px, h: editItem.side_px };
+    }
+    return null;
+  }
+
+  // 开始 AI run（POST /api/ai/run，SSE）
+  function startAiRun() {
+    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (aiRunning) { toast("已有任务进行中", "info"); return; }
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
+      toast("请先配置 AI 服务", "error");
+      els.aiConfigWrap.style.display = "block";
+      els.aiConfigCollapsed.style.display = "none";
+      return;
+    }
+    var task = (els.aiTask.value || "").trim();
+    if (!task) { toast("请输入任务描述", "info"); els.aiTask.focus(); return; }
+
+    // 重置轨迹流
+    els.aiTrace.innerHTML = "";
+    aiOverlay = [];
+    aiTextBubbleEl = null;
+    redrawAnnoCanvas();
+    aiRunning = true;
+    els.aiStartBtn.style.display = "none";
+    els.aiStopBtn.style.display = "inline-block";
+
+    aiAbortCtrl = new AbortController();
+    fetch("/api/ai/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slide: state.slide.name, task: task }),
+      signal: aiAbortCtrl.signal,
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (!resp.ok || !resp.body) {
+        return resp.text().then(function (t) {
+          throw new Error(t || ("HTTP " + resp.status));
+        });
+      }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder("utf-8");
+      var buffer = "";
+      function pump() {
+        return reader.read().then(function (result) {
+          if (result.done) { finishAiRun(); return; }
+          buffer += decoder.decode(result.value, { stream: true });
+          // 按 "\n\n" 切分 SSE 帧
+          var idx;
+          while ((idx = buffer.indexOf("\n\n")) >= 0) {
+            var frame = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            handleSseFrame(frame);
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (e) {
+      if (e && e.name === "AbortError") {
+        toast("已停止", "info");
+      } else {
+        toast("AI 运行失败: " + (e && e.message ? e.message : e), "error");
+        appendTraceRow("error", "AI 运行失败: " + (e && e.message ? e.message : e));
+      }
+      finishAiRun();
+    });
+  }
+
+  function stopAiRun() {
+    if (aiAbortCtrl) { try { aiAbortCtrl.abort(); } catch (e) {} }
+    finishAiRun();
+  }
+
+  function finishAiRun() {
+    aiRunning = false;
+    els.aiStartBtn.style.display = "inline-block";
+    els.aiStopBtn.style.display = "none";
+    aiAbortCtrl = null;
+  }
+
+  // 解析单条 SSE 帧（event:/data: 行）
+  function handleSseFrame(frame) {
+    var eventType = null;
+    var dataStr = "";
+    var lines = frame.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (line.indexOf(":") === 0) continue; // 注释/心跳
+      if (line.indexOf("event:") === 0) {
+        eventType = line.slice(6).trim();
+      } else if (line.indexOf("data:") === 0) {
+        dataStr += line.slice(5).trim();
+      }
+    }
+    if (!eventType) return;
+    var payload = {};
+    if (dataStr) {
+      try { payload = JSON.parse(dataStr); } catch (e) { payload = { raw: dataStr }; }
+    }
+    handleAiEvent(eventType, payload);
+  }
+
+  // 按 SSE 事件类型渲染轨迹流 + canvas overlay
+  function handleAiEvent(type, p) {
+    if (type === "slide_opened") {
+      // 概览层视口作为初始 overlay
+      if (p.viewport) {
+        aiOverlay = [{ x: p.viewport.x, y: p.viewport.y, w: p.viewport.w, h: p.viewport.h,
+                       magnification: "概览" }];
+        redrawAnnoCanvas();
+      }
+      appendTraceRow("info", "已打开切片 " + (p.slide || "") + "，开始读片…");
+      return;
+    }
+    if (type === "agent_thinking") {
+      // 思考中提示（轻量，不每次都加行，避免刷屏：复用最后一行思考态）
+      setThinkingRow();
+      return;
+    }
+    if (type === "text_delta") {
+      appendTextBubble(p.text || "");
+      return;
+    }
+    if (type === "tool_started") {
+      clearThinkingRow();
+      if (p.tool === "goto") {
+        appendTraceRow("tool", "→ goto (" + fmtNum(p.x) + "," + fmtNum(p.y) +
+          ") @ " + (p.magnification || "") + (p.reason ? " · " + p.reason : ""));
+      } else {
+        appendTraceRow("tool", "→ " + p.tool);
+      }
+      return;
+    }
+    if (type === "snapshot_captured") {
+      clearThinkingRow();
+      var bb = p.bboxLevel0 || {};
+      aiOverlay.push({ x: bb.x, y: bb.y, w: bb.w, h: bb.h,
+                       magnification: p.magnification || "" });
+      // 只保留最近一次框（按需求"完成后保留最近一次框"；过程中也只显示最新）
+      if (aiOverlay.length > 1) aiOverlay = aiOverlay.slice(-1);
+      redrawAnnoCanvas();
+      var row = appendTraceRow("snapshot", "+ 快照 @ " + (p.magnification || "") +
+                               "  (点击跳转)");
+      row.dataset.bbox = JSON.stringify(bb);
+      return;
+    }
+    if (type === "observation") {
+      clearThinkingRow();
+      appendTraceRow("observation", "👁 " + (p.label || "") + (p.note ? "：" + p.note : ""));
+      return;
+    }
+    if (type === "annotation_created") {
+      clearThinkingRow();
+      appendTraceRow("annotation", "📌 AI 建议 · " + (p.label || "") +
+                     (p.note ? "（" + p.note + "）" : "") +
+                     " @(" + fmtNum(p.x) + "," + fmtNum(p.y) + "," + p.side_px + "px)");
+      // 刷新标注层与面板，让 AI 标注出现在现有标注体系
+      refreshCurrentAnnotations();
+      loadAnnotationsIndex();
+      return;
+    }
+    if (type === "agent_finished") {
+      clearThinkingRow();
+      appendTraceRow("finished", p.summary || "(完成)");
+      redrawAnnoCanvas();
+      return;
+    }
+    if (type === "agent_error") {
+      clearThinkingRow();
+      appendTraceRow("error", p.error || "出错");
+      return;
+    }
+  }
+
+  function fmtNum(v) {
+    if (v == null) return "?";
+    return Math.round(v);
+  }
+
+  // ---------- 轨迹流 DOM 辅助 ----------
+  function appendTraceRow(cls, text) {
+    // 清掉空提示
+    var empty = els.aiTrace.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    var row = document.createElement("div");
+    row.className = "ai-trace-row " + cls;
+    row.textContent = text;
+    if (cls === "snapshot") {
+      row.style.cursor = "pointer";
+      row.title = "点击跳转到该区域";
+      row.addEventListener("click", function () {
+        try {
+          var bb = JSON.parse(row.dataset.bbox || "{}");
+          if (bb.x != null && viewer && viewer.viewport) {
+            viewer.viewport.fitBounds(
+              viewer.viewport.imageToViewportRectangle(bb.x, bb.y, bb.w, bb.h));
+          }
+        } catch (e) {}
+      });
+    }
+    els.aiTrace.appendChild(row);
+    els.aiTrace.scrollTop = els.aiTrace.scrollHeight;
+    return row;
+  }
+
+  function appendTextBubble(text) {
+    // 增量 append 到当前气泡（若无则新建）
+    if (!aiTextBubbleEl || aiTextBubbleEl.closed) {
+      aiTextBubbleEl = document.createElement("div");
+      aiTextBubbleEl.className = "ai-trace-row bubble";
+      aiTextBubbleEl.textContent = "";
+      aiTextBubbleEl.closed = false;
+      els.aiTrace.appendChild(aiTextBubbleEl);
+    }
+    aiTextBubbleEl.textContent += text;
+    els.aiTrace.scrollTop = els.aiTrace.scrollHeight;
+  }
+
+  var thinkingRowEl = null;
+  function setThinkingRow() {
+    if (thinkingRowEl && thinkingRowEl.parentNode) return;
+    var empty = els.aiTrace.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    thinkingRowEl = document.createElement("div");
+    thinkingRowEl.className = "ai-trace-row thinking";
+    thinkingRowEl.textContent = "思考中…";
+    els.aiTrace.appendChild(thinkingRowEl);
+    els.aiTrace.scrollTop = els.aiTrace.scrollHeight;
+  }
+  function clearThinkingRow() {
+    if (thinkingRowEl && thinkingRowEl.parentNode) {
+      thinkingRowEl.parentNode.removeChild(thinkingRowEl);
+    }
+    thinkingRowEl = null;
+    // 关闭当前 text 气泡：下一段 text_delta 会新建一个
+    if (aiTextBubbleEl) { aiTextBubbleEl.closed = true; }
   }
 
   // ---------- 启动 ----------

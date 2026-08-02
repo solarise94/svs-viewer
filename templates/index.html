@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260801c" />
+  <link rel="stylesheet" href="/static/style.css?v=20260802a" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -53,6 +53,9 @@
 
       <!-- 标记：打开当前切片标注面板 -->
       <button id="anno-btn" class="tool-btn" disabled>标记</button>
+
+      <!-- AI 读片助手（仅管理员，打开后 enable） -->
+      <button id="ai-btn" class="tool-btn ai-btn" disabled title="AI 读片助手（管理员）">✨ AI</button>
 
       <!-- 显示全部标记：移动端已并入标注面板头部；桌面端在此内联保留 -->
       <button id="anno-all-btn" class="tool-btn" disabled>显示全部标记</button>
@@ -215,12 +218,67 @@
           <div class="anno-panel-empty">暂无标注</div>
         </div>
       </div>
+
+      <!-- AI 读片助手面板（管理员） -->
+      <div id="ai-panel" class="ai-panel" style="display:none;">
+        <div class="ai-panel-header">
+          <span id="ai-panel-title">✨ AI 读片助手</span>
+          <div class="ai-panel-header-actions">
+            <button id="ai-panel-close" class="icon-btn close" aria-label="关闭">×</button>
+          </div>
+        </div>
+
+        <!-- 1. 设置区（未配置时展开） -->
+        <div id="ai-config-wrap" class="ai-config-wrap">
+          <div class="ai-config-title">AI 服务配置</div>
+          <label class="ai-field">
+            <span>Base URL</span>
+            <input id="ai-base-url" type="text" placeholder="https://api.openai.com/v1"
+                   autocomplete="off" />
+          </label>
+          <label class="ai-field">
+            <span>API Key</span>
+            <input id="ai-api-key" type="password" placeholder="sk-..."
+                   autocomplete="off" />
+          </label>
+          <label class="ai-field">
+            <span>模型</span>
+            <input id="ai-model" type="text" placeholder="gpt-4o"
+                   autocomplete="off" />
+          </label>
+          <div class="ai-config-actions">
+            <button id="ai-config-save" class="btn primary small">保存配置</button>
+            <span id="ai-config-hint" class="ai-config-hint"></span>
+          </div>
+        </div>
+        <!-- 已配置时折叠，留"重新配置"小链 -->
+        <div id="ai-config-collapsed" class="ai-config-collapsed" style="display:none;">
+          <span id="ai-config-summary" class="ai-config-summary"></span>
+          <button id="ai-reconfig-btn" class="link-btn">重新配置</button>
+        </div>
+
+        <!-- 2. 任务输入 -->
+        <div class="ai-task-wrap">
+          <textarea id="ai-task" class="ai-task" rows="3"
+                    placeholder="让 AI 做什么，如：扫一遍这张片，标出可疑区域并总结"></textarea>
+          <div class="ai-task-actions">
+            <button id="ai-task-jump" class="tool-btn small" title="把当前 ROI/选中标注的坐标写进任务">判读当前选区</button>
+            <button id="ai-start-btn" class="btn primary small">开始</button>
+            <button id="ai-stop-btn" class="btn small" style="display:none;">停止</button>
+          </div>
+        </div>
+
+        <!-- 3. 轨迹流 -->
+        <div id="ai-trace" class="ai-trace">
+          <div class="ai-trace-empty">点击「开始」让 AI 读片。轨迹会显示在这里。</div>
+        </div>
+      </div>
     </main>
   </div>
 
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260801c"></script>
+  <script src="/static/app.js?v=20260802a"></script>
 </body>
 </html>

@@ -8,3 +8,5 @@ zarr>=2.18,<3
 imagecodecs
 numpy
 gunicorn
+# AI 读片助手调用 OpenAI 兼容端点（chat/completions）用
+requests
