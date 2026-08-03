@@ -408,8 +408,9 @@
         var imageZoom = (zoom * containerW) / imgW;
         var mpp = state.mppX;
         if (mpp && mpp > 0 && imageZoom > 0) {
-          // 物镜等效倍率 = 屏幕像素物理尺寸(µm) / 当前每屏像素对应的标本 µm
-          var mag = (25400 / 96) / (mpp * imageZoom);
+          // 相对物镜倍率：以 1:1 图像像素 = 物镜倍率(10/mpp) 为锚，
+          // 全片 fit 时 <1（如 0.2×），zoom 到细胞细节趋近 40×。像显微镜的相对倍率。
+          var mag = imageZoom * (10 / mpp);
           text = formatMag(mag);
         } else {
           text = Math.round(imageZoom * 100) + "%";
