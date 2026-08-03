@@ -374,6 +374,30 @@ def make_fork_messages(slide_name: str, info: dict, spot: dict, question: str,
 # =========================================================================== #
 # run_agent：手写 tool-call while loop（走 SessionRunner）
 # =========================================================================== #
+def _is_context_exceeded(exc: Exception) -> bool:
+    """判断模型调用异常是否"上下文超窗"（§3.6 重试兜底）。
+
+    兼容 OpenAI 官方与兼容端点的不同措辞（大小写不敏感）：
+    - HTTP 400 且响应体含 context_length_exceeded（OpenAI 官方 error.code）；
+    - 异常消息含 context_length / maximum context / too many tokens /
+      context window（部分端点把超窗描述放进 message）。
+    """
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        if resp is not None and getattr(resp, "status_code", None) == 400:
+            try:
+                body = (resp.text or "")
+            except Exception:
+                body = ""
+            if "context_length_exceeded" in body.lower():
+                return True
+    msg = str(exc).lower()
+    for kw in ("context_length", "maximum context", "too many tokens", "context window"):
+        if kw in msg:
+            return True
+    return False
+
+
 def run_agent(initial_messages: List[Dict[str, Any]],
               initial_state: "AgentState",
               runner: Any,
@@ -388,7 +412,7 @@ def run_agent(initial_messages: List[Dict[str, Any]],
 
     runner 需已注入 slide 上下文：runner.set_slide_ctx({config, info, region})。
     """
-    max_steps = max_steps or int((runner.cfg or {}).get("max_steps") or 12)
+    max_steps = max_steps or int((runner.cfg or {}).get("max_steps") or 50)
     kind = runner.get_data().get("kind") or "main"
     ctx = getattr(runner, "get_slide_ctx", lambda: {})() or {}
     cfg = ctx.get("config") or {}
@@ -459,15 +483,38 @@ def run_agent(initial_messages: List[Dict[str, Any]],
                 "tools": tools,
                 "max_tokens": max_tokens,
             }
-            try:
-                resp = requests.post(url, headers=headers, json=req_body, timeout=120)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                runner.emit_event("agent_error", {"error": "调用模型失败：{}".format(e),
-                                                  "step": step})
-                runner.mark_error()
-                return
+
+            # 超窗报错（HTTP 400 context_length_exceeded / 各端点措辞）→
+            # 强制执行一次 compact 后重新物化并重试该次调用（§3.6 兜底）。
+            # 非超窗错误（网络/5xx/鉴权）不重试，直接终止。
+            compact_retried = False
+            while True:
+                try:
+                    resp = requests.post(url, headers=headers, json=req_body, timeout=120)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception as e:
+                    if not compact_retried and _is_context_exceeded(e):
+                        compact_retried = True
+                        # force_compact 会并发 session_compacted{reason} 事件，
+                        # 前端据此显示"上下文已满，已压缩并继续"。
+                        try:
+                            runner.force_compact(reason="context_length_exceeded")
+                            request_messages = runner.materialize_request_messages()
+                            req_body["messages"] = request_messages
+                        except Exception as ce:  # noqa: BLE001
+                            # compact 本身失败（fencing 失守/异常）→ 按原错误终止
+                            runner.emit_event("agent_error", {"error": "调用模型失败：{}".format(e),
+                                                              "step": step})
+                            runner.mark_error()
+                            return
+                        # 重试该次模型调用
+                        continue
+                    runner.emit_event("agent_error", {"error": "调用模型失败：{}".format(e),
+                                                      "step": step})
+                    runner.mark_error()
+                    return
 
             # 记录 usage（compact 触发判断，§3.5）
             choice = (data.get("choices") or [{}])[0]

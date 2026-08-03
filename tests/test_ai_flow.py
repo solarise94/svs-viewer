@@ -94,6 +94,47 @@ class _FakeResp:
         return self._data
 
 
+class _FakeErrResp:
+    """HTTP 错误响应壳（给 requests.HTTPError.response 挂 status_code/text）。"""
+
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return {}
+
+
+def _http_error(status_code, body_text):
+    """构造带响应体的 requests.HTTPError（模拟模型端点 4xx/5xx）。"""
+    import requests
+    resp = _FakeErrResp(status_code, body_text)
+    err = requests.HTTPError("{} Client Error".format(status_code))
+    err.response = resp
+    return err
+
+
+class MockModelRaise:
+    """mock 模型端点：脚本元素为 正常响应 dict 或 待抛出的异常。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.i = 0
+        self.lock = threading.Lock()
+
+    def __call__(self, url, headers=None, json=None, timeout=None):
+        with self.lock:
+            self.calls.append((url, json))
+            if self.i >= len(self.script):
+                raise AssertionError("mock 脚本耗尽")
+            step = self.script[self.i]
+            self.i += 1
+        if isinstance(step, Exception):
+            raise step
+        return _FakeResp(step)
+
+
 def _tool_call(tc_id, name, args):
     return {"id": tc_id, "type": "function",
             "function": {"name": name, "arguments": json.dumps(args)}}
@@ -464,6 +505,148 @@ def test_archive():
     check("unarchive 200", r.status_code == 200 and r.get_json().get("archived") is False)
 
 
+def test_context_exceeded_retry():
+    """超窗(400 context_length_exceeded) → compact → 重试成功 → 正常 finish。"""
+    print("== test_context_exceeded_retry (超窗后 compact 重试成功) ==")
+    reset_all()
+    err = _http_error(400, "This model's maximum context length is 4097 tokens. "
+                            "However, your messages resulted in 5000 tokens. "
+                            '{"error":{"code":"context_length_exceeded",...}}')
+    finish = _choice({"role": "assistant", "content": "看完了",
+                      "tool_calls": [_tool_call("f1", "finish", {"summary": "完成"})]})
+    mock = MockModelRaise([err, finish])
+    import requests
+    requests.post = mock
+
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("超窗重试含 session_compacted", "session_compacted" in types)
+    comp = [p for (_, t, p) in events if t == "session_compacted"]
+    check("session_compacted 带 reason=context_length_exceeded",
+          comp and (comp[0] or {}).get("reason") == "context_length_exceeded")
+    check("超窗重试后 agent_finished", "agent_finished" in types)
+    check("超窗重试不 agent_error", "agent_error" not in types)
+    check("模型调用恰好 2 次（1 失败 + 1 重试）", len(mock.calls) == 2)
+    sid = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid = p.get("session_id")
+    d = ai_session.read_session(sid)
+    check("会话终态 finished", d and d.get("status") == "finished")
+
+
+def test_context_exceeded_retry_fail():
+    """超窗后重试仍超窗 → agent_error 终止（不无限重试）。"""
+    print("== test_context_exceeded_retry_fail (重试仍失败则终止) ==")
+    reset_all()
+    err = _http_error(400, "context_length_exceeded")
+    mock = MockModelRaise([err, err])
+    import requests
+    requests.post = mock
+
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("重试仍超窗含 agent_error", "agent_error" in types)
+    check("重试仍超窗不 agent_finished", "agent_finished" not in types)
+    check("仅重试一次（共 2 次调用）", len(mock.calls) == 2)
+    sid = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid = p.get("session_id")
+    d = ai_session.read_session(sid)
+    check("会话终态 error", d and d.get("status") == "error")
+
+
+def test_non_context_error_no_retry():
+    """非超窗错误（网络/5xx/鉴权）不触发 compact 重试，直接 agent_error。"""
+    print("== test_non_context_error_no_retry (非超窗错误直接终止) ==")
+    reset_all()
+    err500 = _http_error(500, "server error")
+    mock = MockModelRaise([err500])
+    import requests
+    requests.post = mock
+
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("5xx 错误 agent_error", "agent_error" in types)
+    check("5xx 错误无 session_compacted", "session_compacted" not in types)
+    check("5xx 错误不重试（只 1 次调用）", len(mock.calls) == 1)
+
+
+def test_max_steps_default_50():
+    """不传 max_steps（配置里也没有）→ 默认 50 步上限，到顶 agent_paused。"""
+    print("== test_max_steps_default_50 (默认 50 步上限) ==")
+    reset_all()
+    cfg_path = os.path.join(os.environ["SHARE_DATA_DIR"], "ai_config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        # 故意不写 max_steps：验证默认 50
+        json.dump({"base_url": "http://mock/v1", "api_key": "k", "model": "m",
+                   "max_tokens": 256}, f, ensure_ascii=False)
+    goto_call = _choice({"role": "assistant", "content": "",
+                         "tool_calls": [_tool_call("g", "goto",
+                                                   {"x": 10, "y": 10, "level": 1})]})
+    script = [goto_call] * 50
+    mock = MockModelRaise(script)
+    import requests
+    requests.post = mock
+
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("默认 50 步到顶 agent_paused", "agent_paused" in types)
+    check("默认 50 步共 50 次模型调用", len(mock.calls) == 50)
+    check("默认 50 步无 agent_finished", "agent_finished" not in types)
+    sid = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid = p.get("session_id")
+    d = ai_session.read_session(sid)
+    check("会话终态 paused", d and d.get("status") == "paused")
+
+
+def test_event_reset():
+    """after_seq < event_min_seq（缓冲已滚过断点）→ 收到 event_reset 帧。"""
+    print("== test_event_reset (断点被滚动窗口丢弃 → event_reset) ==")
+    reset_all()
+    # 小 event_buffer：让 event_min_seq 快速前移，且不启动真实 worker
+    cfg = {"base_url": "http://mock/v1", "api_key": "k", "model": "m",
+           "max_steps": 3, "event_buffer": 5}
+    r = ai_session.SessionRunner.acquire("a.svs", "main", cfg=cfg)
+    for i in range(10):
+        r.emit_event("text_delta", {"text": "e{}".format(i)})
+    r.pause()  # 离开 running，SSE 才能正常收尾
+    data = r.get_data()
+    min_seq = int(data.get("event_min_seq") or 0)
+    last_seq = int(data.get("last_event_seq") or 0)
+    check("event_min_seq 前移（>5）", min_seq > 5)
+
+    client = app_mod.app.test_client()
+    # after_seq=2 < event_min_seq → event_reset
+    resp = client.get("/api/ai/session/{}/stream?after_seq=2".format(r.session_id))
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("重挂收到 event_reset", "event_reset" in types)
+    rp = None
+    for (_, t, p) in events:
+        if t == "event_reset":
+            rp = p
+    check("event_reset 带 event_min_seq", rp and rp.get("event_min_seq") == min_seq)
+    check("event_reset 带 last_event_seq", rp and rp.get("last_event_seq") == last_seq)
+    check("event_reset 后不重放旧事件", not any(s is not None and s <= 2 for (s, _, _) in events))
+    # after_seq >= event_min_seq → 不触发 event_reset（走正常重放/收尾）
+    resp2 = client.get("/api/ai/session/{}/stream?after_seq={}".format(r.session_id, last_seq))
+    events2 = _parse_sse(resp2.get_data(as_text=True))
+    types2 = [t for (_, t, _) in events2]
+    check("after_seq>=min_seq 无 event_reset", "event_reset" not in types2)
+
+
 def reset_all():
     """清空 share_store 与 ai_sessions。"""
     share_store.SHARE_FILE.unlink(missing_ok=True)
@@ -493,5 +676,10 @@ if __name__ == "__main__":
     test_reconnect_replay()
     test_context_continuity()
     test_archive()
+    test_context_exceeded_retry()
+    test_context_exceeded_retry_fail()
+    test_non_context_error_no_retry()
+    test_max_steps_default_50()
+    test_event_reset()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

@@ -411,6 +411,43 @@ def test_spot_inject():
     check("删除注入 spot_deleted", any("spot_deleted" in m for m in msgs2[n_before:]))
 
 
+# =========================================================================== #
+# 8. force_compact（§3.6 超窗兜底）与 max_steps 默认值
+# =========================================================================== #
+def test_force_compact():
+    print("== test_force_compact (超窗兜底强制压缩) ==")
+    reset_store()
+    cfg = {"context_window_tokens": 5000, "reserve_tokens": 500,
+           "safety_margin": 200, "keep_recent_tokens": 300}
+    r = ai_session.SessionRunner.acquire("a.svs", "main", cfg=cfg)
+    for i in range(6):
+        tcs = r.begin_bundle({"role": "assistant", "content": "bundle {} {}".format(i, "字" * 600),
+                              "tool_calls": [{"id": "c{}".format(i),
+                                              "function": {"name": "mark_observation",
+                                                           "arguments": json.dumps(
+                                                               {"label": "ob{}".format(i),
+                                                                "note": "看" * 600})}}]})
+        r.record_tool_result("c{}".format(i), "已记录")
+        r.commit_bundle()
+    before = len(r.get_data()["canonical_messages"])
+    r.force_compact(reason="context_length_exceeded")
+    data = r.get_data()
+    check("force_compact 后消息变少", len(data["canonical_messages"]) < before)
+    check("force_compact 有 summary", bool(data.get("summary")))
+    # session_compacted 事件落盘且带 reason（前端显示"已压缩并继续"）
+    evs = ai_session.replay_events(r.session_id, 0, data)
+    comp = [e for e in evs if e.get("type") == "session_compacted"]
+    check("session_compacted 事件已发", len(comp) == 1)
+    check("session_compacted 带 reason", (comp[0].get("payload") or {}).get("reason") == "context_length_exceeded")
+
+
+def test_default_max_steps():
+    print("== test_default_max_steps ==")
+    check("DEFAULT_CONFIG max_steps=50", ai_session.DEFAULT_CONFIG["max_steps"] == 50)
+    check("_merge_config({}) max_steps=50", ai_session._merge_config({})["max_steps"] == 50)
+    check("_merge_config 可覆盖 max_steps", ai_session._merge_config({"max_steps": 3})["max_steps"] == 3)
+
+
 if __name__ == "__main__":
     test_migration_and_change_seq()
     test_acquire_and_fencing()
@@ -419,5 +456,7 @@ if __name__ == "__main__":
     test_compact()
     test_snapshot_guard()
     test_spot_inject()
+    test_force_compact()
+    test_default_max_steps()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

@@ -1633,11 +1633,24 @@ def _sse_response(session_id: str):
 
     def gen():
         last_seq = after_seq
+        # 若客户端断点已被事件日志滚动窗口丢弃（after_seq < event_min_seq，
+        # §5.6）→ 先发 event_reset，前端全量 GET session detail 重建轨迹，
+        # 不再补发不完整的历史。
+        _event_reset_sent = False
 
         def _drain():
             nonlocal last_seq
             data = ai_session.read_session(session_id) or {}
             cur = int(data.get("last_event_seq") or 0)
+            if not _event_reset_sent and after_seq > 0:
+                min_seq = int(data.get("event_min_seq") or 0)
+                if after_seq < min_seq:
+                    # 断点已被滚动窗口丢弃 → 只发 event_reset，让前端全量刷新
+                    # （带 id: 推进 Last-Event-ID，避免重连时再次触发）
+                    last_seq = max(last_seq, cur)
+                    return [("id: {}\nevent: event_reset\ndata: {}\n\n".format(
+                        cur, json.dumps({"event_min_seq": min_seq,
+                                         "last_event_seq": cur}, ensure_ascii=False)))]
             yielded = []
             if cur > last_seq:
                 for ev in ai_session.replay_events(session_id, last_seq, data):
@@ -1656,6 +1669,7 @@ def _sse_response(session_id: str):
                 if frames:
                     for f in frames:
                         yield f
+                    _event_reset_sent = True
                     continue
                 data = ai_session.read_session(session_id) or {}
                 status = data.get("status")

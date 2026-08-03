@@ -3364,6 +3364,16 @@
       finishAiRun();
       return;
     }
+    if (eventType === "event_reset") {
+      // 事件缓冲已滚过断点：后端要求前端全量刷新（§5.6 event_reset）
+      var rp = {};
+      if (dataStr) {
+        try { rp = JSON.parse(dataStr); } catch (e) { rp = { raw: dataStr }; }
+      }
+      if (seq != null) aiLastSeq = Math.max(aiLastSeq, seq);
+      handleAiEventReset(rp);
+      return;
+    }
     var payload = {};
     if (dataStr) {
       try { payload = JSON.parse(dataStr); } catch (e) { payload = { raw: dataStr }; }
@@ -3493,6 +3503,15 @@
       loadAnnotationsIndex();
       return;
     }
+    if (type === "session_compacted") {
+      clearThinkingRow();
+      if (p && p.reason === "context_length_exceeded") {
+        appendTraceRow("info", "上下文已满，已压缩并继续");
+      } else {
+        appendTraceRow("info", "上下文已压缩，继续读片…");
+      }
+      return;
+    }
     if (type === "agent_paused") {
       clearThinkingRow();
       appendTraceRow("paused", "已暂停，可继续（" + (p.summary || "") + "）");
@@ -3513,6 +3532,98 @@
       finishAiRun();
       return;
     }
+  }
+
+  // event_reset：事件缓冲已滚过客户端断点 → 清空轨迹，GET session 全量
+  // transcript 重建轨迹，再继续接 live 流（§5.6 event_reset 语义）
+  function handleAiEventReset(payload) {
+    resetAiTrace();
+    appendTraceRow("info", "对话历史过长，正在刷新到最新状态…");
+    if (!aiSessionId) {
+      toast("对话历史过长，已刷新到最新状态", "info");
+      return;
+    }
+    apiFetch("/api/ai/session/" + encodeURIComponent(aiSessionId))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var s = data && data.session;
+        var t = data && data.transcript;
+        resetAiTrace();  // 清掉刷新期间追加的 live 行，以全量 transcript 为准
+        if (t && t.length) {
+          renderAiTranscript(t);
+        } else {
+          appendTraceRow("info", "对话历史过长，已刷新到最新状态");
+        }
+        if (s && s.last_event_seq != null) {
+          aiLastSeq = Math.max(aiLastSeq, Number(s.last_event_seq) || 0);
+        }
+        toast("已刷新到最新状态", "success");
+      })
+      .catch(function () {
+        appendTraceRow("info", "对话历史过长，已刷新到最新状态");
+        toast("对话历史过长，已刷新到最新状态", "info");
+      });
+  }
+
+  // 把 GET session 的脱敏 transcript（canonical messages）渲染成轨迹行
+  function renderAiTranscript(msgs) {
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i] || {};
+      var role = m.role || "";
+      var text = messageText(m);
+      if (role === "user") {
+        if (text) appendTraceRow("info", "🙋 " + truncateStr(text, 200));
+      } else if (role === "assistant") {
+        var tcs = m.tool_calls || [];
+        if (tcs.length) {
+          for (var j = 0; j < tcs.length; j++) {
+            var fn = tcs[j].function || {};
+            var nm = fn.name || "";
+            appendTraceRow("tool", "→ " + nm + " " + summarizeToolArgs(nm, fn.arguments));
+          }
+        } else if (text) {
+          appendTraceRow("finished", truncateStr(text, 300));
+        }
+      } else if (role === "tool") {
+        var res = truncateStr(m.content, 160);
+        if (res) appendTraceRow("info", "⇠ " + res);
+      }
+    }
+  }
+
+  function messageText(m) {
+    var c = m.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+      var out = [];
+      for (var i = 0; i < c.length; i++) {
+        var p = c[i] || {};
+        if (p.type === "text" && p.text) out.push(p.text);
+        else if (p.type === "image_ref" || p.type === "image_url") out.push("（图像）");
+      }
+      return out.join(" ");
+    }
+    return "";
+  }
+
+  function summarizeToolArgs(name, argsStr) {
+    var args = {};
+    if (typeof argsStr === "string") {
+      try { args = JSON.parse(argsStr) || {}; } catch (e) {}
+    } else if (argsStr && typeof argsStr === "object") {
+      args = argsStr;
+    }
+    if (name === "goto") {
+      return "(" + fmtNum(args.x) + "," + fmtNum(args.y) + ") @" + (args.level != null ? args.level : "?");
+    }
+    var s = JSON.stringify(args);
+    return s && s.length > 120 ? s.slice(0, 120) + "…" : s;
+  }
+
+  function truncateStr(s, n) {
+    s = String(s == null ? "" : s);
+    if (s.length <= n) return s;
+    return s.slice(0, n) + "…";
   }
 
   function fmtNum(v) {

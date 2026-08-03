@@ -33,7 +33,7 @@ import fcntl
 
 # 默认参数（§8.1；ai_config.json 可覆盖）
 DEFAULT_CONFIG = {
-    "max_steps": 12,
+    "max_steps": 50,
     "context_window_tokens": 272000,
     "reserve_tokens": 16000,
     "safety_margin": 8192,
@@ -879,6 +879,21 @@ class SessionRunner:
             "tokens_before": tokens_before, "tokens_after": tokens_after,
         })
         return True
+
+    def force_compact(self, reason: str = "context_length_exceeded") -> None:
+        """强制执行一次 compact（§3.6：超窗报错后的兜底重试前置）。
+
+        与 maybe_compact 的阈值判断无关：超窗时上下文必然已满，直接压。
+        fencing 校验走 _compact_now 锁内的 _assert_lease_in_lock；
+        并发 session_compacted{reason} 事件让前端可见"已压缩并继续"。
+        """
+        tokens_before = self.estimate_input_tokens()
+        self._compact_now()
+        tokens_after = self.estimate_input_tokens()
+        self.emit_event("session_compacted", {
+            "tokens_before": tokens_before, "tokens_after": tokens_after,
+            "reason": reason,
+        })
 
     def _compact_now(self) -> None:
         """执行 compact：增量摘要 + 按完整 bundle 切 keep_recent_tokens。"""

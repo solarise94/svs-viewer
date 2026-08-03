@@ -120,8 +120,10 @@ podman run -d --name svs-share -p 38000:38000 \
 - 打开任一切片后，在 AI 面板的任务框输入指令（如「扫一遍这张片，标出可疑区域并总结」），点「开始」。
 - 「判读当前选区」快捷钮会把当前 ROI 框或选中标注的 level-0 坐标写进任务前缀，引导 AI 重点看该区域。
 - 运行中以 SSE（`text/event-stream`）实时推送轨迹：`slide_opened` / `agent_thinking` / `text_delta` / `tool_started` / `snapshot_captured` / `observation` / `annotation_created` / `agent_finished` / `agent_error`。`snapshot_captured` 只推 bbox 与放大倍率（不推图像 base64，省带宽），点击该行可跳转到对应区域。
+- 单轮步数上限默认 `max_steps=50`（可在 `ai_config.json` 覆盖，到上限自动暂停，可「▶ 继续」）。
+- 模型请求若因**上下文超窗**报错（如 `context_length_exceeded`）：自动压缩一次上下文并重试该次调用（轨迹显示"上下文已压缩并继续"），不中断 run。
 - AI 的每个视口在画布上以**青色虚线框**叠加（区别于人工标注的金色实线框）；AI 落的标注会写入标注库（label「AI 建议」），出现在现有标注层与「标记」面板，管理员可正常编辑/删除。
-- 「开始」可切为「停止」中途中断（AbortController）；同时只允许一个 run。
+- 「开始」可切为「停止」中途中断（AbortController）；同时只允许一个 run。断线重连若事件缓冲已滚过断点，服务端发 `event_reset`，前端自动全量刷新对话状态。
 
 **约束**：
 - 所有 `/api/ai/*` 与 `/api/slide/<name>/region` 走现有 `_require_auth`，仅管理员可用。

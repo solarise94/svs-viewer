@@ -18,7 +18,7 @@
 
 ## 0. 要解决的三个真实痛点
 
-1. **跑一半丢进度**：主 run 到步数上限（`max_steps`，默认 12）就停，messages 是局部变量，跑完即弃。用户"满意但想继续"时只能从头再来。
+1. **跑一半丢进度**：主 run 到步数上限（`max_steps`，默认 50）就停，messages 是局部变量，跑完即弃。用户"满意但想继续"时只能从头再来。
 2. **无法对某个 spot 追问**：AI 落了一堆标记和注释，用户想针对**其中某一条**详细提问，现有逻辑没有入口、也没有该 spot 的上下文。
 3. **上下文 / 缓存成本失控**：当前 `ImageBudget` 逐张降级历史图（改消息中间内容），把 prompt 前缀缓存在降级点全部打断，命中率趋近于 0；图 token 与全段重算叠加，越聊越贵。
 
@@ -206,11 +206,13 @@ assert_lease()                     # 校验 active_run_id + lease_epoch，失配
 emit_event(type, payload)          # 单调 seq，append .events.jsonl + 推 SSE
 materialize_request_messages()     # canonical → request（物化未 compact 的 image_ref）
 maybe_compact()                    # §3.5 触发判断 + 执行
+force_compact(reason)              # 无条件执行一次 compact（§3.6 超窗兜底），并发 session_compacted{reason}
 ```
 
 `run_agent(initial_messages, initial_state, runner)` 只调 `runner.*`，不直接碰文件/锁。
 到 `max_steps` 发 `agent_paused{summary, can_continue:true}`，不清空。
-SSE 事件加：`agent_paused`、`session_compacted{tokens_before, tokens_after}`、`spot_updated`、`spot_deleted`、`event_reset`。
+SSE 事件加：`agent_paused`、`session_compacted{tokens_before, tokens_after, reason?}`、`spot_updated`、`spot_deleted`、`event_reset`。
+模型调用报**上下文超窗**（HTTP 400 `context_length_exceeded` 等措辞，§3.6）：先 `force_compact` 再重新物化并重试该次调用一次；重试仍失败才 `agent_error` 终止。
 
 ### 5.2 `fresh` 语义【v3 修正】
 `fresh=1` **归档旧 main（`archived=true`）、新建一个新 `session_id` 的 main**。不让旧 AI 标注的 `created_by_session_id` 指向一个内容已被清空重用的 session。**不动 forks，也不动已落的 AI 标注**。
@@ -351,7 +353,7 @@ pending_snapshot_review: {snapshot_id, bbox, image_ref}
 ### 8.1 默认参数
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `max_steps` | 12 | 单轮步数上限（暂停可继续） |
+| `max_steps` | 50 | 单轮步数上限（暂停可继续；ai_config.json 可覆盖） |
 | `context_window_tokens` | 272000 | compact 触发窗口（保守，§3.6） |
 | `reserve_tokens` | 16000 | 摘要 prompt+输出预留（只减一次） |
 | `safety_margin` | 8192 | 防估算误差顶爆 |
