@@ -106,6 +106,10 @@
     mppInput: $("mpp-input"),
     mppSetBtn: $("mpp-set-btn"),
     zoomBadge: $("zoom-badge"),
+    tbbMoreBtn: $("tbb-more-btn"),
+    tbbMore: $("tbb-more"),
+    tbbMoreAi: $("tbb-more-ai"),
+    tbbMoreZoom: $("tbb-more-zoom"),
     uploadBtn: $("upload-btn"),
     fileInput: $("file-input"),
     progressWrap: $("progress-wrap"),
@@ -341,6 +345,7 @@
     annoPanelOpen = false;
     // AI 助手：打开新切片时 enable 按钮、清空 overlay、关面板（保留配置）
     els.aiBtn.disabled = false;
+    if (els.tbbMoreAi) els.tbbMoreAi.disabled = false;  // ⋯ 面板里的 AI 钮同步
     aiOverlay = [];
     redrawAnnoCanvas();
     syncAnnoAllBtns();
@@ -377,7 +382,9 @@
   // 把"图像缩放比"换算成读片软件常用的物镜等效倍率（如 20× / 40×）。
   // 约定屏幕 96 DPI（1 屏像素 ≈ 25400/96 µm）；缺 mpp 时无法换算，回退百分比。
   function formatMag(mag) {
-    if (mag >= 10000) return (Math.round(mag / 100) * 100) + "×";
+    // 全片概览时屏显等效倍率会到天文数字（无物理意义），缩写为 k 避免撑爆徽章
+    if (mag >= 1000000) return (mag / 1000000).toFixed(1).replace(/\.0$/, "") + "M×";
+    if (mag >= 10000) return Math.round(mag / 1000) + "k×";
     if (mag >= 10) return Math.round(mag) + "×";
     if (mag >= 1) return mag.toFixed(1) + "×";
     return mag.toFixed(2) + "×";
@@ -391,27 +398,26 @@
     return (m >= 10 ? Math.round(m) : m.toFixed(1)) + "x";
   }
   function updateZoomBadge() {
+    var text = "—";
     try {
-      if (!viewer || !viewer.viewport || !viewer.source) {
-        els.zoomBadge.textContent = "—";
-        return;
+      if (viewer && viewer.viewport && viewer.source) {
+        var zoom = viewer.viewport.getZoom(true);
+        var containerW = viewer.viewport.getContainerSize().x;
+        var imgW = viewer.source.dimensions.x;
+        // 真实图像缩放 = 视口缩放 × 容器宽 / 图像宽（1 = 1 图像像素对应 1 屏幕像素）
+        var imageZoom = (zoom * containerW) / imgW;
+        var mpp = state.mppX;
+        if (mpp && mpp > 0 && imageZoom > 0) {
+          // 物镜等效倍率 = 屏幕像素物理尺寸(µm) / 当前每屏像素对应的标本 µm
+          var mag = (25400 / 96) / (mpp * imageZoom);
+          text = formatMag(mag);
+        } else {
+          text = Math.round(imageZoom * 100) + "%";
+        }
       }
-      var zoom = viewer.viewport.getZoom(true);
-      var containerW = viewer.viewport.getContainerSize().x;
-      var imgW = viewer.source.dimensions.x;
-      // 真实图像缩放 = 视口缩放 × 容器宽 / 图像宽（1 = 1 图像像素对应 1 屏幕像素）
-      var imageZoom = (zoom * containerW) / imgW;
-      var mpp = state.mppX;
-      if (mpp && mpp > 0 && imageZoom > 0) {
-        // 物镜等效倍率 = 屏幕像素物理尺寸(µm) / 当前每屏像素对应的标本 µm
-        var mag = (25400 / 96) / (mpp * imageZoom);
-        els.zoomBadge.textContent = formatMag(mag);
-      } else {
-        els.zoomBadge.textContent = Math.round(imageZoom * 100) + "%";
-      }
-    } catch (e) {
-      els.zoomBadge.textContent = "—";
-    }
+    } catch (e) { /* 保持 — */ }
+    els.zoomBadge.textContent = text;
+    if (els.tbbMoreZoom) els.tbbMoreZoom.textContent = text;  // 同步 ⋯ 面板里的徽章
   }
 
   // ---------- 底图缩略图层（慢网下瓦片未到区域的模糊预览） ----------
@@ -1544,6 +1550,32 @@
   function updateCtxBar() {
     var on = state.roiMode != null || state.drawMode != null;
     document.body.classList.toggle("ctx-on", on);
+  }
+
+  // ---------- 移动端 ⋯ 溢出面板（装 AI 读片 + 缩放徽章，避免挤爆底栏） ----------
+  function bindTbbMore() {
+    if (!els.tbbMoreBtn || !els.tbbMore) return;
+    var mask = $("tbb-more-mask");
+    function closeMore() {
+      els.tbbMore.classList.remove("open");
+      if (mask) mask.classList.remove("open");
+    }
+    function openMore() {
+      els.tbbMore.classList.add("open");
+      if (mask) mask.classList.add("open");
+    }
+    els.tbbMoreBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (els.tbbMore.classList.contains("open")) { closeMore(); } else { openMore(); }
+    });
+    if (mask) mask.addEventListener("click", closeMore);
+    // ⋯ 面板里的 AI 钮：转发给主 AI 钮（打开/关闭 AI 面板），并关闭 ⋯
+    if (els.tbbMoreAi) {
+      els.tbbMoreAi.addEventListener("click", function () {
+        closeMore();
+        if (els.aiBtn && !els.aiBtn.disabled) els.aiBtn.click();
+      });
+    }
   }
 
   // =========================================================================
@@ -2979,6 +3011,9 @@
     if (els.sidebarMask) {
       els.sidebarMask.addEventListener("click", closeSidebarDrawer);
     }
+
+    // 移动端 ⋯ 溢出面板（AI 读片 + 缩放徽章）
+    bindTbbMore();
 
     // 新建项目
     els.newProjectBtn.addEventListener("click", function () {

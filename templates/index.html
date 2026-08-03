@@ -80,6 +80,13 @@
       <div class="spacer"></div>
 
       <span id="zoom-badge" class="zoom-badge">—</span>
+
+      <!-- ⋯ 溢出（仅移动端显示）：装 AI 读片助手 + 缩放徽章，避免挤爆底栏 -->
+      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多">⋯</button>
+      <div id="tbb-more" class="tbb-more" role="menu">
+        <button id="tbb-more-ai" class="tool-btn" title="AI 读片助手（管理员）">✨ AI 读片</button>
+        <span id="tbb-more-zoom" class="tbb-more-zoom" title="物镜等效倍率">—</span>
+      </div>
     </div>
   </header>
 
@@ -275,6 +282,9 @@
       </div>
     </main>
   </div>
+
+  <!-- ⋯ 面板遮罩（移动端，点外关闭） -->
+  <div id="tbb-more-mask" class="tbb-more-mask"></div>
 
   <!-- toast 容器 -->
   <div id="toast-container"></div>
