@@ -1959,3 +1959,70 @@ button {
   }
 }
 
+
+/* =========================================================================
+   AI 批注式对话（fork）
+   ========================================================================= */
+/* 标注面板行的 💬 按钮（与 ai-op 同尺寸，hover 高亮） */
+.anno-item .ai-op.ai-fork:hover { color: #7b5cff; background: rgba(123, 92, 255, 0.12); }
+/* AI 轨迹流里的 📌 行 💬 按钮 */
+.ai-trace-row.annotation { display: flex; align-items: center; gap: 6px; }
+.ai-fork-btn {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.75;
+  padding: 0 2px;
+  line-height: 1;
+}
+.ai-fork-btn:hover { opacity: 1; transform: scale(1.15); }
+
+/* 就地展开的 fork 对话块（标注面板内） */
+.fork-chat {
+  margin: 6px 6px 8px 6px;
+  background: #fff;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+.fork-chat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  padding: 6px 8px;
+  border-bottom: 0.5px solid var(--separator-weak);
+}
+.fork-chat-head .icon-btn { width: 20px; height: 20px; font-size: 12px; }
+.fork-chat-stream {
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.fork-chat-stream .ai-trace-row { padding: 3px 2px; }
+.fork-chat-stream .fork-q { color: var(--text); font-weight: 500; }
+.fork-chat-stream .fork-ai { color: var(--text-2); }
+.fork-chat-stream .fork-err { color: var(--danger); }
+.fork-chat-stream .fork-wait { color: var(--text-3); font-style: italic; }
+.fork-chat-input {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 0.5px solid var(--separator-weak);
+}
+.fork-chat-input input {
+  flex: 1;
+  min-width: 0;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--r-input);
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.fork-chat.readonly .fork-chat-input { display: none; }
+.fork-chat.readonly { opacity: 0.6; }

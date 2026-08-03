@@ -40,6 +40,7 @@ import share_store
 import slide_cache
 import slide_io
 import ai_agent
+import ai_session
 
 app = Flask(__name__)
 
@@ -1018,11 +1019,11 @@ def api_slide_region(name):
 
 @app.route("/api/ai/config", methods=["GET", "PUT"])
 def api_ai_config():
-    """读写 AI 配置（base_url/api_key/model/max_tokens）。
+    """读写 AI 配置（base_url/api_key/model/max_tokens + 会话调优参数）。
 
     GET：api_key 脱敏为 api_key_set:bool + 掩码（前4后4），不回显明文。
     PUT：空串=清除 api_key；与掩码同值=不变；其他=覆盖。
-    api_key 不入日志。
+    api_key 不入日志。会话调优参数（§8.1）进 ai_config.json，缺省用文档默认。
     """
     if request.method == "GET":
         cfg = _load_ai_config()
@@ -1034,6 +1035,8 @@ def api_ai_config():
             "model": cfg.get("model") or "",
             "max_tokens": cfg.get("max_tokens") or 2048,
         }
+        for k, v in ai_session.DEFAULT_CONFIG.items():
+            out[k] = cfg.get(k, v)
         return jsonify(out)
 
     body = request.get_json(silent=True) or {}
@@ -1048,6 +1051,13 @@ def api_ai_config():
             cfg["max_tokens"] = int(body.get("max_tokens"))
         except (TypeError, ValueError):
             return jsonify(error="max_tokens 需为整数"), 400
+    # 会话调优参数（数字类型，§8.1）
+    for k in ai_session.DEFAULT_CONFIG:
+        if k in body:
+            try:
+                cfg[k] = float(body[k]) if isinstance(body[k], float) else int(body[k])
+            except (TypeError, ValueError):
+                return jsonify(error="{} 需为数值".format(k)), 400
     # api_key：空串=清除；与掩码同值=不变；其他=覆盖
     if "api_key" in body:
         new_key = body.get("api_key")
@@ -1064,58 +1074,83 @@ def api_ai_config():
     _save_ai_config(cfg)
     # 回显脱敏
     key = cfg.get("api_key") or ""
-    return jsonify({
+    out = {
         "base_url": cfg.get("base_url") or "",
         "api_key_set": bool(key),
         "api_key_mask": _mask_api_key(key),
         "model": cfg.get("model") or "",
         "max_tokens": cfg.get("max_tokens") or 2048,
-    })
+    }
+    for k, v in ai_session.DEFAULT_CONFIG.items():
+        out[k] = cfg.get(k, v)
+    return jsonify(out)
 
 
 def _ai_slide_ctx(slide_name: str):
-    """构造 ai_agent.run_agent 需要的 get_slide_ctx 闭包。
+    """构造 AI 读片所需的 slide 上下文 dict + 物化回调（materializer）。
 
-    封装 region 裁剪 + add_roi + slide info + config，让 ai_agent 不直接
-    import Flask 全局。region 调本进程内的 slide_cache 读图（不走 HTTP）。
+    上下文含 config/info/region/fingerprint：region 调本进程内的 slide_cache
+    读图（不走 HTTP）；materializer 把 canonical 的 image_ref 物化为 base64
+    image_url（§3.3），带 slide_fingerprint 防伪（§3.3 image_ref 防伪）。
     """
     safe = _safe_name(slide_name)
     entry = _get_slide(safe)
     cfg = _load_ai_config()
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        width, height = osr.dimensions
+        try:
+            level_downsamples = tuple(osr.level_downsamples)
+        except Exception:
+            level_downsamples = (1.0,)
+        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        mpp = meta.get("mpp_x")
+    fingerprint = _slide_fingerprint(safe)
 
-    def get_ctx():
-        with slide_cache.borrow_pair(entry) as pair:
-            osr = pair["osr"]
-            width, height = osr.dimensions
-            try:
-                level_downsamples = tuple(osr.level_downsamples)
-            except Exception:
-                level_downsamples = (1.0,)
-            meta = _read_metadata(osr, UPLOAD_DIR / safe)
-            mpp = meta.get("mpp_x")
-        # 把读图与落标注的闭包也带上（run_agent 内部按需调用）
-        def region_fn(x, y, w, h, out_w, out_h):
-            return _read_region_b64(entry, int(x), int(y), int(w), int(h),
-                                    int(out_w), int(out_h), safe, mpp)
+    def region_fn(x, y, w, h, out_w, out_h):
+        return _read_region_b64(entry, int(x), int(y), int(w), int(h),
+                                int(out_w), int(out_h), safe, mpp)
 
-        def add_annotation_fn(label, x, y, side_px, note):
-            roi = share_store.add_roi(
-                share_store.ADMIN_TOKEN, safe, label, type="rect",
-                note=note, x=float(x), y=float(y), side_px=int(side_px),
-            )
-            return {"index": roi.get("index", -1)}
+    ctx = {
+        "config": cfg,
+        "info": {
+            "width": width, "height": height,
+            "level_downsamples": level_downsamples, "mpp": mpp,
+        },
+        "region": region_fn,
+        "fingerprint": fingerprint,
+    }
 
+    def materializer(ref):
+        """image_ref → image_url（物化，§3.3）。"""
+        fp = ref.get("slide_fingerprint") or ""
+        if fp and fp != fingerprint:
+            return {"type": "text", "text": "该图因切片变更不可用。"}
+        src = ref.get("src") or {}
+        x = int(src.get("x") or 0)
+        y = int(src.get("y") or 0)
+        w = int(src.get("w") or 1)
+        h = int(src.get("h") or 1)
+        try:
+            r = _read_region_b64(entry, x, y, w, h, 1568, 1568, safe, mpp)
+        except Exception:
+            return {"type": "text", "text": "该图因切片变更不可用。"}
         return {
-            "config": cfg,
-            "info": {
-                "width": width, "height": height,
-                "level_downsamples": level_downsamples, "mpp": mpp,
-            },
-            "region": region_fn,
-            "add_annotation": add_annotation_fn,
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64," + r["image_base64"]},
         }
 
-    return get_ctx
+    return ctx, materializer
+
+
+def _slide_fingerprint(safe: str) -> str:
+    """切片内容指纹（mtime+size），image_ref 防伪用（§3.3）。"""
+    p = UPLOAD_DIR / safe
+    try:
+        st = p.stat()
+        return "{}:{}".format(st.st_mtime_ns, st.st_size)
+    except Exception:
+        return ""
 
 
 def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
@@ -1170,76 +1205,473 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
 
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
-    """AI 读片助手 SSE 流。body: {slide, task}。
+    """主 session 起跑（SSE）。body: {slide, task, fresh?}。
 
-    校验 slide 存在、AI 已配置；以 text/event-stream 逐事件推送：
-    slide_opened / agent_thinking / text_delta / tool_started /
-    snapshot_captured / observation / annotation_created /
-    agent_finished / agent_error。客户端断开时 break loop。
+    fresh=1（前端"开始"）：归档旧 main、新建 session 跑全片（§5.2），
+    等价于过去的单轮 AI 读片体验。fresh 缺省时复用已有 main（有则续跑）。
+    会话已 running（租约未过期）→ 409。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     task = body.get("task") or ""
-    if not isinstance(slide, str) or not slide:
+    fresh = bool(body.get("fresh"))
+    safe = _validate_ai_slide(slide)
+    _require_ai_configured()
+
+    ctx, materializer = _ai_slide_ctx(safe)
+    cfg = ai_session._merge_config(_load_ai_config())
+
+    if fresh:
+        runner = ai_session.SessionRunner.acquire(safe, "main", cfg=cfg, fresh=True)
+    else:
+        idx = ai_session.list_session_ids_by_slide(safe)
+        sid = idx.get("main")
+        if sid:
+            runner = ai_session.SessionRunner.acquire(safe, "main", session_id=sid, cfg=cfg)
+        else:
+            runner = ai_session.SessionRunner.acquire(safe, "main", cfg=cfg, fresh=True)
+
+    return _start_main_worker(runner, ctx, materializer, task, fresh)
+
+
+@app.route("/api/ai/continue", methods=["POST"])
+def api_ai_continue():
+    """主 session 从落库 state+messages 续跑（SSE）。body: {slide}。"""
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    safe = _validate_ai_slide(slide)
+    _require_ai_configured()
+
+    idx = ai_session.list_session_ids_by_slide(safe)
+    sid = idx.get("main")
+    if not sid:
+        return jsonify(error="没有可继续的主会话"), 404
+
+    ctx, materializer = _ai_slide_ctx(safe)
+    cfg = ai_session._merge_config(_load_ai_config())
+    runner = ai_session.SessionRunner.acquire(safe, "main", session_id=sid, cfg=cfg)
+    return _start_main_worker(runner, ctx, materializer, None, fresh=False, resumed=True)
+
+
+@app.route("/api/ai/ask", methods=["POST"])
+def api_ai_ask():
+    """fork 起跑/续聊（批注式对话，SSE）。body: {slide, annotation_id, question}。
+
+    根标注已删除 → 410 Gone（§2.2）。fork 默认无 create_annotation（纯问答+看图）。
+    活跃 fork 超上限自动归档最旧 idle 的（running 不归档，§2.3）。
+    """
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    annotation_id = body.get("annotation_id")
+    question = body.get("question") or ""
+    safe = _validate_ai_slide(slide)
+    _require_ai_configured()
+    if not isinstance(annotation_id, str) or not annotation_id:
+        return jsonify(error="缺少 annotation_id"), 400
+
+    # 根标注定位（含 tombstone 判断）
+    roi = share_store.get_roi_by_annotation_id(annotation_id)
+    if roi is None or roi.get("deleted"):
+        return jsonify(error="该标注已删除"), 410
+
+    ctx, materializer = _ai_slide_ctx(safe)
+    cfg = ai_session._merge_config(_load_ai_config())
+
+    # 已有 fork 则续聊，否则新建
+    idx = ai_session.list_session_ids_by_slide(safe)
+    existing = idx.get("forks", {}).get(annotation_id)
+    if existing:
+        runner = ai_session.SessionRunner.acquire(safe, "fork", session_id=existing, cfg=cfg)
+        # 追加用户问题
+        with ai_session._SessionLock(runner.session_id):
+            data = runner.get_data()
+            data.setdefault("canonical_messages", []).append(
+                {"role": "user", "content": question or "请谈谈这个区域"})
+            ai_session.write_session(runner.session_id, data)
+        initial_messages = None  # 用 canonical 续跑
+    else:
+        # 新 fork：按 §2.2 构建自包含初始上下文
+        _enforce_fork_limit(safe, int(cfg.get("fork_active_limit") or 20))
+        runner = ai_session.SessionRunner.acquire(
+            safe, "fork", annotation_id=annotation_id,
+            title="批注@" + roi.get("label", ""), cfg=cfg)
+        info = ctx["info"]
+        # 附图：bbox 外扩 10-20%，输出 1024-1568px（§8.3），存 image_ref
+        img_ref, img_b64 = _fork_spot_image_ref(ctx, roi)
+        spot_msgs = ai_agent.make_fork_messages(
+            safe, info, roi, question,
+            image_ref=img_ref, image_b64=img_b64)
+        with ai_session._SessionLock(runner.session_id):
+            data = runner.get_data()
+            data["canonical_messages"] = list(spot_msgs)
+            data["spot_cursor"] = share_store.current_change_seq(safe)
+            ai_session.write_session(runner.session_id, data)
+        initial_messages = None
+        runner.emit_event("fork_created", {
+            "annotation_id": annotation_id,
+            "title": data["title"],
+        })
+
+    return _start_fork_worker(runner, ctx, materializer, annotation_id, question)
+
+
+@app.route("/api/ai/cancel", methods=["POST"])
+def api_ai_cancel():
+    """显式取消（写 cancel_requested，§5.4）。body: {session_id}。"""
+    body = request.get_json(silent=True) or {}
+    session_id = body.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return jsonify(error="缺少 session_id"), 400
+    data = ai_session.read_session(session_id)
+    if data is None:
+        return jsonify(error="会话不存在"), 404
+    runner = ai_session.SessionRunner(session_id)
+    runner.cfg = ai_session._merge_config(_load_ai_config())
+    runner.mark_cancelled()
+    return jsonify(ok=True)
+
+
+@app.route("/api/ai/sessions")
+def api_ai_sessions():
+    """列出某切片的 main + 活跃 forks（§2.1/§2.3）。?slide= 必填。"""
+    slide = request.args.get("slide")
+    if not slide:
         return jsonify(error="缺少 slide"), 400
     safe = _sanitize_name(slide)
     if not safe or safe != slide:
         return jsonify(error="非法文件名"), 400
-    if not (UPLOAD_DIR / safe).is_file():
-        return jsonify(error="切片不存在"), 404
+    idx = ai_session.list_session_ids_by_slide(safe)
+    out = []
+    main_sid = idx.get("main")
+    if main_sid:
+        d = ai_session.read_session(main_sid)
+        if d:
+            out.append(_session_list_item(d))
+    for aid, sid in (idx.get("forks") or {}).items():
+        d = ai_session.read_session(sid)
+        if d and not d.get("archived"):
+            out.append(_session_list_item(d))
+    out.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    return jsonify({"sessions": out})
 
+
+@app.route("/api/ai/session/<session_id>")
+def api_ai_session_detail(session_id):
+    """session detail + 脱敏 transcript（§5：图以 image_ref，不含 base64）。"""
+    data = ai_session.read_session(session_id)
+    if data is None:
+        return jsonify(error="会话不存在"), 404
+    msgs = data.get("canonical_messages") or []
+    return jsonify({
+        "session": {
+            "id": data.get("id"),
+            "slide": data.get("slide"),
+            "kind": data.get("kind"),
+            "title": data.get("title"),
+            "status": data.get("status"),
+            "archived": data.get("archived"),
+            "annotation_id": data.get("annotation_id") or "",
+            "created_at": data.get("created_at"),
+            "updated_at": data.get("updated_at"),
+            "last_accessed_at": data.get("last_accessed_at"),
+            "spot_cursor": data.get("spot_cursor"),
+            "last_event_seq": data.get("last_event_seq"),
+            "event_min_seq": data.get("event_min_seq"),
+            "agent_state": data.get("agent_state"),
+            "summary": data.get("summary"),
+        },
+        "transcript": msgs,
+    })
+
+
+@app.route("/api/ai/session/<session_id>/archive", methods=["POST"])
+@app.route("/api/ai/session/<session_id>/unarchive", methods=["POST"])
+def api_ai_session_archive(session_id):
+    """fork 归档/恢复（§2.3）。running 的 fork 不可归档。"""
+    data = ai_session.read_session(session_id)
+    if data is None:
+        return jsonify(error="会话不存在"), 404
+    archived = request.path.endswith("/archive")
+    if archived and data.get("status") == "running":
+        return jsonify(error="运行中的会话不可归档"), 409
+    with ai_session._SessionLock(session_id):
+        data = ai_session.read_session(session_id)
+        if data is None:
+            return jsonify(error="会话不存在"), 404
+        data["archived"] = bool(archived)
+        data["updated_at"] = time.time()
+        ai_session.write_session(session_id, data)
+    return jsonify(ok=True, archived=bool(archived))
+
+
+# --------------------------------------------------------------------------- #
+# AI 会话辅助（app 内部）
+# --------------------------------------------------------------------------- #
+def _validate_ai_slide(slide):
+    """校验 slide 参数合法且存在，返回净化名。"""
+    if not isinstance(slide, str) or not slide:
+        abort(400, jsonify(error="缺少 slide"))
+    safe = _sanitize_name(slide)
+    if not safe or safe != slide:
+        abort(400, jsonify(error="非法文件名"))
+    if not (UPLOAD_DIR / safe).is_file():
+        abort(404, jsonify(error="切片不存在"))
+    return safe
+
+
+def _require_ai_configured():
     cfg = _load_ai_config()
     if not cfg.get("base_url") or not cfg.get("api_key"):
-        return jsonify(error="AI 未配置：请先在面板里填写 base_url 与 api_key"), 400
+        abort(400, jsonify(error="AI 未配置：请先在面板里填写 base_url 与 api_key"))
 
-    get_ctx = _ai_slide_ctx(safe)
+
+def _session_list_item(d: dict) -> dict:
+    return {
+        "id": d.get("id"),
+        "title": d.get("title"),
+        "kind": d.get("kind"),
+        "status": d.get("status"),
+        "archived": d.get("archived"),
+        "annotation_id": d.get("annotation_id") or "",
+        "updated_at": d.get("updated_at"),
+        "created_at": d.get("created_at"),
+    }
+
+
+def _fork_spot_image_ref(ctx: dict, roi: dict):
+    """fork 附图：bbox 外扩 10-20%，输出 1024-1568px（§8.3），返回 (image_ref, b64|None)。"""
+    x = int(roi.get("x") or 0)
+    y = int(roi.get("y") or 0)
+    side = int(roi.get("side_px") or 0)
+    if side <= 0:
+        return None, None
+    pad = int(round(side * 0.15))  # 外扩 15%
+    info = ctx.get("info") or {}
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    ex = max(0, x - pad)
+    ey = max(0, y - pad)
+    ew = min(side + pad * 2, max(1, width - ex))
+    eh = min(side + pad * 2, max(1, height - ey))
+    src = {"x": ex, "y": ey, "w": ew, "h": eh}
+    mag = None
+    try:
+        r = ctx["region"](ex, ey, ew, eh, 1568, 1568)
+        b64 = r.get("image_base64") or ""
+        mag = r.get("magnification")
+    except Exception:
+        b64 = ""
+    image_ref = {
+        "type": "image_ref",
+        "ref_id": "ref_fork_" + (roi.get("annotation_id") or "")[:12],
+        "slide_fingerprint": ctx.get("fingerprint") or "",
+        "src": src,
+        "magnification": mag,
+        "summary": "该 spot 当前快照（bbox 外扩 15%）",
+    }
+    return image_ref, (b64 or None)
+
+
+def _enforce_fork_limit(slide: str, limit: int) -> None:
+    """活跃 fork 超上限时归档最旧的 idle/paused/finished/error（running 不归档）。"""
+    if limit <= 0:
+        return
+    idx = ai_session.list_session_ids_by_slide(slide)
+    forks = []
+    for sid in (idx.get("forks") or {}).values():
+        d = ai_session.read_session(sid)
+        if d:
+            forks.append(d)
+    running = [d for d in forks if d.get("status") == "running"]
+    idle = [d for d in forks if d.get("status") != "running" and not d.get("archived")]
+    allowed = max(0, limit - len(running))
+    if len(idle) <= allowed:
+        return
+    idle.sort(key=lambda d: d.get("last_accessed_at") or d.get("updated_at") or 0)
+    for d in idle[: len(idle) - allowed]:
+        with ai_session._SessionLock(d.get("id")):
+            cur = ai_session.read_session(d.get("id"))
+            if cur:
+                cur["archived"] = True
+                ai_session.write_session(d.get("id"), cur)
+
+
+def _start_main_worker(runner, ctx, materializer, task, fresh, resumed=False):
+    """启动 main session 的 worker 线程并返回 SSE Response。
+
+    fresh：初始消息 = system + 用户任务 + spot 变更；初始视口 = 概览。
+    resumed：从落库 canonical（materialize 物化）+ agent_state 续跑。
+    """
+    runner.set_slide_ctx(ctx)
+    runner.set_materializer(materializer)
+
+    # 预取 slide 信息与初始视口
+    info = ctx.get("info") or {}
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    downsamples = tuple(info.get("level_downsamples") or (1.0,))
+    mpp = info.get("mpp")
+
+    def worker():
+        try:
+            runner.start_heartbeat_thread()
+            if fresh:
+                vp = 1024
+                lvl = ai_agent.AgentState.pick_overview_level(width, height, downsamples, vp)
+                st = ai_agent.AgentState(width / 2.0, height / 2.0, vp, lvl, mpp)
+                # 先把 system + 用户任务落库 canonical（否则 continue 丢 system 前缀）
+                main_msgs = ai_agent.make_main_messages(
+                    runner.get_data().get("slide"), task, info)
+                for m in main_msgs:
+                    runner.append_message(m)
+                spot_msgs = runner.inject_spot_changes() or []
+                initial = main_msgs + spot_msgs
+                bbox = st.viewport_bbox(downsamples)
+                runner.emit_event("slide_opened", {
+                    "slide": runner.get_data().get("slide"),
+                    "width": width, "height": height,
+                    "overview_level": lvl,
+                    "level_count": len(downsamples),
+                    "mpp": mpp,
+                    "viewport": bbox,
+                    "session_id": runner.session_id,
+                })
+            else:
+                # continue：从落库 state + messages 续跑（§4.1/§3.3）
+                runner.inject_spot_changes()
+                data = runner.get_data()
+                initial = runner.materialize_request_messages()
+                st = ai_agent.AgentState.from_dict(data.get("agent_state"), mpp)
+                runner.emit_event("session_resumed", {
+                    "session_id": runner.session_id,
+                    "status": data.get("status"),
+                })
+            ai_agent.run_agent(initial, st, runner)
+        except Exception as e:  # noqa: BLE001
+            try:
+                runner.emit_event("agent_error", {"error": "读片助手异常：{}".format(e)})
+            except Exception:
+                pass
+        finally:
+            try:
+                runner.finalize()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return _sse_response(runner.session_id)
+
+
+def _start_fork_worker(runner, ctx, materializer, annotation_id, question):
+    """启动 fork session 的 worker 线程并返回 SSE Response（§2.2）。"""
+    runner.set_slide_ctx(ctx)
+    runner.set_materializer(materializer)
+
+    def worker():
+        try:
+            runner.start_heartbeat_thread()
+            runner.inject_spot_changes()
+            data = runner.get_data()
+            initial = runner.materialize_request_messages()
+            info = ctx.get("info") or {}
+            mpp = info.get("mpp")
+            # fork 初始视口：定位到根标注中心
+            st = ai_agent.AgentState.from_dict(data.get("agent_state"), mpp)
+            runner.emit_event("fork_resumed", {
+                "session_id": runner.session_id,
+                "annotation_id": annotation_id,
+            })
+            ai_agent.run_agent(initial, st, runner)
+        except Exception as e:  # noqa: BLE001
+            try:
+                runner.emit_event("agent_error", {"error": "读片助手异常：{}".format(e)})
+            except Exception:
+                pass
+        finally:
+            try:
+                runner.finalize()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return _sse_response(runner.session_id)
+
+
+@app.route("/api/ai/session/<session_id>/stream")
+def api_ai_session_stream(session_id):
+    """SSE 重挂/断线重连：流式重放某 session 的 event log（§5.6）。
+
+    不重新 acquire（CAS 在 /run /continue /ask 里做）；只轮询读持久化
+    .events.jsonl，`?after_seq=N` 或 Last-Event-ID 从断点重放后接续 live。
+    session 离开 running 且无新事件时发 session_ended 结束。
+    """
+    data = ai_session.read_session(session_id)
+    if data is None:
+        return jsonify(error="会话不存在"), 404
+    return _sse_response(session_id)
+
+
+def _sse_response(session_id: str):
+    """SSE 生成器：轮询 .events.jsonl，带 Last-Event-ID 断线重挂（§5.6）。
+
+    after_seq 来自 query 参数或 Last-Event-ID header；断线重挂时重放缺失
+    事件后接续 live 流（轮询读持久化日志，不依赖原请求的内存 queue）。
+    会话离开 running 且无新事件 → 终态后 session_ended 结束。
+    """
+    after_seq = request.args.get("after_seq")
+    try:
+        after_seq = int(after_seq) if after_seq else 0
+    except (TypeError, ValueError):
+        after_seq = 0
+    if after_seq <= 0 and request.headers.get("Last-Event-ID"):
+        try:
+            after_seq = int(request.headers.get("Last-Event-ID"))
+        except (TypeError, ValueError):
+            after_seq = 0
 
     def gen():
-        """SSE 生成器：把 ai_agent.emit 的事件 yield 为 SSE 帧。
+        last_seq = after_seq
 
-        通过 queue 把 emit 回调（在 run_agent 同步循环里调用）与生成器
-        解耦：emit 把事件入队，生成器逐个 yield；客户端断开（生成器被
-        关闭/GC）时把 client_alive=False，让 run_agent 的 emit 返回 False
-        从而 break 其 tool-call 循环。
-        """
-        import queue
-
-        q: "queue.Queue" = queue.Queue()
-        state = {"alive": True}
-
-        def emit(event_type, payload):
-            # 客户端已断开：返回 False 让 ai_agent 中断循环
-            if not state["alive"]:
-                return False
-            q.put((event_type, payload))
-            return None
-
-        def worker():
-            try:
-                ai_agent.run_agent(safe, task, emit, get_ctx)
-            except Exception as e:  # noqa: BLE001
-                q.put(("agent_error", {"error": "读片助手异常：{}".format(e)}))
-            finally:
-                q.put((None, None))  # 结束 sentinel
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        def _drain():
+            nonlocal last_seq
+            data = ai_session.read_session(session_id) or {}
+            cur = int(data.get("last_event_seq") or 0)
+            yielded = []
+            if cur > last_seq:
+                for ev in ai_session.replay_events(session_id, last_seq, data):
+                    s = int(ev.get("seq") or 0)
+                    if s <= last_seq:
+                        continue
+                    last_seq = s
+                    yielded.append("id: {}\nevent: {}\ndata: {}\n\n".format(
+                        s, ev.get("type", "message"),
+                        json.dumps(ev.get("payload") or {}, ensure_ascii=False)))
+            return yielded
 
         try:
             while True:
-                try:
-                    event_type, payload = q.get(timeout=600)
-                except Exception:
-                    # 超时无事件，发心跳保活
-                    yield ": ping\n\n"
+                frames = _drain()
+                if frames:
+                    for f in frames:
+                        yield f
                     continue
-                if event_type is None:
-                    break
-                data = json.dumps(payload, ensure_ascii=False)
-                yield "event: {}\ndata: {}\n\n".format(event_type, data)
-        finally:
-            # 生成器被关闭（客户端断开）：标记断开，run_agent 下次 emit 会感知
-            state["alive"] = False
+                data = ai_session.read_session(session_id) or {}
+                status = data.get("status")
+                # 会话结束（含租约过期视为崩溃残留）→ 终态收尾
+                if status not in ("running",):
+                    frames = _drain()
+                    for f in frames:
+                        yield f
+                    yield ("event: session_ended\ndata: {}\n\n".format(
+                        json.dumps({"status": status or "idle"}, ensure_ascii=False)))
+                    return
+                yield ": ping\n\n"
+                time.sleep(0.5)
+        except GeneratorExit:
+            # 客户端断开：不停止后台 run（§5.6），worker 自行收尾
+            pass
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",

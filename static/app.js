@@ -65,6 +65,11 @@
   var aiRunning = false;     // 是否有进行中的 run（同时只允一个）
   var aiAbortCtrl = null;    // AbortController，停止用
   var aiTextBubbleEl = null; // 当前 text_delta 增量气泡（append 用）
+  var aiSessionId = null;    // 当前 main session id（events 里带）
+  var aiLastSeq = 0;         // 已消费的最大事件 seq（断线重挂用）
+  var aiStreamCtrl = null;   // 断线重挂 SSE 流的 AbortController
+  var aiPaused = false;      // 主 run 是否处于"已暂停，可继续"
+  var aiTraceTarget = null;  // fork 批注对话的 DOM 容器（非空时轨迹渲染到此）
 
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
@@ -178,6 +183,8 @@
     aiTask: $("ai-task"),
     aiTaskJump: $("ai-task-jump"),
     aiStartBtn: $("ai-start-btn"),
+    aiContinueBtn: $("ai-continue-btn"),
+    aiFreshBtn: $("ai-fresh-btn"),
     aiStopBtn: $("ai-stop-btn"),
     aiTrace: $("ai-trace"),
   };
@@ -351,6 +358,10 @@
     syncAnnoAllBtns();
     state.showAnno = false;
     state.focusAnno = null;
+    // 恢复该切片的 main 会话状态（有 running 的则重挂 SSE）
+    aiSessionId = null;
+    aiPaused = false;
+    restoreAiSession();
     if (state.slide) {
       // 管理员标注工具在任意打开的切片上可用（箭头/描图不依赖 mpp）
       els.annoArrowBtn.disabled = false;
@@ -2455,6 +2466,19 @@
         });
         row.appendChild(sharedBtn);
 
+        // AI 落标（source=ai）：挂 💬 → 就地展开批注对话（§6 标注面板 fork）
+        if (it.source === "ai" && it.annotation_id) {
+          var forkBtn = document.createElement("button");
+          forkBtn.className = "ai-op ai-fork";
+          forkBtn.textContent = "💬";
+          forkBtn.title = "就此标注提问（批注对话）";
+          forkBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            openForkChat(it.annotation_id, row);
+          });
+          row.appendChild(forkBtn);
+        }
+
         // 编辑钮：跳转到该标注并进入选中编辑态
         var editBtn = document.createElement("button");
         editBtn.className = "ai-op ai-edit";
@@ -3075,6 +3099,8 @@
       }
     });
     els.aiStartBtn.addEventListener("click", startAiRun);
+    els.aiContinueBtn.addEventListener("click", continueAiRun);
+    els.aiFreshBtn.addEventListener("click", freshAiRun);
     els.aiStopBtn.addEventListener("click", stopAiRun);
     els.aiTaskJump.addEventListener("click", function () {
       var bbox = currentSelectionBbox();
@@ -3169,7 +3195,7 @@
     return null;
   }
 
-  // 开始 AI run（POST /api/ai/run，SSE）
+  // 开始 AI run（POST /api/ai/run?fresh=1，SSE）
   function startAiRun() {
     if (!state.slide) { toast("请先打开一个切片", "info"); return; }
     if (aiRunning) { toast("已有任务进行中", "info"); return; }
@@ -3183,20 +3209,17 @@
     if (!task) { toast("请输入任务描述", "info"); els.aiTask.focus(); return; }
 
     // 重置轨迹流
-    els.aiTrace.innerHTML = "";
-    aiOverlay = [];
-    aiTextBubbleEl = null;
-    redrawAnnoCanvas();
+    resetAiTrace();
     aiRunning = true;
-    els.aiStartBtn.style.display = "none";
-    els.aiStopBtn.style.display = "inline-block";
+    aiPaused = false;
+    setAiRunningUi(true);
+    aiSessionId = null;
+    aiLastSeq = 0;
 
-    aiAbortCtrl = new AbortController();
-    fetch("/api/ai/run", {
+    fetch("/api/ai/run?fresh=1", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slide: state.slide.name, task: task }),
-      signal: aiAbortCtrl.signal,
       credentials: "same-origin",
     }).then(function (resp) {
       if (!resp.ok || !resp.body) {
@@ -3204,73 +3227,203 @@
           throw new Error(t || ("HTTP " + resp.status));
         });
       }
-      var reader = resp.body.getReader();
-      var decoder = new TextDecoder("utf-8");
-      var buffer = "";
-      function pump() {
-        return reader.read().then(function (result) {
-          if (result.done) { finishAiRun(); return; }
-          buffer += decoder.decode(result.value, { stream: true });
-          // 按 "\n\n" 切分 SSE 帧
-          var idx;
-          while ((idx = buffer.indexOf("\n\n")) >= 0) {
-            var frame = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 2);
-            handleSseFrame(frame);
-          }
-          return pump();
-        });
-      }
-      return pump();
+      pumpAiSse(resp.body.getReader());
     }).catch(function (e) {
-      if (e && e.name === "AbortError") {
-        toast("已停止", "info");
-      } else {
-        toast("AI 运行失败: " + (e && e.message ? e.message : e), "error");
-        appendTraceRow("error", "AI 运行失败: " + (e && e.message ? e.message : e));
-      }
+      toast("AI 运行失败: " + (e && e.message ? e.message : e), "error");
+      appendTraceRow("error", "AI 运行失败: " + (e && e.message ? e.message : e));
       finishAiRun();
     });
   }
 
+  // 继续 paused 的主 run（POST /api/ai/continue，SSE）
+  function continueAiRun() {
+    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (aiRunning) { toast("已有任务进行中", "info"); return; }
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
+      toast("请先配置 AI 服务", "error");
+      return;
+    }
+    aiRunning = true;
+    aiPaused = false;
+    setAiRunningUi(true);
+    appendTraceRow("info", "继续读片…");
+    fetch("/api/ai/continue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slide: state.slide.name }),
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (!resp.ok || !resp.body) {
+        return resp.text().then(function (t) { throw new Error(t || ("HTTP " + resp.status)); });
+      }
+      pumpAiSse(resp.body.getReader());
+    }).catch(function (e) {
+      toast("继续失败: " + (e && e.message ? e.message : e), "error");
+      appendTraceRow("error", "继续失败: " + (e && e.message ? e.message : e));
+      finishAiRun();
+    });
+  }
+
+  // 新会话（fresh）：归档旧 main 开新，不影响标注与批注
+  function freshAiRun() {
+    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
+      toast("请先配置 AI 服务", "error");
+      return;
+    }
+    if (!confirm("归档旧对话开新会话，不影响已落标注与批注对话，确认？")) return;
+    els.aiTask.value = "";
+    startAiRun();
+  }
+
   function stopAiRun() {
+    // 走 /cancel（不只是断开 SSE，§5.4）
+    if (aiSessionId) {
+      apiFetch("/api/ai/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: aiSessionId }),
+      }).catch(function () {});
+    }
     if (aiAbortCtrl) { try { aiAbortCtrl.abort(); } catch (e) {} }
     finishAiRun();
   }
 
   function finishAiRun() {
     aiRunning = false;
-    els.aiStartBtn.style.display = "inline-block";
-    els.aiStopBtn.style.display = "none";
+    setAiRunningUi(false);
     aiAbortCtrl = null;
+    aiStreamCtrl = null;
   }
 
-  // 解析单条 SSE 帧（event:/data: 行）
+  // 运行中/暂停/空闲的按钮组状态
+  function setAiRunningUi(running) {
+    if (running) {
+      els.aiStartBtn.style.display = "none";
+      els.aiContinueBtn.style.display = "none";
+      els.aiFreshBtn.style.display = "none";
+      els.aiStopBtn.style.display = "inline-block";
+    } else if (aiPaused) {
+      els.aiStartBtn.style.display = "none";
+      els.aiContinueBtn.style.display = "inline-block";
+      els.aiFreshBtn.style.display = "inline-block";
+      els.aiStopBtn.style.display = "none";
+    } else {
+      els.aiStartBtn.style.display = "inline-block";
+      els.aiContinueBtn.style.display = "none";
+      els.aiFreshBtn.style.display = "none";
+      els.aiStopBtn.style.display = "none";
+    }
+  }
+
+  // 通用 SSE 泵：解析帧 → handleAiEvent（同时推进 aiLastSeq）
+  function pumpAiSse(reader) {
+    var decoder = new TextDecoder("utf-8");
+    var buffer = "";
+    function pump() {
+      return reader.read().then(function (result) {
+        if (result.done) {
+          // 正常结束：若 run 是 paused 则保持按钮组
+          finishAiRun();
+          return;
+        }
+        buffer += decoder.decode(result.value, { stream: true });
+        var idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          var frame = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          handleSseFrame(frame);
+        }
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  // 解析单条 SSE 帧（event:/data:/id: 行）
   function handleSseFrame(frame) {
     var eventType = null;
     var dataStr = "";
+    var seq = null;
     var lines = frame.split("\n");
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i];
       if (line.indexOf(":") === 0) continue; // 注释/心跳
-      if (line.indexOf("event:") === 0) {
+      if (line.indexOf("id:") === 0) {
+        seq = parseInt(line.slice(3).trim(), 10);
+        if (!isFinite(seq)) seq = null;
+      } else if (line.indexOf("event:") === 0) {
         eventType = line.slice(6).trim();
       } else if (line.indexOf("data:") === 0) {
         dataStr += line.slice(5).trim();
       }
     }
     if (!eventType) return;
+    if (eventType === "session_ended") {
+      finishAiRun();
+      return;
+    }
     var payload = {};
     if (dataStr) {
       try { payload = JSON.parse(dataStr); } catch (e) { payload = { raw: dataStr }; }
     }
+    if (seq != null) aiLastSeq = Math.max(aiLastSeq, seq);
+    if (payload && payload.session_id) aiSessionId = payload.session_id;
     handleAiEvent(eventType, payload);
+  }
+
+  // 断线重挂：页面刷新/重开切片后，GET session + 带 Last-Event-ID 重放进行中的 run
+  function restoreAiSession() {
+    if (!state.slide) return;
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) return;
+    apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(state.slide.name))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var sessions = (data && data.sessions) || [];
+        var main = null;
+        for (var i = 0; i < sessions.length; i++) {
+          if (sessions[i].kind === "main") { main = sessions[i]; break; }
+        }
+        if (!main) { setAiRunningUi(false); return; }
+        aiSessionId = main.id;
+        if (main.status === "running") {
+          // 有进行中的 run：重挂 SSE（带 last seq）
+          aiRunning = true;
+          aiPaused = false;
+          setAiRunningUi(true);
+          appendTraceRow("info", "检测到进行中的读片，恢复事件流…");
+          attachAiStream(main.id);
+        } else if (main.status === "paused") {
+          aiPaused = true;
+          setAiRunningUi(false);
+          appendTraceRow("info", "上次读片已暂停（(已暂停，可继续)）");
+        }
+      })
+      .catch(function () { /* 静默 */ });
+  }
+
+  function attachAiStream(sessionId) {
+    var url = "/api/ai/session/" + encodeURIComponent(sessionId) + "/stream?after_seq=" + aiLastSeq;
+    if (aiStreamCtrl) { try { aiStreamCtrl.abort(); } catch (e) {} }
+    aiStreamCtrl = new AbortController();
+    fetch(url, {
+      headers: { "Last-Event-ID": String(aiLastSeq || 0) },
+      signal: aiStreamCtrl.signal,
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (!resp.ok || !resp.body) { throw new Error("HTTP " + resp.status); }
+      return pumpAiSse(resp.body.getReader());
+    }).catch(function (e) {
+      if (e && e.name === "AbortError") return;
+      // 重挂失败：后台继续，稍后手动"继续"或刷新
+      toast("事件流重挂失败", "error");
+    });
   }
 
   // 按 SSE 事件类型渲染轨迹流 + canvas overlay
   function handleAiEvent(type, p) {
     if (type === "slide_opened") {
-      // 概览层视口作为初始 overlay
       if (p.viewport) {
         aiOverlay = [{ x: p.viewport.x, y: p.viewport.y, w: p.viewport.w, h: p.viewport.h,
                        magnification: "概览" }];
@@ -3279,8 +3432,11 @@
       appendTraceRow("info", "已打开切片 " + (p.slide || "") + "，开始读片…");
       return;
     }
+    if (type === "session_resumed" || type === "fork_resumed" || type === "fork_created") {
+      appendTraceRow("info", (type === "fork_created" ? "批注对话已建立" : "会话已恢复"));
+      return;
+    }
     if (type === "agent_thinking") {
-      // 思考中提示（轻量，不每次都加行，避免刷屏：复用最后一行思考态）
       setThinkingRow();
       return;
     }
@@ -3316,25 +3472,45 @@
       appendTraceRow("observation", "👁 " + (p.label || "") + (p.note ? "：" + p.note : ""));
       return;
     }
+    if (type === "snapshot_reviewed") {
+      clearThinkingRow();
+      appendTraceRow("observation", "✓ 快照已判读（" + (p.disposition || "") + "）");
+      return;
+    }
     if (type === "annotation_created") {
       clearThinkingRow();
-      appendTraceRow("annotation", "📌 AI 建议 · " + (p.label || "") +
+      var aRow = appendTraceRow("annotation", "📌 AI 建议 · " + (p.label || "") +
                      (p.note ? "（" + p.note + "）" : "") +
                      " @(" + fmtNum(p.x) + "," + fmtNum(p.y) + "," + p.side_px + "px)");
+      if (p.annotation_id) aRow.dataset.annotationId = p.annotation_id;
+      if (aiTraceTarget) {
+        // fork 无 create_annotation，但保险起见也挂 💬
+      } else {
+        attachForkBtn(aRow, p.annotation_id);
+      }
       // 刷新标注层与面板，让 AI 标注出现在现有标注体系
       refreshCurrentAnnotations();
       loadAnnotationsIndex();
+      return;
+    }
+    if (type === "agent_paused") {
+      clearThinkingRow();
+      appendTraceRow("paused", "已暂停，可继续（" + (p.summary || "") + "）");
+      aiPaused = true;
+      finishAiRun();
       return;
     }
     if (type === "agent_finished") {
       clearThinkingRow();
       appendTraceRow("finished", p.summary || "(完成)");
       redrawAnnoCanvas();
+      finishAiRun();
       return;
     }
     if (type === "agent_error") {
       clearThinkingRow();
       appendTraceRow("error", p.error || "出错");
+      finishAiRun();
       return;
     }
   }
@@ -3345,9 +3521,11 @@
   }
 
   // ---------- 轨迹流 DOM 辅助 ----------
-  function appendTraceRow(cls, text) {
+  // container 默认主 AI 轨迹；传 container 则渲染到 fork 对话流
+  function appendTraceRow(cls, text, container) {
+    var target = container || els.aiTrace;
     // 清掉空提示
-    var empty = els.aiTrace.querySelector(".ai-trace-empty");
+    var empty = target.querySelector(".ai-trace-empty");
     if (empty) empty.remove();
     var row = document.createElement("div");
     row.className = "ai-trace-row " + cls;
@@ -3365,9 +3543,180 @@
         } catch (e) {}
       });
     }
-    els.aiTrace.appendChild(row);
-    els.aiTrace.scrollTop = els.aiTrace.scrollHeight;
+    target.appendChild(row);
+    target.scrollTop = target.scrollHeight;
     return row;
+  }
+
+  function resetAiTrace() {
+    els.aiTrace.innerHTML = "";
+    aiOverlay = [];
+    aiTextBubbleEl = null;
+    redrawAnnoCanvas();
+  }
+
+  // 📌 行挂 💬 按钮：以该标注 fork 批注对话
+  function attachForkBtn(row, annotationId) {
+    if (!annotationId) return;
+    var btn = document.createElement("button");
+    btn.className = "ai-fork-btn";
+    btn.textContent = "💬";
+    btn.title = "就此标注提问";
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      openForkChat(annotationId, row);
+    });
+    row.appendChild(btn);
+  }
+
+  // 就地展开 fork 批注对话（标注面板内）
+  function openForkChat(annotationId, anchorRow) {
+    if (!state.slide) return;
+    // 若已在标注面板内，就地展开；否则打开标注面板后滚动到该条
+    var existing = $("fork-chat-" + annotationId);
+    if (existing) {
+      existing.style.display = existing.style.display === "none" ? "block" : "none";
+      return;
+    }
+    var wrap = document.createElement("div");
+    wrap.id = "fork-chat-" + annotationId;
+    wrap.className = "fork-chat";
+    var head = document.createElement("div");
+    head.className = "fork-chat-head";
+    head.textContent = "💬 批注对话";
+    var close = document.createElement("button");
+    close.className = "icon-btn close";
+    close.textContent = "×";
+    close.addEventListener("click", function () { wrap.style.display = "none"; });
+    head.appendChild(close);
+    var stream = document.createElement("div");
+    stream.className = "fork-chat-stream";
+    stream.innerHTML = '<div class="ai-trace-empty">就此标注提问…</div>';
+    var inputRow = document.createElement("div");
+    inputRow.className = "fork-chat-input";
+    var input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "问：这个区域是什么？";
+    var send = document.createElement("button");
+    send.className = "btn primary small";
+    send.textContent = "发送";
+    send.addEventListener("click", function () {
+      sendForkQuestion(annotationId, input.value, stream, wrap);
+    });
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") sendForkQuestion(annotationId, input.value, stream, wrap);
+    });
+    inputRow.appendChild(input);
+    inputRow.appendChild(send);
+    wrap.appendChild(head);
+    wrap.appendChild(stream);
+    wrap.appendChild(inputRow);
+    // 挂载：若 anchor 是标注面板行，插到其后；否则插到面板列表顶部
+    var panelList = els.annoPanelList;
+    if (anchorRow && anchorRow.parentNode) {
+      anchorRow.parentNode.insertBefore(wrap, anchorRow.nextSibling);
+    } else if (panelList) {
+      panelList.insertBefore(wrap, panelList.firstChild);
+    } else {
+      document.body.appendChild(wrap);
+    }
+    input.focus();
+  }
+
+  function sendForkQuestion(annotationId, question, streamEl, wrapEl) {
+    question = (question || "").trim();
+    if (!question) return;
+    appendTraceRow("fork-q", "🙋 " + question, streamEl);
+    var input = wrapEl ? wrapEl.querySelector("input") : null;
+    if (input) input.value = "";
+    appendTraceRow("fork-wait", "思考中…", streamEl);
+    fetch("/api/ai/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slide: state.slide.name, annotation_id: annotationId, question: question }),
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (resp.status === 410) {
+        appendTraceRow("fork-err", "该标注已删除，对话已归档（只读）", streamEl);
+        if (wrapEl) wrapEl.classList.add("fork-readonly");
+        throw new Error("gone");
+      }
+      if (!resp.ok || !resp.body) {
+        return resp.text().then(function (t) { throw new Error(t || ("HTTP " + resp.status)); });
+      }
+      // 流入 fork 对话流
+      aiTraceTarget = streamEl;
+      return pumpForkSse(resp.body.getReader(), streamEl, wrapEl);
+    }).catch(function (e) {
+      if (e && e.message === "gone") return;
+      appendTraceRow("fork-err", "发送失败: " + (e && e.message ? e.message : e), streamEl);
+    });
+  }
+
+  function pumpForkSse(reader, streamEl, wrapEl) {
+    var decoder = new TextDecoder("utf-8");
+    var buffer = "";
+    function pump() {
+      return reader.read().then(function (result) {
+        if (result.done) { aiTraceTarget = null; return; }
+        buffer += decoder.decode(result.value, { stream: true });
+        var idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          var frame = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          var type = null, dataStr = "";
+          frame.split("\n").forEach(function (line) {
+            if (line.indexOf(":") === 0) return;
+            if (line.indexOf("event:") === 0) type = line.slice(6).trim();
+            else if (line.indexOf("data:") === 0) dataStr += line.slice(5).trim();
+          });
+          if (type === "session_ended") { aiTraceTarget = null; continue; }
+          var payload = {};
+          if (dataStr) { try { payload = JSON.parse(dataStr); } catch (e) {} }
+          handleForkEvent(type, payload, streamEl, wrapEl);
+        }
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  function handleForkEvent(type, p, streamEl, wrapEl) {
+    // 复用主轨迹渲染，但把追加目标切到 fork 流
+    var prev = aiTraceTarget;
+    aiTraceTarget = streamEl;
+    if (type === "agent_thinking") { setThinkingRowFork(streamEl); aiTraceTarget = prev; return; }
+    if (type === "text_delta") { appendTextBubbleFork(p.text || "", streamEl); aiTraceTarget = prev; return; }
+    handleAiEvent(type, p);
+    aiTraceTarget = prev;
+    // 收尾清理
+    if (type === "agent_paused" || type === "agent_finished" || type === "agent_error") {
+      var waits = streamEl.querySelectorAll(".ai-trace-row.fork-wait, .ai-trace-row.thinking");
+      waits.forEach(function (w) { if (w.parentNode) w.parentNode.removeChild(w); });
+    }
+  }
+
+  var forkBubbleEl = null;
+  function appendTextBubbleFork(text, streamEl) {
+    if (!forkBubbleEl || forkBubbleEl.closed || forkBubbleEl.parentNode !== streamEl) {
+      forkBubbleEl = document.createElement("div");
+      forkBubbleEl.className = "ai-trace-row bubble fork-ai";
+      forkBubbleEl.textContent = "";
+      forkBubbleEl.closed = false;
+      streamEl.appendChild(forkBubbleEl);
+    }
+    forkBubbleEl.textContent += text;
+    streamEl.scrollTop = streamEl.scrollHeight;
+  }
+
+  var forkThinkingEl = null;
+  function setThinkingRowFork(streamEl) {
+    if (forkThinkingEl && forkThinkingEl.parentNode === streamEl) return;
+    forkThinkingEl = document.createElement("div");
+    forkThinkingEl.className = "ai-trace-row thinking";
+    forkThinkingEl.textContent = "思考中…";
+    streamEl.appendChild(forkThinkingEl);
+    streamEl.scrollTop = streamEl.scrollHeight;
   }
 
   function appendTextBubble(text) {
@@ -3385,14 +3734,15 @@
 
   var thinkingRowEl = null;
   function setThinkingRow() {
-    if (thinkingRowEl && thinkingRowEl.parentNode) return;
-    var empty = els.aiTrace.querySelector(".ai-trace-empty");
+    var target = aiTraceTarget || els.aiTrace;
+    if (thinkingRowEl && thinkingRowEl.parentNode === target) return;
+    var empty = target.querySelector(".ai-trace-empty");
     if (empty) empty.remove();
     thinkingRowEl = document.createElement("div");
     thinkingRowEl.className = "ai-trace-row thinking";
     thinkingRowEl.textContent = "思考中…";
-    els.aiTrace.appendChild(thinkingRowEl);
-    els.aiTrace.scrollTop = els.aiTrace.scrollHeight;
+    target.appendChild(thinkingRowEl);
+    target.scrollTop = target.scrollHeight;
   }
   function clearThinkingRow() {
     if (thinkingRowEl && thinkingRowEl.parentNode) {

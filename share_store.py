@@ -13,6 +13,7 @@ import os
 import secrets
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 import fcntl
@@ -24,8 +25,14 @@ SHARE_DATA_DIR = Path(
 SHARE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 SHARE_FILE = SHARE_DATA_DIR / "shares.json"
 
-# 空结构骨架
-_EMPTY = {"shares": {}, "rois": [], "projects": {}, "slide_meta": {}}
+# 空结构骨架（change_seq_by_slide 为切片级全局单调变更序号计数器，见 docs 4.2）
+_EMPTY = {
+    "shares": {},
+    "rois": [],
+    "projects": {},
+    "slide_meta": {},
+    "change_seq_by_slide": {},
+}
 
 # 支持的标注类型
 ROI_TYPES = ("rect", "arrow", "freehand")
@@ -122,6 +129,8 @@ def _load_locked(f):
         data.setdefault("projects", {})
         # 向后兼容：旧文件无 slide_meta 时补 {}
         data.setdefault("slide_meta", {})
+        # 向后兼容：旧文件无 change_seq_by_slide 时补 {}
+        data.setdefault("change_seq_by_slide", {})
         if not isinstance(data["shares"], dict):
             data["shares"] = {}
         if not isinstance(data["rois"], list):
@@ -130,6 +139,10 @@ def _load_locked(f):
             data["projects"] = {}
         if not isinstance(data["slide_meta"], dict):
             data["slide_meta"] = {}
+        if not isinstance(data["change_seq_by_slide"], dict):
+            data["change_seq_by_slide"] = {}
+        # 存量 ROI 一次性迁移（补 annotation_id/change_seq/revision/source/deleted）
+        _ensure_roi_identity(data)
         return data
     except (json.JSONDecodeError, ValueError):
         # 损坏：备份后重建
@@ -145,7 +158,100 @@ def _load_locked(f):
 
 def _copy_empty():
     """返回一个新的空结构（避免共享引用）。"""
-    return {"shares": {}, "rois": [], "projects": {}, "slide_meta": {}}
+    return {"shares": {}, "rois": [], "projects": {}, "slide_meta": {},
+            "change_seq_by_slide": {}}
+
+
+# --------------------------------------------------------------------------- #
+# ROI 迁移 / 稳定 ID / 变更序号（docs §4.2 v3 P0）
+#
+# 现有 ROI 只按「token 内插入序 index」定位，delete 用 pop() 会位移，不能作
+# fork 根键。一次性迁移补齐：annotation_id(UUID)、change_seq（切片级全局单调，
+# 按现有顺序赋递增初值）、revision=1、source（旧数据安全默认 human）、
+# deleted=false；并初始化 change_seq_by_slide 全局计数器。
+# --------------------------------------------------------------------------- #
+def _ensure_roi_identity(data):
+    """把 data（已锁定）中的存量 ROI 一次性补齐稳定 ID / 变更字段。
+
+    幂等：已有 annotation_id 的跳过；change_seq_by_slide 已初始化的不重置
+    （后续每次新建/编辑/删除在锁内继续递增）。返回是否发生过迁移。
+    """
+    migrated = False
+    seq_map = data.get("change_seq_by_slide")
+    if not isinstance(seq_map, dict):
+        seq_map = {}
+        data["change_seq_by_slide"] = seq_map
+    next_seq = {}
+    for slide, cur in seq_map.items():
+        if isinstance(cur, (int, float)):
+            next_seq[str(slide)] = int(cur)
+    for roi in data["rois"]:
+        if not isinstance(roi, dict):
+            continue
+        slide = roi.get("slide")
+        if not roi.get("annotation_id"):
+            roi["annotation_id"] = str(uuid.uuid4())
+            migrated = True
+        if roi.get("revision") is None:
+            roi["revision"] = 1
+            migrated = True
+        if roi.get("source") is None:
+            # 缺省安全地默认 human（历史标注非 AI 落标）
+            roi["source"] = "human"
+            migrated = True
+        if roi.get("deleted") is None:
+            roi["deleted"] = False
+            migrated = True
+        if roi.get("change_seq") is None and slide is not None:
+            # 按现有顺序赋递增初值；同一张切片的计数器共享
+            nxt = next_seq.get(slide, 0) + 1
+            next_seq[slide] = nxt
+            roi["change_seq"] = nxt
+            migrated = True
+        if roi.get("updated_at") is None:
+            roi["updated_at"] = roi.get("ts") or time.time()
+            migrated = True
+    for slide, nxt in next_seq.items():
+        seq_map[slide] = nxt
+    return migrated
+
+
+def _roi_index_map(data, token):
+    """返回 {roi对象id: token 内插入序 index}（与 list_rois 的 counters 一致）。"""
+    counters = {}
+    out = {}
+    for r in data["rois"]:
+        if r.get("token") == token:
+            out[id(r)] = counters.get(token, 0)
+            counters[token] = counters.get(token, 0) + 1
+    return out
+
+
+def _roi_out(roi, index=None, shared=None):
+    """ROI 导出副本：统一补 index/shared/note 兼容字段。"""
+    out = dict(roi)
+    if index is not None:
+        out["index"] = index
+    if shared is not None:
+        out["shared"] = bool(shared)
+    out["note"] = roi.get("note", "")
+    return out
+
+
+def _bump_change_seq(data, slide):
+    """在锁内为某切片递增全局 change_seq 计数器，返回新值。"""
+    seq_map = data.setdefault("change_seq_by_slide", {})
+    cur = seq_map.get(slide)
+    if not isinstance(cur, (int, float)):
+        cur = 0
+    nxt = int(cur) + 1
+    seq_map[slide] = nxt
+    return nxt
+
+
+def _visible(data):
+    """过滤出非 tombstone 的 roi（list/get/update 默认过滤，docs §4.2）。"""
+    return [r for r in data["rois"] if not r.get("deleted")]
 
 
 def _save_locked(f, data):
@@ -378,7 +484,8 @@ def _clean_note(note):
     return n
 
 
-def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None, **geom):
+def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
+            source=None, created_by_session_id=None, _effect_key=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     管理员标注使用 token="admin"（此时 share 校验放宽：不要求 token 命中 shares，
@@ -390,8 +497,13 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
     note 为备注文本（可选，缺省空串；strip 后 ≤ 500 字符，超出抛 ValueError）。
     visitor 为创建设备的访客标识（可选，None 存空串）——分享端按设备归属校验用。
 
-    返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared/note）。
-    若校验失败抛出 ValueError。
+    source：ROI 来源（"ai" | "human"），缺省按 token 推断（admin 且非公开 → "ai"，
+    其余 → "human"）。created_by_session_id：AI 落标时所属 session（可选）。
+    _effect_key：WAL 幂等键（docs §5.4）；同一键已落标时复用返回（不重复写入），
+    幂等检查与写入在同一 share_store 锁临界区内完成。
+
+    返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared/note、
+    annotation_id/change_seq 等）。若校验失败抛出 ValueError。
     """
     # type 合法性
     if type not in ROI_TYPES:
@@ -423,15 +535,35 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                 raise ValueError("share invalid")
             if slide not in share.get("slides", []):
                 raise ValueError("slide not in share")
+        # WAL 幂等：effect_key 已落 → 直接复用返回（不重复写、不重复递增 change_seq）
+        if _effect_key:
+            for r in data["rois"]:
+                if r.get("effect_key") == _effect_key and not r.get("deleted"):
+                    same = [x for x in data["rois"] if x.get("token") == token]
+                    idx = [i for i, x in enumerate(same) if x is r]
+                    return _roi_out(r, index=(idx[0] if idx else len(same) - 1))
+        now = time.time()
+        src = source if source in ("ai", "human") else (
+            "ai" if (is_admin and not shared) else "human")
         roi = {
             "token": token,
             "slide": slide,
             "label": label,
-            "ts": time.time(),
+            "ts": now,
             "shared": bool(shared),
             "note": note_clean,
             "visitor": visitor or "",
+            # docs §4.2 新增字段：稳定 ID / 来源 / 变更追踪 / tombstone
+            "annotation_id": str(uuid.uuid4()),
+            "source": src,
+            "created_by_session_id": created_by_session_id or "",
+            "revision": 1,
+            "change_seq": _bump_change_seq(data, slide),
+            "updated_at": now,
+            "deleted": False,
         }
+        if _effect_key:
+            roi["effect_key"] = _effect_key
         roi.update(norm)
         data["rois"].append(roi)
         _save_locked(f, data)
@@ -474,8 +606,9 @@ def update_roi(token, index, geom=None, note=None):
             share = data["shares"].get(token)
             if share is None or not _is_active(share):
                 raise ValueError("share invalid")
-        # 定位该 token 下第 index 条 roi
-        same = [i for i, r in enumerate(data["rois"]) if r["token"] == token]
+        # 定位该 token 下第 index 条 roi（跳过 tombstone，docs §4.2）
+        same = [i for i, r in enumerate(data["rois"])
+                if r["token"] == token and not r.get("deleted")]
         if index < 0 or index >= len(same):
             return False
         real_i = same[index]
@@ -496,12 +629,17 @@ def update_roi(token, index, geom=None, note=None):
         if note_clean != "_UNSET_":
             roi["note"] = note_clean
 
+        # docs §4.2：任何编辑都递增 revision + 切片级 change_seq（锁内分配）
+        roi["revision"] = int(roi.get("revision") or 1) + 1
+        roi["change_seq"] = _bump_change_seq(data, roi.get("slide"))
+        roi["updated_at"] = time.time()
+
         _save_locked(f, data)
 
         # 返回更新后的 roi dict（含 index）
         out = dict(roi)
         # index 按 token 内序号计算（同 list_rois 逻辑）
-        all_same = [r for r in data["rois"] if r["token"] == token]
+        all_same = [r for r in data["rois"] if r["token"] == token and not r.get("deleted")]
         out["index"] = all_same.index(roi)
         out["shared"] = _roi_shared_compat(roi)
         return out
@@ -510,17 +648,17 @@ def update_roi(token, index, geom=None, note=None):
 
 
 def list_rois(token=None):
-    """返回 ROI 列表；可按 token 过滤。
+    """返回 ROI 列表；可按 token 过滤（跳过 tombstone，docs §4.2）。
 
     每项含 index（该 token 下的序号）与 shared（按兼容规则归一为 bool）。
     """
     def _do(f):
         data = _load_locked(f)
-        rois = data["rois"]
+        rois = _visible(data)
         if token is not None:
             rois = [r for r in rois if r["token"] == token]
             # 计算 index：原列表中同 token 的顺序序号
-            all_same = [r for r in data["rois"] if r["token"] == token]
+            all_same = [r for r in _visible(data) if r["token"] == token]
             idx_map = {}
             for i, r in enumerate(all_same):
                 idx_map[id(r)] = i
@@ -551,15 +689,16 @@ def list_rois(token=None):
 
 
 def get_roi(token, index):
-    """返回该 token 下第 index 条 roi 的 dict 副本；不存在返回 None。
+    """返回该 token 下第 index 条 roi 的 dict 副本（跳过 tombstone）；不存在返回 None。
 
     供分享端做设备归属校验（visitor 字段）使用。index 语义与 list_rois 的
-    counters 完全一致（该 token 下按文件插入顺序的序号）。
+    counters 完全一致（该 token 下按文件插入顺序的序号，tombstone 不计入）。
     返回副本含 visitor 字段（旧数据缺省空串），含 index。
     """
     def _do(f):
         data = _load_locked(f)
-        same = [i for i, r in enumerate(data["rois"]) if r["token"] == token]
+        same = [i for i, r in enumerate(data["rois"])
+                if r["token"] == token and not r.get("deleted")]
         if index < 0 or index >= len(same):
             return None
         roi = data["rois"][same[index]]
@@ -573,23 +712,100 @@ def get_roi(token, index):
     return _with_lock("r+", _do)
 
 
-def delete_roi(token, index):
-    """删除该 token 下第 index 条 ROI；返回是否删除成功。"""
+def get_roi_by_annotation_id(annotation_id):
+    """按稳定 annotation_id 取 ROI 完整 dict（含 tombstone）；不存在返回 None。
+
+    fork 根标注定位 / 变更追踪用（docs §4.2）。旧数据（已删）找不到返回 None。
+    """
     def _do(f):
         data = _load_locked(f)
-        same = [i for i, r in enumerate(data["rois"]) if r["token"] == token]
+        for r in data["rois"]:
+            if r.get("annotation_id") == annotation_id:
+                return dict(r)
+        return None
+
+    return _with_lock("r+", _do)
+
+
+def delete_roi(token, index):
+    """删除该 token 下第 index 条 ROI；返回是否删除成功。
+
+    docs §4.2【v3】：物理删除改为置 tombstone（deleted=true + 递增 change_seq，
+    产生 spot_deleted 事件）。重复删除（已 deleted=true 的）是 no-op，不再递增。
+    返回 (bool, annotation_id|None)。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        same = [i for i, r in enumerate(data["rois"])
+                if r["token"] == token and not r.get("deleted")]
         if index < 0 or index >= len(same):
-            return False
+            return False, None
         real_i = same[index]
-        data["rois"].pop(real_i)
+        roi = data["rois"][real_i]
+        if roi.get("deleted"):
+            return False, None
+        roi["deleted"] = True
+        roi["change_seq"] = _bump_change_seq(data, roi.get("slide"))
+        roi["updated_at"] = time.time()
         _save_locked(f, data)
-        return True
+        return True, roi.get("annotation_id")
+
+    return _with_lock("r+", _do)
+
+
+def delete_roi_by_annotation_id(annotation_id):
+    """按稳定 annotation_id 删除（tombstone 语义同 delete_roi）；返回是否成功。"""
+    def _do(f):
+        data = _load_locked(f)
+        for r in data["rois"]:
+            if r.get("annotation_id") == annotation_id and not r.get("deleted"):
+                r["deleted"] = True
+                r["change_seq"] = _bump_change_seq(data, r.get("slide"))
+                r["updated_at"] = time.time()
+                _save_locked(f, data)
+                return True
+        return False
+
+    return _with_lock("r+", _do)
+
+
+def list_changes(slide, after_seq):
+    """返回 change_seq > after_seq 的全部变更（含 tombstone，docs §4.2）。
+
+    内部接口，供 session 做 spot 增量注入（§8.4）；不进入 UI 标注层。
+    """
+    if not isinstance(after_seq, (int, float)):
+        after_seq = 0
+
+    def _do(f):
+        data = _load_locked(f)
+        out = []
+        for r in data["rois"]:
+            if r.get("slide") != slide:
+                continue
+            cs = r.get("change_seq")
+            if cs is None or not isinstance(cs, (int, float)) or cs <= after_seq:
+                continue
+            out.append(dict(r))
+        out.sort(key=lambda x: x.get("change_seq", 0))
+        return out
+
+    return _with_lock("r+", _do)
+
+
+def current_change_seq(slide):
+    """返回某切片当前的全局 change_seq 水位（无则 0）。"""
+    def _do(f):
+        data = _load_locked(f)
+        seq_map = data.get("change_seq_by_slide") or {}
+        cur = seq_map.get(slide)
+        return int(cur) if isinstance(cur, (int, float)) else 0
 
     return _with_lock("r+", _do)
 
 
 def set_roi_shared(token, index, shared):
-    """设置该 token 下第 index 条 ROI 的 shared 字段。
+    """设置该 token 下第 index 条 ROI 的 shared 字段（跳过 tombstone）。
 
     返回是否设置成功（token/index 无效时返回 False，不抛异常）。
     shared 会被归一为 bool 并持久化。
@@ -598,7 +814,8 @@ def set_roi_shared(token, index, shared):
 
     def _do(f):
         data = _load_locked(f)
-        same = [i for i, r in enumerate(data["rois"]) if r["token"] == token]
+        same = [i for i, r in enumerate(data["rois"])
+                if r["token"] == token and not r.get("deleted")]
         if index < 0 or index >= len(same):
             return False
         data["rois"][same[index]]["shared"] = shared_b
@@ -609,11 +826,13 @@ def set_roi_shared(token, index, shared):
 
 
 def roi_count_by_token():
-    """返回 {token: count} 计数表。"""
+    """返回 {token: count} 计数表（跳过 tombstone）。"""
     def _do(f):
         data = _load_locked(f)
         counts = {}
         for r in data["rois"]:
+            if r.get("deleted"):
+                continue
             counts[r["token"]] = counts.get(r["token"], 0) + 1
         return counts
 
@@ -621,7 +840,7 @@ def roi_count_by_token():
 
 
 def list_shared_rois_for_slides(slides):
-    """返回 shared 为真（按兼容规则判定）且 slide ∈ slides 的标注列表。
+    """返回 shared 为真（按兼容规则判定）且 slide ∈ slides 的标注列表（跳过 tombstone）。
 
     供分享端展示「公开标注」使用：包含管理员公开标注与其他用户被管理员公开的标注。
     每项带 index/token/label/type/几何/ts/shared=True，按 token 归组计算 index
@@ -638,6 +857,8 @@ def list_shared_rois_for_slides(slides):
         counters = defaultdict(int)  # token -> 下一个 index
         out = []
         for r in data["rois"]:
+            if r.get("deleted"):
+                continue
             idx = counters[r["token"]]
             counters[r["token"]] += 1
             if r.get("slide") not in slide_set:
@@ -903,6 +1124,8 @@ def annotations_by_slide():
         # slide -> label -> {label, count, items}
         by_slide = {}
         for r in data["rois"]:
+            if r.get("deleted"):
+                continue  # tombstone 不进 UI 标注层 / spot 索引（docs §4.2）
             slide = r.get("slide")
             lbl = _norm_label(r.get("label"))
             grp_map = by_slide.setdefault(slide, {})
@@ -928,6 +1151,12 @@ def annotations_by_slide():
                 "ts": r.get("ts"),
                 "shared": _roi_shared_compat(r),
                 "note": r.get("note", ""),
+                # docs §4.2：稳定 ID / 来源，供 fork 批注挂 💬（旧数据兼容默认值）
+                "annotation_id": r.get("annotation_id"),
+                "source": r.get("source", "human"),
+                "created_by_session_id": r.get("created_by_session_id", ""),
+                "change_seq": r.get("change_seq"),
+                "revision": r.get("revision", 1),
                 # 设备标识短码：同链接不同设备在管理端可区分（旧数据缺省空）
                 "visitor": (r.get("visitor") or "")[:8],
             }
