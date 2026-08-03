@@ -469,15 +469,17 @@ def run_agent(slide_name: str, task: str, emit: EmitFn,
                         return
                     # 回喂带图（image content）的 tool 消息
                     data_url = "data:image/jpeg;base64,{}".format(img_b64)
+                    bbox_text = "{},{},{},{}".format(
+                        src.get("x"), src.get("y"), src.get("w"), src.get("h"))
+                    tool_text = (
+                        "快照区域 level-0 bbox={bbox}，放大 {mag}，"
+                        "输出 {w}×{h} 像素。"
+                    ).format(bbox=bbox_text, mag=mag,
+                             w=r.get("width"), h=r.get("height"))
                     messages.append({
                         "role": "tool", "tool_call_id": tc_id, "name": "snapshot",
                         "content": [
-                            {"type": "text", "text": "快照区域 level-0 bbox={x},{y},{w},{h}，"
-                                                      "放大 {}，输出 {}×{} 像素。".format(
-                                                          "{},{},{},{}".format(
-                                                              src.get("x"), src.get("y"),
-                                                              src.get("w"), src.get("h")),
-                                                          mag, r.get("width"), r.get("height"))},
+                            {"type": "text", "text": tool_text},
                             {"type": "image_url", "image_url": {"url": data_url}},
                         ],
                     })

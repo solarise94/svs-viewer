@@ -382,6 +382,14 @@
     if (mag >= 1) return mag.toFixed(1) + "×";
     return mag.toFixed(2) + "×";
   }
+  // AI 轨迹里的倍率：可能是数字（需格式化）或已带单位的字符串（如 "20x (high power)"）
+  function fmtAiMag(mag) {
+    if (mag === null || mag === undefined || mag === "") return "";
+    if (typeof mag === "string") return mag;  // 已格式化（如 ai_agent 的 magnification_label）
+    var m = Number(mag);
+    if (!isFinite(m)) return String(mag);
+    return (m >= 10 ? Math.round(m) : m.toFixed(1)) + "x";
+  }
   function updateZoomBadge() {
     try {
       if (!viewer || !viewer.viewport || !viewer.source) {
@@ -1625,7 +1633,7 @@
         if (!animating && bb.magnification) {
           annoCtx.fillStyle = "rgba(0,229,255,0.9)";
           annoCtx.font = "12px -apple-system, sans-serif";
-          annoCtx.fillText("AI · " + bb.magnification, x + 4, y + 14);
+          annoCtx.fillText("AI · " + fmtAiMag(bb.magnification), x + 4, y + 14);
         }
         annoCtx.restore();
       });
@@ -3262,7 +3270,7 @@
       // 只保留最近一次框（按需求"完成后保留最近一次框"；过程中也只显示最新）
       if (aiOverlay.length > 1) aiOverlay = aiOverlay.slice(-1);
       redrawAnnoCanvas();
-      var row = appendTraceRow("snapshot", "+ 快照 @ " + (p.magnification || "") +
+      var row = appendTraceRow("snapshot", "+ 快照 @ " + fmtAiMag(p.magnification) +
                                "  (点击跳转)");
       row.dataset.bbox = JSON.stringify(bb);
       return;
