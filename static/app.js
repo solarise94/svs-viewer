@@ -106,10 +106,10 @@
     mppInput: $("mpp-input"),
     mppSetBtn: $("mpp-set-btn"),
     zoomBadge: $("zoom-badge"),
+    headerZoomBadge: $("header-zoom-badge"),
     tbbMoreBtn: $("tbb-more-btn"),
     tbbMore: $("tbb-more"),
     tbbMoreAi: $("tbb-more-ai"),
-    tbbMoreZoom: $("tbb-more-zoom"),
     uploadBtn: $("upload-btn"),
     fileInput: $("file-input"),
     progressWrap: $("progress-wrap"),
@@ -418,7 +418,7 @@
       }
     } catch (e) { /* 保持 — */ }
     els.zoomBadge.textContent = text;
-    if (els.tbbMoreZoom) els.tbbMoreZoom.textContent = text;  // 同步 ⋯ 面板里的徽章
+    if (els.headerZoomBadge) els.headerZoomBadge.textContent = text;  // 同步顶部徽章（移动端）
   }
 
   // ---------- 底图缩略图层（慢网下瓦片未到区域的模糊预览） ----------

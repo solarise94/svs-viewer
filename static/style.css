@@ -288,10 +288,13 @@ button {
   box-shadow: var(--shadow-sm);
 }
 
-/* ⋯ 溢出钮与面板：桌面隐藏，仅移动端出现（装 AI 读片 + 缩放徽章） */
+/* ⋯ 溢出钮与面板：桌面隐藏，仅移动端出现（装 AI 读片） */
 .tbb-more-btn { display: none; }
 .tbb-more { display: none; }
 .tbb-more-mask { display: none; }
+
+/* 顶部栏缩放徽章：桌面隐藏（桌面用底栏 #zoom-badge），仅移动端显示 */
+.header-zoom-badge { display: none; }
 
 /* =========================================================================
    主体布局
@@ -1553,9 +1556,17 @@ button {
     font-size: 11px;
   }
 
-  /* —— 移动端：AI 读片钮与缩放徽章收进 ⋯ 溢出面板，底栏主行只留常用操作 —— */
+  /* —— 移动端：AI 读片钮收进 ⋯ 溢出面板；缩放徽章移到顶部栏右侧 —— */
   #toolbar #ai-btn { display: none; }          /* AI 主钮移动端藏起，进 ⋯ */
-  #toolbar .zoom-badge { display: none; }       /* 缩放徽章进 ⋯（桌面仍内联） */
+  #toolbar .zoom-badge { display: none; }       /* 底栏徽章藏起，改用顶部徽章 */
+  .header-zoom-badge {
+    display: inline-block;                      /* 移动端显示顶部徽章 */
+    flex-shrink: 0;
+    margin-left: auto;                          /* 顶到 header 右侧 */
+    padding: 3px 10px;
+    min-width: 52px;
+    font-size: 12px;
+  }
   #toolbar .tbb-more-btn {
     display: inline-flex;
     flex-shrink: 0;
@@ -1580,17 +1591,6 @@ button {
   }
   #toolbar .tbb-more.open { display: flex; }
   #toolbar .tbb-more .tool-btn { height: 36px; padding: 0 12px; font-size: 13px; }
-  #toolbar .tbb-more-zoom {
-    font-family: var(--mono);
-    font-variant-numeric: tabular-nums;
-    font-size: 13px;
-    color: var(--text);
-    padding: 3px 10px;
-    background: #fff;
-    border: 0.5px solid var(--separator-strong);
-    border-radius: var(--r-pill);
-    white-space: nowrap;
-  }
   /* ⋯ 遮罩：点外关闭 */
   .tbb-more-mask {
     display: none;
