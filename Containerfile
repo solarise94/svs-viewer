@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ai_agent.py share_server.py share_store.py slide_io.py slide_cache.py ./
+COPY app.py ai_agent.py ai_session.py share_server.py share_store.py slide_io.py slide_cache.py ./
 COPY share_entry.sh ./
 RUN chmod +x share_entry.sh
 COPY templates/ templates/
