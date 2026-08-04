@@ -3567,19 +3567,27 @@
       // 只保留最近一次框（按需求"完成后保留最近一次框"；过程中也只显示最新）
       if (aiOverlay.length > 1) aiOverlay = aiOverlay.slice(-1);
       redrawAnnoCanvas();
-      var row = appendTraceRow("snapshot", "+ 快照 @ " + fmtAiMag(p.magnification) +
-                               "  (点击跳转)");
+      // 友好卡片：只显示"📷 快照 @倍率（点击跳转）"，不暴露 out_w/out_h 原始参数
+      var row = appendTraceRow("snapshot", "📷 快照 @" + fmtAiMag(p.magnification) +
+                               "　（点击跳转）");
       row.dataset.bbox = JSON.stringify(bb);
       return;
     }
     if (type === "observation") {
       clearThinkingRow();
-      appendTraceRow("observation", "👁 " + (p.label || "") + (p.note ? "：" + p.note : ""));
+      // 观察卡：标题（label）+ 正文（note），no_annotation_reason 显示为小字备注。
+      // 不显示原始 JSON / h / snapshot_id（任务1：卡片化）。
+      appendObservationCard(p);
       return;
     }
     if (type === "snapshot_reviewed") {
       clearThinkingRow();
-      appendTraceRow("observation", "✓ 快照已判读（" + (p.disposition || "") + "）");
+      // 判读卡：一行简洁状态 + summary 副标题。不显示 snapshot_id/disposition 原文。
+      var disp = p.disposition || "";
+      var title = (disp === "annotated") ? "✓ 快照已判读（已标注）"
+                : (disp === "no_annotation") ? "✓ 快照已判读（无需标注）"
+                : "✓ 快照已判读";
+      appendReviewCard(title, p.summary || "", disp === "no_annotation" ? (p.no_annotation_reason || "") : "");
       return;
     }
     if (type === "annotation_created") {
@@ -3692,21 +3700,52 @@
         if (text) {
           appendChatBubble(target, "assistant", text);
         }
-        // tool_calls → 紧凑系统行（main 跑批里工具调用密集，不做成大气泡）
+        // tool_calls → 友好渲染（任务1：不再 dump 原始 JSON 参数）
+        // mark_observation/complete_snapshot_review → 卡片；snapshot/goto/create_annotation → 简洁行
         for (var j = 0; j < tcs.length; j++) {
           var fn = tcs[j].function || {};
           var nm = fn.name || "";
-          appendSysRow(target, "→ " + nm + " " + summarizeToolArgs(nm, fn.arguments), "tool");
+          var args = parseToolArgs(fn.arguments);
+          if (nm === "mark_observation") {
+            appendObservationCard({
+              label: args.label || "", note: args.note || "",
+              no_annotation_reason: args.no_annotation_reason || "", bbox: {},
+            }, target);
+          } else if (nm === "complete_snapshot_review") {
+            var disp = args.disposition || "";
+            appendReviewCard(
+              disp === "annotated" ? "✓ 快照已判读（已标注）"
+              : disp === "no_annotation" ? "✓ 快照已判读（无需标注）"
+              : "✓ 快照已判读",
+              args.summary || "",
+              disp === "no_annotation" ? (args.no_annotation_reason || "") : "",
+              target);
+          } else if (nm === "goto") {
+            appendSysRow(target, "→ goto (" + fmtNum(args.x) + "," + fmtNum(args.y) +
+              ") @ " + (args.level != null ? args.level : "?") +
+              (args.reason ? " · " + args.reason : ""), "tool");
+          } else if (nm === "create_annotation") {
+            appendSysRow(target, "📌 " + (args.label || "AI 建议") +
+              (args.note ? "（" + truncateStr(args.note, 80) + "）" : ""), "tool");
+          } else if (nm === "snapshot") {
+            // 不显示 out_w/out_h 原始参数（image_ref 占位行由后续 tool 结果渲染）
+            appendSysRow(target, "📷 抓取快照…", "tool");
+          } else if (nm === "finish") {
+            // finish 的总结已在 assistant 文本气泡里，不重复
+          } else {
+            appendSysRow(target, "→ " + nm, "tool");
+          }
         }
       } else if (role === "tool") {
-        // tool 结果：含 image_ref 的渲染为 📷 快照行（可点跳 bbox）；纯文本渲染为紧凑行
+        // tool 结果：含 image_ref 的渲染为 📷 快照行（可点跳 bbox）；纯文本结果
+        // 中若含守卫拒绝信息（snapshot_id/pending），转成用户可读的紧凑行
         var imgRef = findImageRef(m);
         if (imgRef) {
           appendSnapshotPlaceholder(target, imgRef);
         }
         var resText = messageText(m);
         if (resText && !imgRef) {
-          appendSysRow(target, "⇠ " + truncateStr(resText, 200));
+          appendSysRow(target, "⇠ " + friendlyToolResult(resText), "tool");
         }
       }
     }
@@ -3795,18 +3834,86 @@
     return row;
   }
 
-  function summarizeToolArgs(name, argsStr) {
-    var args = {};
+  // 观察卡：标题（label）+ 正文（note）+ 可选的"未落标注"小字备注。
+  // 不显示原始 JSON / h / snapshot_id（任务1：卡片化）。
+  // container 默认主轨迹（live 流），恢复历史时由调用方传入。
+  // live 流走 handleAiEvent（fork 时 aiTraceTarget 已被切到 fork 流）。
+  function appendObservationCard(p, container) {
+    var target = container || aiTraceTarget || els.aiTrace;
+    var empty = target.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    var card = document.createElement("div");
+    card.className = "ai-card observation";
+    var title = document.createElement("div");
+    title.className = "ai-card-title";
+    title.textContent = "👁 " + (p.label || "观察");
+    card.appendChild(title);
+    if (p.note) {
+      var body = document.createElement("div");
+      body.className = "ai-card-body";
+      body.textContent = p.note;
+      card.appendChild(body);
+    }
+    var reason = p.no_annotation_reason;
+    if (reason && String(reason).trim()) {
+      var sub = document.createElement("div");
+      sub.className = "ai-card-sub";
+      sub.textContent = "未落标注：" + reason;
+      card.appendChild(sub);
+    }
+    target.appendChild(card);
+    target.scrollTop = target.scrollHeight;
+    return card;
+  }
+
+  // 判读卡：一行状态 + 可选 summary 副标题 + 可选 reason 备注。
+  function appendReviewCard(title, summary, reason, container) {
+    var target = container || aiTraceTarget || els.aiTrace;
+    var empty = target.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    var card = document.createElement("div");
+    card.className = "ai-card review";
+    var head = document.createElement("div");
+    head.className = "ai-card-title";
+    head.textContent = title;
+    card.appendChild(head);
+    if (summary) {
+      var body = document.createElement("div");
+      body.className = "ai-card-body";
+      body.textContent = summary;
+      card.appendChild(body);
+    }
+    if (reason && String(reason).trim()) {
+      var sub = document.createElement("div");
+      sub.className = "ai-card-sub";
+      sub.textContent = "原因：" + reason;
+      card.appendChild(sub);
+    }
+    target.appendChild(card);
+    target.scrollTop = target.scrollHeight;
+    return card;
+  }
+
+  // 解析 tool_call 的 arguments（OpenAI 为 JSON 字符串，已解析对象也兼容）
+  function parseToolArgs(argsStr) {
     if (typeof argsStr === "string") {
-      try { args = JSON.parse(argsStr) || {}; } catch (e) {}
-    } else if (argsStr && typeof argsStr === "object") {
-      args = argsStr;
+      try { return JSON.parse(argsStr) || {}; } catch (e) { return {}; }
     }
-    if (name === "goto") {
-      return "(" + fmtNum(args.x) + "," + fmtNum(args.y) + ") @" + (args.level != null ? args.level : "?");
+    if (argsStr && typeof argsStr === "object") return argsStr;
+    return {};
+  }
+
+  // 把 tool 结果文本里的内部细节（snapshot_id / tool_call_id / pending 措辞）
+  // 转成用户可读，避免暴露 call_xxx 这类内部 id（任务1：守卫信息可读化）。
+  function friendlyToolResult(text) {
+    var t = String(text || "");
+    // 含 tool_call_id（call_xxx）→ 抽象成"该操作未关联到当前快照"
+    if (/call_[A-Za-z0-9]{6,}/.test(t) && /snapshot_id|pending|必须引用/.test(t)) {
+      return "该观察未关联到当前快照，已忽略（请先抓取并消化快照）";
     }
-    var s = JSON.stringify(args);
-    return s && s.length > 120 ? s.slice(0, 120) + "…" : s;
+    // 仅暴露 snapshot_id 的行也折叠
+    t = t.replace(/snapshot_id[（(]?\s*[:：]?\s*call_[A-Za-z0-9]+[)）]?/gi, "");
+    return truncateStr(t.trim(), 200);
   }
 
   function truncateStr(s, n) {

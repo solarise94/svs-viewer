@@ -59,28 +59,20 @@ def reset_store():
 # #4：ROI 迁移 source 数据修正（只改 AI 落标，不误伤人工标注）
 # =========================================================================== #
 def test_roi_source_fix():
-    print("== test_roi_source_fix（#4 数据修正）==")
+    print("== test_roi_source_fix（source 迁移：旧默认 human，新数据落标写 ai）==")
     reset_store()
-    # 构造旧格式 ROI：混合 AI 落标（特征）+ 真人 admin 手画 + 普通用户标注
+    # 构造旧格式 ROI（无 source 字段）：人工 + 访客混合。迁移应一律默认 human，
+    # 不做"看起来像 AI"的启发式猜测（判据已移除，见 commit refactor）。
     share_store.SHARE_FILE.write_text(json.dumps({
         "shares": {"tok_user": {"slides": ["a.svs"], "created_at": 1.0,
                                 "expires_at": 1e12, "revoked": False}},
         "rois": [
-            # 1) 迁移前 AI 落标（生产特征）：admin、无 visitor、label="可疑区域1-气道周围致密病变"、note 长
+            # 旧标注（含此前被误判的"可疑区域"措辞）→ 一律默认 human
             {"token": "admin", "slide": "a.svs", "label": "可疑区域1-气道周围致密病变",
              "ts": 1.0, "shared": False, "note": "气道周围见致密病变，伴纤维化", "visitor": "",
              "type": "rect", "x": 100, "y": 100, "side_px": 500, "size_mm": 6.0},
-            # 2) 另一条 AI 落标：label 含"纤维化"
-            {"token": "admin", "slide": "a.svs", "label": "可疑区域2-纤维化伴色素沉着灶",
-             "ts": 2.0, "shared": False, "note": "纤维化伴色素沉着，需关注", "visitor": "",
-             "type": "rect", "x": 200, "y": 200, "side_px": 500, "size_mm": 6.0},
-            # 3) 真人 admin 手画（label="管理员"，note 短）→ 必须保持 human
             {"token": "admin", "slide": "a.svs", "label": "管理员", "ts": 3.0, "shared": True,
              "note": "旧", "visitor": "", "type": "rect", "x": 1, "y": 2, "side_px": 100, "size_mm": 6.0},
-            # 4) 真人以 admin 身份手画但 label 是用户名（非 AI 措辞、note 短）→ 保持 human
-            {"token": "admin", "slide": "a.svs", "label": "张三", "ts": 4.0, "shared": False,
-             "note": "看一下", "visitor": "", "type": "rect", "x": 5, "y": 6, "side_px": 100, "size_mm": 6.0},
-            # 5) 普通用户标注（非 admin token）→ 保持 human
             {"token": "tok_user", "slide": "a.svs", "label": "访客A", "ts": 5.0, "shared": False,
              "note": "访客画的", "visitor": "dev1", "type": "rect", "x": 10, "y": 10, "side_px": 100, "size_mm": 6.0},
         ],
@@ -90,34 +82,28 @@ def test_roi_source_fix():
     rois = share_store.list_rois()  # 触发迁移
     by_label = {r["label"]: r for r in rois}
 
-    ai1 = by_label["可疑区域1-气道周围致密病变"]
-    check("AI 落标1 source 改为 ai", ai1.get("source") == "ai", str(ai1.get("source")))
-    check("AI 落标1 有 annotation_id", bool(ai1.get("annotation_id")))
+    # 旧数据：一律 human（不猜测 AI 来源），但 annotation_id 必须补齐
+    check("旧标注默认 human", by_label["可疑区域1-气道周围致密病变"].get("source") == "human")
+    check("旧标注有 annotation_id", bool(by_label["可疑区域1-气道周围致密病变"].get("annotation_id")))
+    check("人工标注 human", by_label["管理员"].get("source") == "human")
+    check("访客标注 human", by_label["访客A"].get("source") == "human")
 
-    ai2 = by_label["可疑区域2-纤维化伴色素沉着灶"]
-    check("AI 落标2 source 改为 ai", ai2.get("source") == "ai", str(ai2.get("source")))
-
-    human_admin = by_label["管理员"]
-    check("人工 admin 标注保持 human", human_admin.get("source") == "human", str(human_admin.get("source")))
-
-    human_user = by_label["张三"]
-    check("admin 身份用户名标注保持 human", human_user.get("source") == "human", str(human_user.get("source")))
-
-    visitor = by_label["访客A"]
-    check("普通用户标注保持 human", visitor.get("source") == "human", str(visitor.get("source")))
-
-    # 幂等：再读一遍，不重复改、值稳定
+    # 幂等：再读一遍，值稳定
     rois2 = share_store.list_rois()
     by_label2 = {r["label"]: r for r in rois2}
-    check("幂等：AI1 仍 ai", by_label2["可疑区域1-气道周围致密病变"].get("source") == "ai")
-    check("幂等：人工仍 human", by_label2["管理员"].get("source") == "human")
+    check("幂等：仍 human", by_label2["可疑区域1-气道周围致密病变"].get("source") == "human")
 
-    # 迁移落盘：读路径后磁盘也带上 source（读路径触发补落盘）
+    # 迁移落盘：读路径后磁盘带上 source=human
     raw = json.loads(share_store.SHARE_FILE.read_text(encoding="utf-8"))
-    disk_ai1 = [r for r in raw["rois"] if r["label"] == "可疑区域1-气道周围致密病变"][0]
-    check("磁盘落盘 source=ai", disk_ai1.get("source") == "ai")
-    disk_human = [r for r in raw["rois"] if r["label"] == "管理员"][0]
-    check("磁盘落盘 source=human", disk_human.get("source") == "human")
+    disk = [r for r in raw["rois"] if r["label"] == "可疑区域1-气道周围致密病变"][0]
+    check("磁盘落盘 source=human", disk.get("source") == "human")
+
+    # 新数据：AI 落标显式写 source="ai"（add_roi source 参数），fork 渲染条件满足
+    new_ai = share_store.add_roi("admin", "a.svs", "可疑区域X", type="rect",
+                                 note="AI 新落标", x=1, y=1, side_px=100,
+                                 source="ai", created_by_session_id="sess_x")
+    check("新 AI 落标 source=ai", new_ai.get("source") == "ai")
+    check("新 AI 落标带 annotation_id", bool(new_ai.get("annotation_id")))
 
     # annotations_by_slide 返回的 item 带 source/annotation_id（前端 💬 渲染条件依赖）
     by_slide = share_store.annotations_by_slide()
@@ -126,8 +112,8 @@ def test_roi_source_fix():
         for g in groups:
             items.extend(g.get("items") or [])
     ai_items = [it for it in items if it.get("source") == "ai"]
-    check("annotations 返回 source=ai 的项", len(ai_items) == 2, "got %d" % len(ai_items))
-    check("annotations 返回的 ai 项带 annotation_id", all(it.get("annotation_id") for it in ai_items))
+    check("annotations 返回新 AI 项", len(ai_items) == 1, "got %d" % len(ai_items))
+    check("annotations 的 ai 项带 annotation_id", all(it.get("annotation_id") for it in ai_items))
 
 
 # =========================================================================== #

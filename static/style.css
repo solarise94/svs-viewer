@@ -2019,6 +2019,53 @@ button {
   display: inline-block;
 }
 .ai-chat-sys.snapshot:hover { background: rgba(0, 229, 255, 0.16); }
+
+/* 观察卡 / 判读卡（任务1：把原始 JSON 参数改成友好卡片）
+   贴合现有 Apple HIG 变量：圆角用 --r-panel，边框用 --separator-weak，
+   标题色用 --text，正文用 --text-2，备注用 --text-3。 */
+.ai-card {
+  margin: 4px 0;
+  padding: 7px 10px;
+  border-radius: var(--r-panel);
+  border: 0.5px solid var(--separator-strong);
+  background: var(--hover);
+  animation: ai-fade-in 0.18s ease;
+  word-break: break-word;
+}
+.ai-card .ai-card-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.4;
+}
+.ai-card .ai-card-body {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+  margin-top: 3px;
+  white-space: pre-wrap;
+}
+.ai-card .ai-card-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+/* 观察卡：左侧细色条（青系，与 snapshot 同色系，区别于 annotation 的金） */
+.ai-card.observation {
+  border-left: 3px solid #00B8C4;
+  background: rgba(0, 184, 196, 0.06);
+}
+/* 判读卡：成功色（绿），状态明确 */
+.ai-card.review {
+  border-left: 3px solid #28a745;
+  background: rgba(40, 167, 69, 0.06);
+}
+.ai-card.review .ai-card-title { color: #1a7d34; }
+/* fork 对话流里卡片更紧凑 */
+.fork-chat-stream .ai-card { padding: 5px 8px; margin: 3px 0; }
+.fork-chat-stream .ai-card .ai-card-title { font-size: 12px; }
+.fork-chat-stream .ai-card .ai-card-body { font-size: 11.5px; }
 /* fork 对话流里复用同样的气泡（容器更窄） */
 .fork-chat-stream .ai-chat-bubble { font-size: 12px; max-width: 92%; padding: 5px 8px; }
 

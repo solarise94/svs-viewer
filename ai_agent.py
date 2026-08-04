@@ -26,6 +26,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
+import ai_protocol
+
 
 # =========================================================================== #
 # AgentState：当前视口状态（level-0 坐标 + 放大信息）
@@ -462,15 +464,6 @@ def run_agent(initial_messages: List[Dict[str, Any]],
             runner.emit_event("agent_error", {"error": "无法读取切片尺寸"})
             runner.mark_error()
             return
-        if api_protocol == "anthropic":
-            # 暂未支持 Anthropic Messages API 直连：工具 schema 转换 / messages 格式 /
-            # image base64 source block / x-api-key+anthropic-version header 均未适配。
-            # 请改用 OpenAI 兼容端点（api_protocol=openai）。完整 anthropic 适配列为后续。
-            runner.emit_event("agent_error", {
-                "error": "暂未支持 anthropic 直连，请在配置里把 api_protocol 改回 openai"
-                         "（或使用 OpenAI 兼容端点）"})
-            runner.mark_error()
-            return
 
         st = initial_state
         # 初始 canonical 上下文（fresh 时 app 已把它写进 session？没有——fresh 的
@@ -485,11 +478,9 @@ def run_agent(initial_messages: List[Dict[str, Any]],
         except Exception:
             pass
 
-        url = base_url + "/chat/completions"
-        headers = {
-            "Authorization": "Bearer " + api_key,
-            "Content-Type": "application/json",
-        }
+        # 模型调用按协议分流（openai / anthropic）由 ai_protocol.post_model 统一处理：
+        # anthropic 在该层完成 messages/tools/image 转换与响应归一，run_agent 下游
+        # 只认 OpenAI 形态的 choice/message/tool_calls（任务3：协议完整适配）。
         tools = tools_for_kind(kind)
         finished = False
 
@@ -512,13 +503,6 @@ def run_agent(initial_messages: List[Dict[str, Any]],
                 runner.mark_error()
                 return
 
-            req_body = {
-                "model": model,
-                "messages": request_messages,
-                "tools": tools,
-                "max_tokens": max_tokens,
-            }
-
             # 超窗报错（HTTP 400 context_length_exceeded / 各端点措辞）→
             # 强制执行一次 compact 后重新物化并重试该次调用（§3.6 兜底）。
             # 瞬时错误（SSL 断连/超时/429/5xx）→ 有限退避重试（网络抖动，尤
@@ -528,9 +512,11 @@ def run_agent(initial_messages: List[Dict[str, Any]],
             max_transient = 3  # 瞬时错误最多重试 3 次（退避 2s/4s/8s）
             while True:
                 try:
-                    resp = requests.post(url, headers=headers, json=req_body, timeout=120)
-                    resp.raise_for_status()
-                    data = resp.json()
+                    # post_model 内部按 api_protocol 分流（openai/anthropic），
+                    # anthropic 完成转换后归一回 OpenAI 形态，下游无感知。
+                    data = ai_protocol.post_model(
+                        base_url, api_key, model, max_tokens,
+                        api_protocol, request_messages, tools, timeout=120)
                     break
                 except Exception as e:
                     if not compact_retried and _is_context_exceeded(e):
@@ -540,7 +526,6 @@ def run_agent(initial_messages: List[Dict[str, Any]],
                         try:
                             runner.force_compact(reason="context_length_exceeded")
                             request_messages = runner.materialize_request_messages()
-                            req_body["messages"] = request_messages
                         except Exception as ce:  # noqa: BLE001
                             # compact 本身失败（fencing 失守/异常）→ 按原错误终止
                             runner.emit_event("agent_error", {"error": "调用模型失败：{}".format(e),
@@ -753,7 +738,13 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
             "ts": time.time(),
         }
         runner.add_observation(obs)
-        runner.emit_event("observation", {"label": label, "note": note})
+        # payload 带 label/note/no_annotation_reason/bbox：前端渲染成"观察卡"
+        # （§7.2），不显示 snapshot_id 等内部 id。
+        runner.emit_event("observation", {
+            "label": label, "note": note,
+            "no_annotation_reason": obs.get("no_annotation_reason") or "",
+            "bbox": obs.get("bbox") or {},
+        })
         return "已记录观察：{}".format(label), False
 
     if name == "create_annotation":

@@ -261,9 +261,9 @@
           </label>
           <label class="ai-field">
             <span>协议</span>
-            <select id="ai-api-protocol" title="openai 走 /chat/completions；anthropic 直连暂未支持">
+            <select id="ai-api-protocol" title="openai 走 /chat/completions；anthropic 直连 /v1/messages">
               <option value="openai">openai（兼容端点）</option>
-              <option value="anthropic">anthropic（暂未支持）</option>
+              <option value="anthropic">anthropic（直连）</option>
             </select>
           </label>
           <!-- 高级调优参数（折叠，§8.1，非必须） -->
@@ -320,6 +320,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260803fix"></script>
+  <script src="/static/app.js?v=20260803cards"></script>
 </body>
 </html>
