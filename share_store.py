@@ -179,61 +179,11 @@ def _copy_empty():
 # 按现有顺序赋递增初值）、revision=1、source（旧数据安全默认 human）、
 # deleted=false；并初始化 change_seq_by_slide 全局计数器。
 #
-# source 修正（#4）：迁移前由 AI 落的标注（走 admin token、note 是模型给的
-# 描述、label 形如"可疑区域1-…"）此前被一刀切默认成 human，导致前端 💬 不渲染。
-# 这里对「高置信是 AI 落标」的旧 ROI 把 source 改回 ai（见 _looks_like_legacy_ai）。
+# source 不再用启发式判据猜（#4 后续）：AI 标注自本版起在落标时显式写
+# source="ai"（add_roi 的 source 参数），新数据天然带正确来源；旧数据一律
+# human，不做"看起来像 AI"的猜测修正。
 # --------------------------------------------------------------------------- #
-# 已知人工标注会出现在 label 字段的取值（迁移前人工标注 label=标注人/标签名）
-_HUMAN_LABEL_KNOWN = {"管理员", "browser_admin", "admin"}
 
-
-def _looks_like_legacy_ai(roi):
-    """保守判别一条旧 ROI 是否「迁移前由 AI 落的标注」（#4 数据修正）。
-
-    背景：迁移前 AI 落标走 admin token（无 visitor），note 是模型给的描述性判读，
-    label 是模型起的标题（通常以"可疑区域"开头或含典型 AI 措辞）。人工标注同样
-    走 admin token，但 label 是标注人/标签名（如"管理员"、用户名），note 可空。
-
-    判据（全部满足才判 ai，宁缺毋滥——只纠正高置信的 AI 落标，绝不误伤人工标注）：
-      1. token == "admin" 且 visitor 为空（AI 落标无访客）；
-      2. note 非空（模型总会写镜下所见）；
-      3. label 形如 AI 起的标题——满足下列任一：
-           a) label 以"可疑区域"开头（生产 AI 落标特征）；
-           b) label 含典型 AI 措辞（"可疑"/"病变"/"纤维化"/"色素"/"浸润"/"增生"/
-              "异型"/"坏死"/"肉芽肿"/"结节"等病理判读词）；
-           c) label 不是已知人工标签（"管理员"/"browser_admin"/"admin"），且
-              label 与 note 都较长、描述性强（label > 6 字符且 note > 12 字符）。
-
-    返回 True 表示判为 AI；返回 False 视为人工（保持 human 默认，不误伤）。
-    """
-    if not isinstance(roi, dict):
-        return False
-    if roi.get("token") != ADMIN_TOKEN:
-        return False
-    visitor = (roi.get("visitor") or "")
-    if visitor != "":
-        return False
-    note = (roi.get("note") or "").strip()
-    if not note:
-        return False
-    label = (roi.get("label") or "").strip()
-    if not label:
-        return False
-    # (a) 生产 AI 落标典型 label 前缀
-    if label.startswith("可疑区域"):
-        return True
-    # (b) label 含病理判读典型措辞
-    ai_markers = ("可疑", "病变", "纤维化", "色素", "浸润", "增生", "异型",
-                  "坏死", "肉芽肿", "结节", "癌", "肿瘤", "炎细胞", "核分裂")
-    for kw in ai_markers:
-        if kw in label:
-            return True
-    # (c) 不是已知人工标签 + 描述性强（兜底，仍偏保守）
-    if label in _HUMAN_LABEL_KNOWN:
-        return False
-    if len(label) > 6 and len(note) > 12:
-        return True
-    return False
 
 
 def _ensure_roi_identity(data):
@@ -262,15 +212,9 @@ def _ensure_roi_identity(data):
             roi["revision"] = 1
             migrated = True
         if roi.get("source") is None:
-            # 缺省：高置信是 AI 落标的旧标注判为 ai（#4），其余保守判 human。
-            # 旧数据若已显式带 source（无论 ai/human）一律尊重原值，不覆盖。
-            roi["source"] = "ai" if _looks_like_legacy_ai(roi) else "human"
-            migrated = True
-        elif roi.get("source") == "human" and _looks_like_legacy_ai(roi):
-            # 修正历史：此前的迁移把 AI 落标误标成 human（#4 根因）。仅对高置信
-            # 是 AI 落标的旧 ROI 改回 ai；幂等（改完 source=ai 后不再进此分支）。
-            # 安全：判据保守（见 _looks_like_legacy_ai），不会误伤人工标注。
-            roi["source"] = "ai"
+            # 缺省：旧标注一律 human（不再用启发式判据猜 AI 来源——AI 标注
+            # 自本版起在落标时显式写 source="ai"，新数据天然带正确来源）。
+            roi["source"] = "human"
             migrated = True
         if roi.get("deleted") is None:
             roi["deleted"] = False
