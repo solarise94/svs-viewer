@@ -114,7 +114,13 @@ def _is_finite_num(v):
 
 
 def _load_locked(f):
-    """在已锁定的文件对象上读取并解析 JSON；损坏则备份重建。"""
+    """在已锁定的文件对象上读取并解析 JSON；损坏则备份重建。
+
+    会做存量 ROI 迁移（_ensure_roi_identity）。若迁移改动数据，本次临界区的
+    迁移后 dict 会缓存到 f._svs_migrated_data；_with_lock 在 fn 结束后若发现
+    fn 自身未保存（缓存未被消费）且 fn 未显式写盘，则补一次落盘，保证读路径
+    返回的迁移值（annotation_id/source 等）下次落盘不丢。迁移本身幂等。
+    """
     f.seek(0)
     raw = f.read()
     if not raw:
@@ -142,7 +148,10 @@ def _load_locked(f):
         if not isinstance(data["change_seq_by_slide"], dict):
             data["change_seq_by_slide"] = {}
         # 存量 ROI 一次性迁移（补 annotation_id/change_seq/revision/source/deleted）
-        _ensure_roi_identity(data)
+        # 迁移若改动数据，缓存给 _with_lock 用于补落盘
+        changed = _ensure_roi_identity(data)
+        if changed:
+            f._svs_migrated_data = data
         return data
     except (json.JSONDecodeError, ValueError):
         # 损坏：备份后重建
@@ -169,7 +178,64 @@ def _copy_empty():
 # fork 根键。一次性迁移补齐：annotation_id(UUID)、change_seq（切片级全局单调，
 # 按现有顺序赋递增初值）、revision=1、source（旧数据安全默认 human）、
 # deleted=false；并初始化 change_seq_by_slide 全局计数器。
+#
+# source 修正（#4）：迁移前由 AI 落的标注（走 admin token、note 是模型给的
+# 描述、label 形如"可疑区域1-…"）此前被一刀切默认成 human，导致前端 💬 不渲染。
+# 这里对「高置信是 AI 落标」的旧 ROI 把 source 改回 ai（见 _looks_like_legacy_ai）。
 # --------------------------------------------------------------------------- #
+# 已知人工标注会出现在 label 字段的取值（迁移前人工标注 label=标注人/标签名）
+_HUMAN_LABEL_KNOWN = {"管理员", "browser_admin", "admin"}
+
+
+def _looks_like_legacy_ai(roi):
+    """保守判别一条旧 ROI 是否「迁移前由 AI 落的标注」（#4 数据修正）。
+
+    背景：迁移前 AI 落标走 admin token（无 visitor），note 是模型给的描述性判读，
+    label 是模型起的标题（通常以"可疑区域"开头或含典型 AI 措辞）。人工标注同样
+    走 admin token，但 label 是标注人/标签名（如"管理员"、用户名），note 可空。
+
+    判据（全部满足才判 ai，宁缺毋滥——只纠正高置信的 AI 落标，绝不误伤人工标注）：
+      1. token == "admin" 且 visitor 为空（AI 落标无访客）；
+      2. note 非空（模型总会写镜下所见）；
+      3. label 形如 AI 起的标题——满足下列任一：
+           a) label 以"可疑区域"开头（生产 AI 落标特征）；
+           b) label 含典型 AI 措辞（"可疑"/"病变"/"纤维化"/"色素"/"浸润"/"增生"/
+              "异型"/"坏死"/"肉芽肿"/"结节"等病理判读词）；
+           c) label 不是已知人工标签（"管理员"/"browser_admin"/"admin"），且
+              label 与 note 都较长、描述性强（label > 6 字符且 note > 12 字符）。
+
+    返回 True 表示判为 AI；返回 False 视为人工（保持 human 默认，不误伤）。
+    """
+    if not isinstance(roi, dict):
+        return False
+    if roi.get("token") != ADMIN_TOKEN:
+        return False
+    visitor = (roi.get("visitor") or "")
+    if visitor != "":
+        return False
+    note = (roi.get("note") or "").strip()
+    if not note:
+        return False
+    label = (roi.get("label") or "").strip()
+    if not label:
+        return False
+    # (a) 生产 AI 落标典型 label 前缀
+    if label.startswith("可疑区域"):
+        return True
+    # (b) label 含病理判读典型措辞
+    ai_markers = ("可疑", "病变", "纤维化", "色素", "浸润", "增生", "异型",
+                  "坏死", "肉芽肿", "结节", "癌", "肿瘤", "炎细胞", "核分裂")
+    for kw in ai_markers:
+        if kw in label:
+            return True
+    # (c) 不是已知人工标签 + 描述性强（兜底，仍偏保守）
+    if label in _HUMAN_LABEL_KNOWN:
+        return False
+    if len(label) > 6 and len(note) > 12:
+        return True
+    return False
+
+
 def _ensure_roi_identity(data):
     """把 data（已锁定）中的存量 ROI 一次性补齐稳定 ID / 变更字段。
 
@@ -196,8 +262,15 @@ def _ensure_roi_identity(data):
             roi["revision"] = 1
             migrated = True
         if roi.get("source") is None:
-            # 缺省安全地默认 human（历史标注非 AI 落标）
-            roi["source"] = "human"
+            # 缺省：高置信是 AI 落标的旧标注判为 ai（#4），其余保守判 human。
+            # 旧数据若已显式带 source（无论 ai/human）一律尊重原值，不覆盖。
+            roi["source"] = "ai" if _looks_like_legacy_ai(roi) else "human"
+            migrated = True
+        elif roi.get("source") == "human" and _looks_like_legacy_ai(roi):
+            # 修正历史：此前的迁移把 AI 落标误标成 human（#4 根因）。仅对高置信
+            # 是 AI 落标的旧 ROI 改回 ai；幂等（改完 source=ai 后不再进此分支）。
+            # 安全：判据保守（见 _looks_like_legacy_ai），不会误伤人工标注。
+            roi["source"] = "ai"
             migrated = True
         if roi.get("deleted") is None:
             roi["deleted"] = False
@@ -255,12 +328,18 @@ def _visible(data):
 
 
 def _save_locked(f, data):
-    """在已锁定的文件对象上写入 JSON（先截断）。"""
+    """在已锁定的文件对象上写入 JSON（先截断）。
+
+    fn 自身已写盘时，清掉 _with_lock 的迁移补落盘缓存（避免用过期快照覆盖）。
+    """
     f.seek(0)
     f.truncate()
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.flush()
     os.fsync(f.fileno())
+    # fn 已落盘 → 取消 _with_lock 末尾的迁移补落盘
+    if hasattr(f, "_svs_migrated_data"):
+        f._svs_migrated_data = None
 
 
 def _with_lock(mode, fn):
@@ -268,14 +347,26 @@ def _with_lock(mode, fn):
 
     mode 为 'r+'（读写，要求文件已存在；不存在则先创建）或 'w+'。
     返回 fn 的返回值。
+
+    若本次 _load_locked 触发了存量 ROI 迁移，而 fn 自身未显式写盘（只读路径如
+    list_rois / annotations_by_slide），这里补一次保存，让迁移结果落盘——读路径
+    返回的 annotation_id/source 立即可被前端使用，下次任何写自然带上迁移后格式。
+    迁移本身幂等（已补字段的 ROI 不再改），重复读不会重复落盘。
     """
     # 确保文件存在
     if not SHARE_FILE.exists():
         SHARE_FILE.touch()
     with open(SHARE_FILE, mode, encoding="utf-8") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        migrated_data = None
         try:
-            return fn(f)
+            ret = fn(f)
+            # 若迁移发生且 fn 未消费（未清缓存），补落盘
+            migrated_data = getattr(f, "_svs_migrated_data", None)
+            if migrated_data is not None:
+                _save_locked(f, migrated_data)
+                f._svs_migrated_data = None
+            return ret
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 

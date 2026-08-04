@@ -1825,6 +1825,33 @@ button {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-fill);
 }
+.ai-field select {
+  padding: 6px 8px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-btn);
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--text);
+}
+.ai-field select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-fill);
+}
+/* 高级调优折叠区（§8.1，默认收起） */
+.ai-advanced {
+  margin: 4px 0 8px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.ai-advanced > summary {
+  cursor: pointer;
+  padding: 2px 0;
+  list-style: none;
+}
+.ai-advanced > summary::-webkit-details-marker { display: none; }
+.ai-advanced > summary::before { content: "▸ "; }
+.ai-advanced[open] > summary::before { content: "▾ "; }
 .ai-config-actions {
   display: flex;
   align-items: center;
@@ -1945,6 +1972,55 @@ button {
   background: rgba(231, 76, 60, 0.1);
   border-left: 3px solid #e74c3c;
 }
+
+/* SMS 式聊天气泡（恢复会话 / fork 批注）：user 右、assistant 左、系统行灰小字 */
+.ai-chat-bubble {
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 7px 10px;
+  margin: 4px 0;
+  border-radius: 12px;
+  max-width: 88%;
+  word-break: break-word;
+  white-space: pre-wrap;
+  animation: ai-fade-in 0.18s ease;
+}
+.ai-chat-bubble.user {
+  margin-left: auto;
+  background: var(--accent-fill);
+  border: 0.5px solid var(--accent);
+  color: var(--text);
+  border-bottom-right-radius: 4px;
+}
+.ai-chat-bubble.assistant {
+  margin-right: auto;
+  background: var(--hover);
+  color: var(--text-2);
+  border: 0.5px solid var(--separator-weak);
+  border-bottom-left-radius: 4px;
+}
+.ai-chat-sys {
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 2px 6px;
+  margin: 2px 0;
+  color: var(--text-3);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  word-break: break-word;
+}
+.ai-chat-sys.tool {
+  color: var(--text-2);
+}
+.ai-chat-sys.snapshot {
+  color: #0099A8;
+  background: rgba(0, 229, 255, 0.08);
+  border-radius: var(--r-row);
+  cursor: pointer;
+  display: inline-block;
+}
+.ai-chat-sys.snapshot:hover { background: rgba(0, 229, 255, 0.16); }
+/* fork 对话流里复用同样的气泡（容器更窄） */
+.fork-chat-stream .ai-chat-bubble { font-size: 12px; max-width: 92%; padding: 5px 8px; }
 
 /* 手机端：AI 面板贴底显示 */
 @media (max-width: 768px) {

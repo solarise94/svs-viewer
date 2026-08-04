@@ -883,6 +883,92 @@ def _ai_config_path() -> Path:
     return _data_dir_for_secret() / "ai_config.json"
 
 
+# api_key 加密：磁盘存 Fernet 密文（前缀 "enc:"），读取时解密为明文供调用方使用。
+# 密钥单独持久化为 ai_secret.key（0600），与 flask_secret 同目录。明文旧配置
+# 自动迁移：读取时检测到明文 api_key 会加密重写落盘。
+try:
+    from cryptography.fernet import Fernet  # type: ignore
+    _HAS_FERNET = True
+except Exception:  # pragma: no cover - cryptography 通常已装
+    _HAS_FERNET = False
+
+
+def _ai_secret_path() -> Path:
+    return _data_dir_for_secret() / "ai_secret.key"
+
+
+_FERNET_PREFIX = "enc:"
+
+
+def _load_or_create_ai_secret() -> "Optional[object]":
+    """加载/生成 AI api_key 加密用的 Fernet 密钥（0600），返回 Fernet 或 None。
+
+    cryptography 不可用时返回 None（此时退化为明文存储，与旧行为一致，安全降级）。
+    gunicorn 多 worker 下用 fcntl 锁保证并发首次生成只写一次（同 flask_secret）。
+    """
+    if not _HAS_FERNET:
+        return None
+    p = _ai_secret_path()
+    data_dir = _data_dir_for_secret()
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    def _read_or_create_locked():
+        if p.is_file():
+            try:
+                raw = p.read_bytes().strip()
+                if raw:
+                    return Fernet(raw)
+            except Exception:
+                pass  # 损坏 → 重新生成（旧密文将无法解密，调用方会提示重填 key）
+        key = Fernet.generate_key()
+        p.write_bytes(key)
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        return Fernet(key)
+
+    try:
+        import fcntl
+        lock_file = data_dir / "ai_secret.lock"
+        with open(lock_file, "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                return _read_or_create_locked()
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        return _read_or_create_locked()
+
+
+def _encrypt_api_key(plain: str):
+    """加密明文 api_key 为 'enc:' 前缀的密文；Fernet 不可用时退化为明文。"""
+    if not plain:
+        return ""
+    f = _load_or_create_ai_secret()
+    if f is None:
+        return plain  # 降级明文（cryptography 缺失）
+    try:
+        return _FERNET_PREFIX + f.encrypt(plain.encode("utf-8")).decode("ascii")
+    except Exception:
+        return plain  # 加密失败不阻断保存
+
+
+def _decrypt_api_key(stored):
+    """解密磁盘上的 api_key 值（'enc:' 前缀→解密；否则视为明文原样返回）。"""
+    if not stored or not isinstance(stored, str):
+        return ""
+    if not stored.startswith(_FERNET_PREFIX):
+        return stored  # 明文（旧配置 / 降级）
+    f = _load_or_create_ai_secret()
+    if f is None:
+        return ""  # 密文但无法解密（密钥丢失/库缺失）
+    try:
+        return f.decrypt(stored[len(_FERNET_PREFIX):].encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""  # 密钥不匹配/损坏 → 当作未配置，提示用户重填
+
+
 def _mask_api_key(key: str) -> str:
     """api_key 掩码：前4 + **** + 后4；过短则全掩。"""
     if not key:
@@ -893,20 +979,38 @@ def _mask_api_key(key: str) -> str:
 
 
 def _load_ai_config() -> dict:
-    """读取 ai_config.json（0600）；不存在返回空 dict。"""
+    """读取 ai_config.json（0600）；不存在返回空 dict。
+
+    api_key 在磁盘上为加密密文（enc: 前缀），这里解密为明文返回，供调用方（agent、
+    校验）直接用。检测到明文 api_key（旧配置）时自动加密重写落盘（无缝迁移）。
+    其他字段（base_url/model/max_tokens/调优参数/api_protocol）原样返回。
+    """
     p = _ai_config_path()
     if not p.is_file():
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
     except Exception:
         return {}
+    stored = data.get("api_key") or ""
+    if stored and not stored.startswith(_FERNET_PREFIX) and _HAS_FERNET:
+        # 明文旧配置 → 加密重写（迁移）。失败则保留明文，不阻断读取。
+        enc = _encrypt_api_key(stored)
+        if enc and enc != stored:
+            data["api_key"] = enc
+            try:
+                _save_ai_config_raw(data)
+            except Exception:
+                pass
+    data["api_key"] = _decrypt_api_key(stored)
+    return data
 
 
-def _save_ai_config(cfg: dict) -> None:
-    """写 ai_config.json（0600）。api_key 不入日志。"""
+def _save_ai_config_raw(cfg: dict) -> None:
+    """写 ai_config.json（0600），不改动 api_key 字段（已按磁盘格式存好）。"""
     p = _ai_config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
@@ -914,6 +1018,19 @@ def _save_ai_config(cfg: dict) -> None:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, p)
+
+
+def _save_ai_config(cfg: dict) -> None:
+    """写 ai_config.json（0600）。
+
+    cfg["api_key"] 应为明文（调用方约定的内存形态）：非空且非已加密格式时加密后
+    落盘；已是 enc: 密文或空则原样写。api_key 不入日志。
+    """
+    out = dict(cfg)
+    key = out.get("api_key")
+    if isinstance(key, str) and key and not key.startswith(_FERNET_PREFIX):
+        out["api_key"] = _encrypt_api_key(key)
+    _save_ai_config_raw(out)
 
 
 @app.route("/api/slide/<name>/region", methods=["GET"])
@@ -1019,11 +1136,14 @@ def api_slide_region(name):
 
 @app.route("/api/ai/config", methods=["GET", "PUT"])
 def api_ai_config():
-    """读写 AI 配置（base_url/api_key/model/max_tokens + 会话调优参数）。
+    """读写 AI 配置（base_url/api_key/model/max_tokens/api_protocol + 会话调优参数）。
 
     GET：api_key 脱敏为 api_key_set:bool + 掩码（前4后4），不回显明文。
-    PUT：空串=清除 api_key；与掩码同值=不变；其他=覆盖。
-    api_key 不入日志。会话调优参数（§8.1）进 ai_config.json，缺省用文档默认。
+    PUT：空串=清除；与掩码同值=不变；其他=覆盖（明文进 → 加密落盘）。
+    api_key 加密存盘（Fernet），旧明文配置自动迁移。api_key 不入日志。
+    会话调优参数（§8.1）进 ai_config.json，缺省用文档默认。api_protocol 为
+    "openai"|"anthropic"（默认 openai）：anthropic 直连暂未支持，选了会在起跑
+    时给出明确报错（请用 OpenAI 兼容端点）。
     """
     if request.method == "GET":
         cfg = _load_ai_config()
@@ -1034,6 +1154,7 @@ def api_ai_config():
             "api_key_mask": _mask_api_key(key),
             "model": cfg.get("model") or "",
             "max_tokens": cfg.get("max_tokens") or 2048,
+            "api_protocol": cfg.get("api_protocol") or "openai",
         }
         for k, v in ai_session.DEFAULT_CONFIG.items():
             out[k] = cfg.get(k, v)
@@ -1051,6 +1172,12 @@ def api_ai_config():
             cfg["max_tokens"] = int(body.get("max_tokens"))
         except (TypeError, ValueError):
             return jsonify(error="max_tokens 需为整数"), 400
+    # api_protocol：openai | anthropic（默认 openai）
+    if "api_protocol" in body:
+        proto = str(body.get("api_protocol") or "").strip().lower()
+        if proto not in ("openai", "anthropic"):
+            return jsonify(error="api_protocol 仅支持 openai 或 anthropic"), 400
+        cfg["api_protocol"] = proto
     # 会话调优参数（数字类型，§8.1）
     for k in ai_session.DEFAULT_CONFIG:
         if k in body:
@@ -1058,7 +1185,7 @@ def api_ai_config():
                 cfg[k] = float(body[k]) if isinstance(body[k], float) else int(body[k])
             except (TypeError, ValueError):
                 return jsonify(error="{} 需为数值".format(k)), 400
-    # api_key：空串=清除；与掩码同值=不变；其他=覆盖
+    # api_key：空串=清除；与掩码同值=不变；其他=覆盖（明文 → _save_ai_config 加密）
     if "api_key" in body:
         new_key = body.get("api_key")
         if new_key is None:
@@ -1080,6 +1207,7 @@ def api_ai_config():
         "api_key_mask": _mask_api_key(key),
         "model": cfg.get("model") or "",
         "max_tokens": cfg.get("max_tokens") or 2048,
+        "api_protocol": cfg.get("api_protocol") or "openai",
     }
     for k, v in ai_session.DEFAULT_CONFIG.items():
         out[k] = cfg.get(k, v)

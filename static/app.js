@@ -61,7 +61,12 @@
   // ---------- AI 读片助手状态 ----------
   var aiPanelOpen = false;
   var aiOverlay = [];        // canvas 叠加：agent 的 bbox（goto/snapshot），青色虚线框
-  var aiConfig = null;       // {base_url, api_key_set, api_key_mask, model, max_tokens}
+  var aiConfig = null;       // {base_url, api_key_set, api_key_mask, model, max_tokens, ...}
+  // AI 判读区配色（#3）：overlay 半透明填充 + 描边；AI 落标（进标注库 source=ai）填充
+  // 颜色/透明度集中在此常量调，人工标注保持更淡（drawAnnoItem 内按 source 区分）。
+  var AI_OVERLAY_FILL = "rgba(0,229,255,0.10)";   // agent goto/snapshot 判读区填充
+  var AI_OVERLAY_STROKE = "#00E5FF";               // agent 判读区虚线描边
+  var AI_ANNO_FILL = "rgba(0,229,255,0.14)";       // 进标注库的 AI 标注填充（比人工略浓）
   var aiRunning = false;     // 是否有进行中的 run（同时只允一个）
   var aiAbortCtrl = null;    // AbortController，停止用
   var aiTextBubbleEl = null; // 当前 text_delta 增量气泡（append 用）
@@ -178,6 +183,14 @@
     aiBaseUrl: $("ai-base-url"),
     aiApiKey: $("ai-api-key"),
     aiModel: $("ai-model"),
+    aiMaxSteps: $("ai-max-steps"),
+    aiApiProtocol: $("ai-api-protocol"),
+    aiCtxWindow: $("ai-ctx-window"),
+    aiReserve: $("ai-reserve"),
+    aiSafetyMargin: $("ai-safety-margin"),
+    aiKeepRecent: $("ai-keep-recent"),
+    aiForkLimit: $("ai-fork-limit"),
+    aiLeaseTtl: $("ai-lease-ttl"),
     aiConfigSave: $("ai-config-save"),
     aiConfigHint: $("ai-config-hint"),
     aiTask: $("ai-task"),
@@ -1661,7 +1674,7 @@
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
-    // AI overlay（agent 的 goto/snapshot bbox）：青色虚线框，区别于人工标注
+    // AI overlay（agent 的 goto/snapshot bbox）：青色虚线框 + 半透明填充，区别于人工标注
     if (hasAiOverlay) {
       aiOverlay.forEach(function (bb) {
         var tl = imgToCanvas(bb.x, bb.y);
@@ -1669,8 +1682,11 @@
         var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
         var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
         annoCtx.save();
+        // 半透明青色填充：判读区更醒目（#3），颜色/透明度集中在此常量调
+        annoCtx.fillStyle = AI_OVERLAY_FILL;
+        annoCtx.fillRect(x, y, w, h);
         annoCtx.lineWidth = 2;
-        annoCtx.strokeStyle = "#00E5FF";
+        annoCtx.strokeStyle = AI_OVERLAY_STROKE;
         annoCtx.setLineDash([6, 4]);
         annoCtx.strokeRect(x, y, w, h);
         annoCtx.setLineDash([]);
@@ -1729,11 +1745,16 @@
     var typ = it.type || "rect";
     var hlStroke = selected ? "#007AFF" : null;
     var lbl = showText ? it.label : null;
+    // AI 落标（进标注库 source=ai）给半透明青色填充，区别于人工标注（#3）
+    var isAi = (it.source === "ai");
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
       var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
+      // 半透明填充：AI 标注青色（更醒目），人工标注用 label 哈希淡色
+      annoCtx.fillStyle = isAi ? AI_ANNO_FILL : (color.fill || "rgba(0,0,0,0)");
+      annoCtx.fillRect(x, y, w, h);
       if (hlStroke) {
         annoCtx.lineWidth = 6;
         annoCtx.strokeStyle = hlStroke;
@@ -3097,6 +3118,7 @@
         els.aiApiKey.value = aiConfig.api_key_mask;
         els.aiApiKey.placeholder = "与掩码同值=不变，清空=删除";
       }
+      fillAiTuningFields();
     });
     els.aiStartBtn.addEventListener("click", startAiRun);
     els.aiContinueBtn.addEventListener("click", continueAiRun);
@@ -3140,7 +3162,23 @@
       // 回填已知的非敏感字段
       els.aiBaseUrl.value = aiConfig.base_url || "";
       els.aiModel.value = aiConfig.model || "";
+      fillAiTuningFields();
     }
+  }
+
+  // 把调优参数（步数上限/协议/高级区）回填到表单（用 aiConfig 当前值或文档默认）
+  function fillAiTuningFields() {
+    if (!aiConfig) return;
+    els.aiMaxSteps.value = aiConfig.max_steps != null ? aiConfig.max_steps : 50;
+    if (els.aiApiProtocol) {
+      els.aiApiProtocol.value = aiConfig.api_protocol || "openai";
+    }
+    if (els.aiCtxWindow) els.aiCtxWindow.value = aiConfig.context_window_tokens != null ? aiConfig.context_window_tokens : "";
+    if (els.aiReserve) els.aiReserve.value = aiConfig.reserve_tokens != null ? aiConfig.reserve_tokens : "";
+    if (els.aiSafetyMargin) els.aiSafetyMargin.value = aiConfig.safety_margin != null ? aiConfig.safety_margin : "";
+    if (els.aiKeepRecent) els.aiKeepRecent.value = aiConfig.keep_recent_tokens != null ? aiConfig.keep_recent_tokens : "";
+    if (els.aiForkLimit) els.aiForkLimit.value = aiConfig.fork_active_limit != null ? aiConfig.fork_active_limit : "";
+    if (els.aiLeaseTtl) els.aiLeaseTtl.value = aiConfig.lease_ttl != null ? aiConfig.lease_ttl : "";
   }
 
   // 保存配置（PUT /api/ai/config）
@@ -3152,6 +3190,29 @@
     var keyVal = els.aiApiKey.value;
     // 空串或与掩码同值都不传（后端按规则处理）；这里显式传让后端判断
     if (keyVal !== "") { payload.api_key = keyVal; }
+    // 步数上限（必填项）
+    var steps = parseInt(els.aiMaxSteps.value, 10);
+    if (isNaN(steps) || steps < 1) {
+      toast("步数上限需为 ≥1 的整数", "error");
+      els.aiMaxSteps.focus();
+      return;
+    }
+    payload.max_steps = steps;
+    // 协议
+    if (els.aiApiProtocol) { payload.api_protocol = els.aiApiProtocol.value || "openai"; }
+    // 高级调优参数（填了才提交，后端校验数值）
+    var advFields = [
+      ["context_window_tokens", els.aiCtxWindow],
+      ["reserve_tokens", els.aiReserve],
+      ["safety_margin", els.aiSafetyMargin],
+      ["keep_recent_tokens", els.aiKeepRecent],
+      ["fork_active_limit", els.aiForkLimit],
+      ["lease_ttl", els.aiLeaseTtl],
+    ];
+    advFields.forEach(function (pair) {
+      var val = pair[1] ? pair[1].value.trim() : "";
+      if (val !== "") { payload[pair[0]] = Number(val); }
+    });
     els.aiConfigHint.textContent = "保存中…";
     els.aiConfigSave.disabled = true;
     apiFetch("/api/ai/config", {
@@ -3383,6 +3444,31 @@
     handleAiEvent(eventType, payload);
   }
 
+  // GET session detail，把脱敏 transcript 渲染成 SMS 聊天气泡（#1）。
+  // container=主 AI 轨迹 或 fork 对话流；opts 透传给 renderAiTranscript。
+  function loadAndRenderTranscript(sessionId, container, opts) {
+    if (!sessionId || !container) return Promise.resolve();
+    return apiFetch("/api/ai/session/" + encodeURIComponent(sessionId))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var s = data && data.session;
+        var t = (data && data.transcript) || [];
+        // 清空容器里的旧内容（保留 fork 头部/输入框——只清 stream 区）
+        container.innerHTML = "";
+        if (t && t.length) {
+          renderAiTranscript(t, { container: container, emphasis: (opts && opts.emphasis) || "main" });
+        } else {
+          appendTraceRow("info", "（暂无对话记录）", container);
+        }
+        if (s && s.last_event_seq != null) {
+          aiLastSeq = Math.max(aiLastSeq, Number(s.last_event_seq) || 0);
+        }
+      })
+      .catch(function () {
+        appendTraceRow("info", "（对话记录加载失败）", container);
+      });
+  }
+
   // 断线重挂：页面刷新/重开切片后，GET session + 带 Last-Event-ID 重放进行中的 run
   function restoreAiSession() {
     if (!state.slide) return;
@@ -3398,16 +3484,25 @@
         if (!main) { setAiRunningUi(false); return; }
         aiSessionId = main.id;
         if (main.status === "running") {
-          // 有进行中的 run：重挂 SSE（带 last seq）
+          // 有进行中的 run：重挂 SSE（带 last seq），并把已有 transcript 渲染出来
           aiRunning = true;
           aiPaused = false;
           setAiRunningUi(true);
           appendTraceRow("info", "检测到进行中的读片，恢复事件流…");
+          loadAndRenderTranscript(main.id, els.aiTrace, { emphasis: "main" });
           attachAiStream(main.id);
-        } else if (main.status === "paused") {
-          aiPaused = true;
+        } else if (main.status === "paused" || main.status === "finished" || main.status === "error") {
+          aiPaused = (main.status === "paused");
           setAiRunningUi(false);
-          appendTraceRow("info", "上次读片已暂停（(已暂停，可继续)）");
+          // 渲染完整 SMS 式对话记录（#1）：paused/finished/error 都把历史铺出来
+          loadAndRenderTranscript(main.id, els.aiTrace, { emphasis: "main" });
+          if (main.status === "paused") {
+            appendTraceRow("info", "(已暂停，可继续)");
+          } else if (main.status === "finished") {
+            appendTraceRow("finished", "读片已完成");
+          } else {
+            appendTraceRow("error", "上次读片异常终止");
+          }
         }
       })
       .catch(function () { /* 静默 */ });
@@ -3565,30 +3660,52 @@
       });
   }
 
-  // 把 GET session 的脱敏 transcript（canonical messages）渲染成轨迹行
-  function renderAiTranscript(msgs) {
+  // 把 GET session 的脱敏 transcript（canonical messages）渲染成 SMS 聊天气泡。
+  // user → 右气泡；assistant 文本 → 左气泡；tool 调用（goto/snapshot/annotation）
+  // → 紧凑灰色系统行；image_ref → "📷 快照 @倍率"占位行（可点击跳 bbox）。
+  // opts.emphasis: "main"（跑批，工具行多，文本气泡次要）/ "fork"（问答，气泡为主）。
+  function renderAiTranscript(msgs, opts) {
+    var target = (opts && opts.container) || els.aiTrace;
+    opts = opts || {};
     for (var i = 0; i < msgs.length; i++) {
       var m = msgs[i] || {};
       var role = m.role || "";
       var text = messageText(m);
+      // system / spot_updated / spot_deleted 等 user-system 行：当作紧凑系统行
+      var isSystem = (role === "system") ||
+                     (role === "user" && (m.spot_updated || m.spot_deleted ||
+                                          /^spot_(updated|deleted)/.test(text)));
+      if (isSystem) {
+        if (text) appendSysRow(target, truncateStr(text, 400));
+        continue;
+      }
       if (role === "user") {
-        if (text) appendTraceRow("info", "🙋 " + truncateStr(text, 200));
+        appendChatBubble(target, "user", text);
       } else if (role === "assistant") {
+        // assistant 文本（无 tool_calls）→ 左气泡（fork 里是回答，main 里是总结）
         var tcs = m.tool_calls || [];
-        if (tcs.length) {
-          for (var j = 0; j < tcs.length; j++) {
-            var fn = tcs[j].function || {};
-            var nm = fn.name || "";
-            appendTraceRow("tool", "→ " + nm + " " + summarizeToolArgs(nm, fn.arguments));
-          }
-        } else if (text) {
-          appendTraceRow("finished", truncateStr(text, 300));
+        if (text) {
+          appendChatBubble(target, "assistant", text);
+        }
+        // tool_calls → 紧凑系统行（main 跑批里工具调用密集，不做成大气泡）
+        for (var j = 0; j < tcs.length; j++) {
+          var fn = tcs[j].function || {};
+          var nm = fn.name || "";
+          appendSysRow(target, "→ " + nm + " " + summarizeToolArgs(nm, fn.arguments), "tool");
         }
       } else if (role === "tool") {
-        var res = truncateStr(m.content, 160);
-        if (res) appendTraceRow("info", "⇠ " + res);
+        // tool 结果：含 image_ref 的渲染为 📷 快照行（可点跳 bbox）；纯文本渲染为紧凑行
+        var imgRef = findImageRef(m);
+        if (imgRef) {
+          appendSnapshotPlaceholder(target, imgRef);
+        }
+        var resText = messageText(m);
+        if (resText && !imgRef) {
+          appendSysRow(target, "⇠ " + truncateStr(resText, 200));
+        }
       }
     }
+    target.scrollTop = target.scrollHeight;
   }
 
   function messageText(m) {
@@ -3604,6 +3721,73 @@
       return out.join(" ");
     }
     return "";
+  }
+
+  // 取消息里第一个 image_ref（tool 结果的 snapshot 物化引用）
+  function findImageRef(m) {
+    var c = m.content;
+    if (Array.isArray(c)) {
+      for (var i = 0; i < c.length; i++) {
+        var p = c[i] || {};
+        if (p.type === "image_ref") return p;
+      }
+    }
+    return null;
+  }
+
+  // SMS 气泡：side="user"（右，accent 底）/ "assistant"（左，灰底）
+  function appendChatBubble(container, side, text) {
+    if (!text) return;
+    var empty = container.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    var row = document.createElement("div");
+    row.className = "ai-chat-bubble " + side;
+    row.textContent = text;
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return row;
+  }
+
+  // 紧凑系统行（灰色小字，工具调用 / tool 结果 / system / spot_*）
+  function appendSysRow(container, text, sub) {
+    if (!text) return null;
+    var empty = container.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    var row = document.createElement("div");
+    row.className = "ai-chat-sys" + (sub ? " " + sub : "");
+    row.textContent = text;
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return row;
+  }
+
+  // image_ref 占位行："📷 快照 @倍率"，可点击跳转 bbox
+  function appendSnapshotPlaceholder(container, imgRef) {
+    var empty = container.querySelector(".ai-trace-empty");
+    if (empty) empty.remove();
+    var row = document.createElement("div");
+    row.className = "ai-chat-sys snapshot";
+    var mag = imgRef.magnification;
+    var label = "📷 快照" + (mag ? " @" + fmtAiMag(mag) : "");
+    row.textContent = label;
+    row.title = "点击跳转到该区域";
+    var src = imgRef.src;
+    if (src && src.x != null && src.w) {
+      row.dataset.bbox = JSON.stringify(src);
+      row.style.cursor = "pointer";
+      row.addEventListener("click", function () {
+        try {
+          var bb = JSON.parse(row.dataset.bbox || "{}");
+          if (bb.x != null && viewer && viewer.viewport) {
+            viewer.viewport.fitBounds(
+              viewer.viewport.imageToViewportRectangle(bb.x, bb.y, bb.w, bb.h));
+          }
+        } catch (e) {}
+      });
+    }
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+    return row;
   }
 
   function summarizeToolArgs(name, argsStr) {
@@ -3732,6 +3916,27 @@
       document.body.appendChild(wrap);
     }
     input.focus();
+    // 恢复历史（#1）：若此标注已有 fork 会话，渲染完整 SMS 式对话记录
+    restoreForkTranscript(annotationId, stream);
+  }
+
+  // 查找该标注已有的 fork 会话并渲染历史 transcript（fork 打开时）
+  function restoreForkTranscript(annotationId, streamEl) {
+    if (!state.slide || !annotationId || !streamEl) return;
+    apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(state.slide.name))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var sessions = (data && data.sessions) || [];
+        var fork = null;
+        for (var i = 0; i < sessions.length; i++) {
+          if (sessions[i].kind === "fork" && sessions[i].annotation_id === annotationId) {
+            fork = sessions[i]; break;
+          }
+        }
+        if (!fork) return;  // 无历史，保留"就此标注提问…"
+        loadAndRenderTranscript(fork.id, streamEl, { emphasis: "fork" });
+      })
+      .catch(function () { /* 静默：渲染失败不影响提问 */ });
   }
 
   function sendForkQuestion(annotationId, question, streamEl, wrapEl) {

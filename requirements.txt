@@ -10,3 +10,5 @@ numpy
 gunicorn
 # AI 读片助手调用 OpenAI 兼容端点（chat/completions）用
 requests
+# AI api_key 加密存储（Fernet，机器本地密钥 ai_secret.key 0600）
+cryptography

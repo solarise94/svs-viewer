@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260802a" />
+  <link rel="stylesheet" href="/static/style.css?v=20260803fix" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -254,6 +254,34 @@
             <input id="ai-model" type="text" placeholder="gpt-4o"
                    autocomplete="off" />
           </label>
+          <label class="ai-field">
+            <span>步数上限</span>
+            <input id="ai-max-steps" type="number" min="1" max="500" placeholder="50"
+                   title="单轮步数上限（到顶暂停可继续）" autocomplete="off" />
+          </label>
+          <label class="ai-field">
+            <span>协议</span>
+            <select id="ai-api-protocol" title="openai 走 /chat/completions；anthropic 直连暂未支持">
+              <option value="openai">openai（兼容端点）</option>
+              <option value="anthropic">anthropic（暂未支持）</option>
+            </select>
+          </label>
+          <!-- 高级调优参数（折叠，§8.1，非必须） -->
+          <details class="ai-advanced">
+            <summary>高级调优</summary>
+            <label class="ai-field"><span>上下文窗口 tokens</span>
+              <input id="ai-ctx-window" type="number" min="10000" placeholder="272000" /></label>
+            <label class="ai-field"><span>摘要预留 tokens</span>
+              <input id="ai-reserve" type="number" min="0" placeholder="16000" /></label>
+            <label class="ai-field"><span>安全余量 tokens</span>
+              <input id="ai-safety-margin" type="number" min="0" placeholder="8192" /></label>
+            <label class="ai-field"><span>压缩后保留 tokens</span>
+              <input id="ai-keep-recent" type="number" min="1000" placeholder="20000" /></label>
+            <label class="ai-field"><span>批注活跃上限</span>
+              <input id="ai-fork-limit" type="number" min="1" placeholder="20" /></label>
+            <label class="ai-field"><span>租约 TTL（秒）</span>
+              <input id="ai-lease-ttl" type="number" min="30" placeholder="150" /></label>
+          </details>
           <div class="ai-config-actions">
             <button id="ai-config-save" class="btn primary small">保存配置</button>
             <span id="ai-config-hint" class="ai-config-hint"></span>
@@ -292,6 +320,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260803ai"></script>
+  <script src="/static/app.js?v=20260803fix"></script>
 </body>
 </html>

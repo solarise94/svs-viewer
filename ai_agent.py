@@ -420,6 +420,7 @@ def run_agent(initial_messages: List[Dict[str, Any]],
     api_key = cfg.get("api_key") or ""
     model = cfg.get("model") or "gpt-4o"
     max_tokens = int(cfg.get("max_tokens") or 2048)
+    api_protocol = str(cfg.get("api_protocol") or "openai").strip().lower()
 
     info = ctx.get("info") or {}
     width = int(info.get("width") or 0)
@@ -434,6 +435,15 @@ def run_agent(initial_messages: List[Dict[str, Any]],
             return
         if width <= 0 or height <= 0:
             runner.emit_event("agent_error", {"error": "无法读取切片尺寸"})
+            runner.mark_error()
+            return
+        if api_protocol == "anthropic":
+            # 暂未支持 Anthropic Messages API 直连：工具 schema 转换 / messages 格式 /
+            # image base64 source block / x-api-key+anthropic-version header 均未适配。
+            # 请改用 OpenAI 兼容端点（api_protocol=openai）。完整 anthropic 适配列为后续。
+            runner.emit_event("agent_error", {
+                "error": "暂未支持 anthropic 直连，请在配置里把 api_protocol 改回 openai"
+                         "（或使用 OpenAI 兼容端点）"})
             runner.mark_error()
             return
 
