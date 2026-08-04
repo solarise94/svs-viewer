@@ -562,11 +562,12 @@ def test_context_exceeded_retry_fail():
 
 
 def test_non_context_error_no_retry():
-    """非超窗错误（网络/5xx/鉴权）不触发 compact 重试，直接 agent_error。"""
-    print("== test_non_context_error_no_retry (非超窗错误直接终止) ==")
+    """瞬时错误（5xx/网络）退避重试；非瞬时（4xx 鉴权）不触发 compact、直接终止。"""
+    print("== test_non_context_error_no_retry (瞬时退避/非瞬时终止) ==")
     reset_all()
-    err500 = _http_error(500, "server error")
-    mock = MockModelRaise([err500])
+    # 401 鉴权错误：非瞬时、非超窗 → 不 compact、不重试，直接 agent_error
+    err401 = _http_error(401, "invalid api key")
+    mock = MockModelRaise([err401])
     import requests
     requests.post = mock
 
@@ -574,9 +575,39 @@ def test_non_context_error_no_retry():
     resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
     events = _parse_sse(resp.get_data(as_text=True))
     types = [t for (_, t, _) in events]
-    check("5xx 错误 agent_error", "agent_error" in types)
-    check("5xx 错误无 session_compacted", "session_compacted" not in types)
-    check("5xx 错误不重试（只 1 次调用）", len(mock.calls) == 1)
+    check("401 错误 agent_error", "agent_error" in types)
+    check("401 错误无 session_compacted", "session_compacted" not in types)
+    check("401 非瞬时不重试（只 1 次调用）", len(mock.calls) == 1)
+
+
+def test_transient_error_retry():
+    """瞬时错误（500）退避重试：首次 500 → agent_retrying → 重试成功 → finish。"""
+    print("== test_transient_error_retry (瞬时错误退避重试) ==")
+    reset_all()
+    _write_ai_config()
+    err500 = _http_error(500, "server error")
+    finish = _choice({"role": "assistant", "content": "完成",
+                      "tool_calls": [_tool_call("f", "finish", {"summary": "ok"})]},
+                     finish_reason="tool_calls")
+    # 第 1 次 500（瞬时）→ 退避重试 → 第 2 次正常 finish
+    mock = MockModelRaise([err500, finish])
+    import requests
+    requests.post = mock
+    import ai_agent as _ag
+    # 退避 sleep 加速（2s→0）
+    orig_sleep = _ag.time.sleep
+    _ag.time.sleep = lambda s: None
+    try:
+        client = app_mod.app.test_client()
+        resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+        events = _parse_sse(resp.get_data(as_text=True))
+    finally:
+        _ag.time.sleep = orig_sleep
+    types = [t for (_, t, _) in events]
+    check("瞬时 500 含 agent_retrying", "agent_retrying" in types)
+    check("瞬时 500 重试后 agent_finished", "agent_finished" in types)
+    check("瞬时 500 不 agent_error", "agent_error" not in types)
+    check("瞬时 500 共 2 次调用（1 失败+1 重试）", len(mock.calls) == 2)
 
 
 def test_max_steps_default_50():
@@ -679,6 +710,7 @@ if __name__ == "__main__":
     test_context_exceeded_retry()
     test_context_exceeded_retry_fail()
     test_non_context_error_no_retry()
+    test_transient_error_retry()
     test_max_steps_default_50()
     test_event_reset()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))

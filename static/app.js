@@ -3621,6 +3621,11 @@
       finishAiRun();
       return;
     }
+    if (type === "agent_retrying") {
+      // 瞬时错误（网络抖动）退避重试：提示但不终止（区别于 agent_error）
+      if (p && p.reason) appendTraceRow("info", "⟳ " + p.reason);
+      return;
+    }
     if (type === "agent_error") {
       clearThinkingRow();
       appendTraceRow("error", p.error || "出错");

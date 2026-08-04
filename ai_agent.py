@@ -398,6 +398,31 @@ def _is_context_exceeded(exc: Exception) -> bool:
     return False
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """判断模型调用异常是否"瞬时/可重试"（网络抖动、限流、网关临时错误）。
+
+    这类错误（尤其第三方转发端点的偶发 SSL 断连/502/429）不应直接终止 run，
+    有限退避重试即可恢复。与超窗（_is_context_exceeded，走 compact）互斥判断。
+    """
+    # 连接/超时/SSL 等传输层错误：典型偶发
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    # HTTP 状态码类：限流与网关临时错误可重试
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        code = getattr(resp, "status_code", None) if resp is not None else None
+        if code in (408, 409, 425, 429, 500, 502, 503, 504):
+            return True
+        return False
+    # 兜底：消息里出现 SSL/EOF/连接重置等传输特征
+    msg = str(exc).lower()
+    for kw in ("sslerror", "unexpected_eof", "eof while", "connection reset",
+               "connection aborted", "broken pipe", "timed out", "max retries"):
+        if kw in msg:
+            return True
+    return False
+
+
 def run_agent(initial_messages: List[Dict[str, Any]],
               initial_state: "AgentState",
               runner: Any,
@@ -496,8 +521,11 @@ def run_agent(initial_messages: List[Dict[str, Any]],
 
             # 超窗报错（HTTP 400 context_length_exceeded / 各端点措辞）→
             # 强制执行一次 compact 后重新物化并重试该次调用（§3.6 兜底）。
-            # 非超窗错误（网络/5xx/鉴权）不重试，直接终止。
+            # 瞬时错误（SSL 断连/超时/429/5xx）→ 有限退避重试（网络抖动，尤
+            # 其第三方转发端点偶发，不应直接终止）。其余错误（4xx 鉴权/参数）终止。
             compact_retried = False
+            transient_attempts = 0
+            max_transient = 3  # 瞬时错误最多重试 3 次（退避 2s/4s/8s）
             while True:
                 try:
                     resp = requests.post(url, headers=headers, json=req_body, timeout=120)
@@ -520,6 +548,17 @@ def run_agent(initial_messages: List[Dict[str, Any]],
                             runner.mark_error()
                             return
                         # 重试该次模型调用
+                        continue
+                    if _is_transient_error(e) and transient_attempts < max_transient:
+                        transient_attempts += 1
+                        delay = 2 ** transient_attempts  # 2/4/8s 退避
+                        runner.emit_event("agent_retrying", {
+                            "step": step, "attempt": transient_attempts,
+                            "max": max_transient, "delay": delay,
+                            "reason": "网络波动，{}s 后重试（{}/{}）".format(
+                                delay, transient_attempts, max_transient),
+                        })
+                        time.sleep(delay)
                         continue
                     runner.emit_event("agent_error", {"error": "调用模型失败：{}".format(e),
                                                       "step": step})
