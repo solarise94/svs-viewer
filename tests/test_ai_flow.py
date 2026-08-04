@@ -678,6 +678,71 @@ def test_event_reset():
     check("after_seq>=min_seq 无 event_reset", "event_reset" not in types2)
 
 
+def test_length_truncation_pauses():
+    """finish_reason=length（Anthropic max_tokens）不得 mark_finished，应 pause。"""
+    print("== test_length_truncation_pauses (截断 → paused) ==")
+    reset_all()
+    script = [
+        _choice({"role": "assistant", "content": "这是被截断的回答…", "tool_calls": []},
+                finish_reason="length"),
+    ]
+    mock = MockModel(script)
+    import requests
+    requests.post = mock
+
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("截断发 agent_paused", "agent_paused" in types)
+    check("截断不发 agent_finished", "agent_finished" not in types)
+    paused_payload = None
+    for (_, t, p) in events:
+        if t == "agent_paused":
+            paused_payload = p
+    check("paused payload reason=max_tokens",
+          paused_payload and paused_payload.get("reason") == "max_tokens")
+    sid = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid = p.get("session_id")
+    d = ai_session.read_session(sid)
+    check("截断会话终态 paused", d and d.get("status") == "paused")
+
+
+def test_snapshot_reviewed_has_no_annotation_reason():
+    """snapshot_reviewed 实时事件应带 no_annotation_reason（与历史恢复一致）。"""
+    print("== test_snapshot_reviewed_has_no_annotation_reason ==")
+    reset_all()
+    script = [
+        _choice({"role": "assistant", "content": "",
+                 "tool_calls": [
+                     _tool_call("s1", "snapshot", {"out_w": 512, "out_h": 512}),
+                     _tool_call("o1", "mark_observation",
+                                {"snapshot_id": "s1", "label": "正常",
+                                 "note": "未见异常", "no_annotation_reason": "炎症细胞"}),
+                     _tool_call("r1", "complete_snapshot_review",
+                                {"snapshot_id": "s1", "disposition": "no_annotation",
+                                 "summary": "无需标",
+                                 "no_annotation_reason": "仅见炎症细胞"}),
+                     _tool_call("f1", "finish", {"summary": "ok"})]}),
+    ]
+    mock = MockModel(script)
+    import requests
+    requests.post = mock
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    reviewed = [p for (_, t, p) in events if t == "snapshot_reviewed"]
+    check("有 snapshot_reviewed", len(reviewed) >= 1)
+    if reviewed:
+        p = reviewed[0] or {}
+        check("snapshot_reviewed 含 no_annotation_reason 字段",
+              "no_annotation_reason" in p)
+        check("snapshot_reviewed no_annotation_reason 值正确",
+              p.get("no_annotation_reason") == "仅见炎症细胞")
+
+
 def reset_all():
     """清空 share_store 与 ai_sessions。"""
     share_store.SHARE_FILE.unlink(missing_ok=True)
@@ -713,5 +778,7 @@ if __name__ == "__main__":
     test_transient_error_retry()
     test_max_steps_default_50()
     test_event_reset()
+    test_length_truncation_pauses()
+    test_snapshot_reviewed_has_no_annotation_reason()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

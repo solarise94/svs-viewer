@@ -254,7 +254,8 @@ def parse_anthropic_response(data: Dict[str, Any]) -> Dict[str, Any]:
 
     - content blocks 里 text → message.content；
     - tool_use → message.tool_calls（OpenAI 格式，arguments 序列化成字符串）；
-    - stop_reason → finish_reason（tool_use→tool_calls，end→stop，其余原样）。
+    - stop_reason → finish_reason（tool_use→tool_calls，end→stop，
+      max_tokens/model_context_window_exceeded→length）。
     run_agent 下游只认 OpenAI 的 choice/message，故这里做归一。
     """
     import json as _json
@@ -297,11 +298,18 @@ def parse_anthropic_response(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _anthropic_stop_to_openai(stop_reason: str, has_tool_calls: bool) -> str:
-    """Anthropic stop_reason → OpenAI finish_reason。"""
+    """Anthropic stop_reason → OpenAI finish_reason。
+
+    max_tokens / model_context_window_exceeded 必须映射为 length（截断），
+    不能当成普通 stop，否则下游会在无 tool_calls 时误 mark_finished。
+    参见 https://docs.anthropic.com/en/api/handling-stop-reasons
+    """
     sr = (stop_reason or "").lower()
     if sr == "tool_use" or sr == "tool_calls":
         return "tool_calls"
-    if sr in ("end_turn", "stop_sequence", "max_tokens", "stop"):
+    if sr in ("max_tokens", "model_context_window_exceeded"):
+        return "length"
+    if sr in ("end_turn", "stop_sequence", "stop"):
         return "stop"
     # 有 tool_use 但 stop_reason 缺失时也按 tool_calls
     return "tool_calls" if has_tool_calls else "stop"

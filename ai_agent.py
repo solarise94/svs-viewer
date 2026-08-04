@@ -558,12 +558,26 @@ def run_agent(initial_messages: List[Dict[str, Any]],
 
             msg = choice.get("message") or {}
             content_text = msg.get("content")
+            finish_reason = (choice.get("finish_reason") or "").lower()
 
             # 文本增量事件（仅在非纯文本结束时有意义）
             if isinstance(content_text, str) and content_text.strip():
                 runner.emit_event("text_delta", {"text": content_text})
 
             tool_calls = msg.get("tool_calls") or []
+
+            # 输出被截断（OpenAI length / Anthropic max_tokens）：不可当作正常结束，
+            # 也不执行可能不完整的 tool_calls；暂停以便继续或调高 max_tokens。
+            if finish_reason == "length":
+                tip = "模型输出被截断（达到 max_tokens）"
+                if tool_calls:
+                    tip += "，工具调用可能不完整"
+                tip += "，可继续生成或提高 max_tokens"
+                runner.emit_event("agent_paused", {
+                    "summary": tip, "can_continue": True, "reason": "max_tokens",
+                })
+                runner.pause()
+                return
 
             # 纯文本（无 tool_calls）
             if not tool_calls:
@@ -792,6 +806,7 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
         runner.emit_event("snapshot_reviewed", {
             "snapshot_id": snap_id, "disposition": disposition,
             "summary": args.get("summary") or "",
+            "no_annotation_reason": args.get("no_annotation_reason") or "",
         })
         return ("已关闭快照 {sid}（{disp}）。".format(sid=snap_id, disp=disposition)), False
 

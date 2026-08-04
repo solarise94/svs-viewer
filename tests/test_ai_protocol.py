@@ -219,10 +219,15 @@ def test_parse_response_tool_use():
 
 
 def test_parse_response_max_tokens():
-    print("== test_parse_response_max_tokens（max_tokens → stop）==")
+    print("== test_parse_response_max_tokens（max_tokens → length）==")
     out = ai_protocol.parse_anthropic_response({"content": [{"type": "text", "text": "x"}],
                                                 "stop_reason": "max_tokens"})
-    check("max_tokens → stop", out["choices"][0]["finish_reason"] == "stop")
+    check("max_tokens → length", out["choices"][0]["finish_reason"] == "length")
+    out2 = ai_protocol.parse_anthropic_response(
+        {"content": [{"type": "text", "text": "y"}],
+         "stop_reason": "model_context_window_exceeded"})
+    check("model_context_window_exceeded → length",
+          out2["choices"][0]["finish_reason"] == "length")
 
 
 # =========================================================================== #

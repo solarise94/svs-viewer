@@ -69,12 +69,12 @@
   var AI_ANNO_FILL = "rgba(0,229,255,0.14)";       // 进标注库的 AI 标注填充（比人工略浓）
   var aiRunning = false;     // 是否有进行中的 run（同时只允一个）
   var aiAbortCtrl = null;    // AbortController，停止用
-  var aiTextBubbleEl = null; // 当前 text_delta 增量气泡（append 用）
   var aiSessionId = null;    // 当前 main session id（events 里带）
-  var aiLastSeq = 0;         // 已消费的最大事件 seq（断线重挂用）
   var aiStreamCtrl = null;   // 断线重挂 SSE 流的 AbortController
   var aiPaused = false;      // 主 run 是否处于"已暂停，可继续"
-  var aiTraceTarget = null;  // fork 批注对话的 DOM 容器（非空时轨迹渲染到此）
+  var aiSlideEpoch = 0;      // 切片切换世代：过期异步响应一律丢弃
+  // 主会话轨迹渲染上下文（显式传入；lastSeq 仅服务 main，禁止被 fork 污染）
+  var mainAiCtx = { container: null, bubbleEl: null, thinkingEl: null, isFork: false, lastSeq: 0 };
 
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
@@ -363,18 +363,15 @@
     els.annoAllBtn.disabled = true;
     els.annoPanel.style.display = "none";
     annoPanelOpen = false;
-    // AI 助手：打开新切片时 enable 按钮、清空 overlay、关面板（保留配置）
+    // AI 助手：完整隔离上一张切片的会话 UI / SSE / 游标，再恢复本切片
     els.aiBtn.disabled = false;
     if (els.tbbMoreAi) els.tbbMoreAi.disabled = false;  // ⋯ 面板里的 AI 钮同步
-    aiOverlay = [];
-    redrawAnnoCanvas();
     syncAnnoAllBtns();
     state.showAnno = false;
     state.focusAnno = null;
-    // 恢复该切片的 main 会话状态（有 running 的则重挂 SSE）
-    aiSessionId = null;
-    aiPaused = false;
-    restoreAiSession();
+    var slideName = state.slide ? state.slide.name : null;
+    var epoch = resetAiForSlide();
+    if (slideName) restoreAiSession(slideName, epoch);
     if (state.slide) {
       // 管理员标注工具在任意打开的切片上可用（箭头/描图不依赖 mpp）
       els.annoArrowBtn.disabled = false;
@@ -3269,29 +3266,34 @@
     var task = (els.aiTask.value || "").trim();
     if (!task) { toast("请输入任务描述", "info"); els.aiTask.focus(); return; }
 
-    // 重置轨迹流
+    // 重置轨迹流，立即显示用户任务气泡
     resetAiTrace();
     aiRunning = true;
     aiPaused = false;
     setAiRunningUi(true);
     aiSessionId = null;
-    aiLastSeq = 0;
+    mainAiCtx.lastSeq = 0;
+    appendChatBubble(els.aiTrace, "user", task);
+    var slideName = state.slide.name;
+    var epoch = aiSlideEpoch;
 
     fetch("/api/ai/run?fresh=1", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slide: state.slide.name, task: task }),
+      body: JSON.stringify({ slide: slideName, task: task }),
       credentials: "same-origin",
     }).then(function (resp) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
       if (!resp.ok || !resp.body) {
         return resp.text().then(function (t) {
           throw new Error(t || ("HTTP " + resp.status));
         });
       }
-      pumpAiSse(resp.body.getReader());
+      pumpAiSse(resp.body.getReader(), slideName, epoch);
     }).catch(function (e) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
       toast("AI 运行失败: " + (e && e.message ? e.message : e), "error");
-      appendTraceRow("error", "AI 运行失败: " + (e && e.message ? e.message : e));
+      appendStatusRow(els.aiTrace, "error", "AI 运行失败: " + (e && e.message ? e.message : e));
       finishAiRun();
     });
   }
@@ -3307,20 +3309,24 @@
     aiRunning = true;
     aiPaused = false;
     setAiRunningUi(true);
-    appendTraceRow("info", "继续读片…");
+    appendStatusRow(els.aiTrace, "info", "继续读片…");
+    var slideName = state.slide.name;
+    var epoch = aiSlideEpoch;
     fetch("/api/ai/continue", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slide: state.slide.name }),
+      body: JSON.stringify({ slide: slideName }),
       credentials: "same-origin",
     }).then(function (resp) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
       if (!resp.ok || !resp.body) {
         return resp.text().then(function (t) { throw new Error(t || ("HTTP " + resp.status)); });
       }
-      pumpAiSse(resp.body.getReader());
+      pumpAiSse(resp.body.getReader(), slideName, epoch);
     }).catch(function (e) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
       toast("继续失败: " + (e && e.message ? e.message : e), "error");
-      appendTraceRow("error", "继续失败: " + (e && e.message ? e.message : e));
+      appendStatusRow(els.aiTrace, "error", "继续失败: " + (e && e.message ? e.message : e));
       finishAiRun();
     });
   }
@@ -3378,23 +3384,35 @@
     }
   }
 
-  // 通用 SSE 泵：解析帧 → handleAiEvent（同时推进 aiLastSeq）
-  function pumpAiSse(reader) {
+  // 通用 SSE 泵：解析帧 → handleAiEvent（同时推进 mainAiCtx.lastSeq）
+  // slideName/epoch 可选：切片切换后丢弃过期流。
+  function pumpAiSse(reader, slideName, epoch) {
     var decoder = new TextDecoder("utf-8");
     var buffer = "";
+    function stillCurrent() {
+      return slideName == null || epoch == null || isCurrentAiSlide(slideName, epoch);
+    }
     function pump() {
       return reader.read().then(function (result) {
+        if (!stillCurrent()) {
+          try { reader.cancel(); } catch (e) {}
+          return;
+        }
         if (result.done) {
           // 正常结束：若 run 是 paused 则保持按钮组
-          finishAiRun();
+          if (stillCurrent()) finishAiRun();
           return;
         }
         buffer += decoder.decode(result.value, { stream: true });
         var idx;
         while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          if (!stillCurrent()) {
+            try { reader.cancel(); } catch (e) {}
+            return;
+          }
           var frame = buffer.slice(0, idx);
           buffer = buffer.slice(idx + 2);
-          handleSseFrame(frame);
+          handleSseFrame(frame, slideName, epoch);
         }
         return pump();
       });
@@ -3403,7 +3421,8 @@
   }
 
   // 解析单条 SSE 帧（event:/data:/id: 行）
-  function handleSseFrame(frame) {
+  function handleSseFrame(frame, slideName, epoch) {
+    if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
     var eventType = null;
     var dataStr = "";
     var seq = null;
@@ -3431,287 +3450,364 @@
       if (dataStr) {
         try { rp = JSON.parse(dataStr); } catch (e) { rp = { raw: dataStr }; }
       }
-      if (seq != null) aiLastSeq = Math.max(aiLastSeq, seq);
-      handleAiEventReset(rp);
+      if (seq != null) mainAiCtx.lastSeq = Math.max(mainAiCtx.lastSeq || 0, seq);
+      handleAiEventReset(rp, slideName, epoch);
       return;
     }
     var payload = {};
     if (dataStr) {
       try { payload = JSON.parse(dataStr); } catch (e) { payload = { raw: dataStr }; }
     }
-    if (seq != null) aiLastSeq = Math.max(aiLastSeq, seq);
+    if (seq != null) mainAiCtx.lastSeq = Math.max(mainAiCtx.lastSeq || 0, seq);
     if (payload && payload.session_id) aiSessionId = payload.session_id;
     handleAiEvent(eventType, payload);
   }
 
+  // 切片切换时完整隔离 AI 主会话状态（DOM / 游标 / SSE / running）。
+  // 返回新 epoch，供 restoreAiSession 固定查询目标并丢弃过期响应。
+  function isCurrentAiSlide(slideName, epoch) {
+    return !!(state.slide && slideName && state.slide.name === slideName &&
+              epoch != null && epoch === aiSlideEpoch);
+  }
+
+  function resetAiForSlide() {
+    aiSlideEpoch += 1;
+    if (aiStreamCtrl) { try { aiStreamCtrl.abort(); } catch (e) {} }
+    if (aiAbortCtrl) { try { aiAbortCtrl.abort(); } catch (e) {} }
+    aiStreamCtrl = null;
+    aiAbortCtrl = null;
+    aiRunning = false;
+    aiPaused = false;
+    aiSessionId = null;
+    mainAiCtx.lastSeq = 0;
+    mainAiCtx.bubbleEl = null;
+    mainAiCtx.thinkingEl = null;
+    mainAiCtx.container = els.aiTrace;
+    aiOverlay = [];
+    if (els.aiTrace) {
+      els.aiTrace.innerHTML =
+        '<div class="ai-trace-empty">点击「开始」让 AI 读片。对话会显示在这里。</div>';
+    }
+    setAiRunningUi(false);
+    redrawAnnoCanvas();
+    return aiSlideEpoch;
+  }
+
   // GET session detail，把脱敏 transcript 渲染成 SMS 聊天气泡（#1）。
   // container=主 AI 轨迹 或 fork 对话流；opts 透传给 renderAiTranscript。
+  // opts.slideName + opts.epoch：主会话恢复时校验，过期响应不写 DOM。
   function loadAndRenderTranscript(sessionId, container, opts) {
     if (!sessionId || !container) return Promise.resolve();
+    opts = opts || {};
+    var slideName = opts.slideName;
+    var epoch = opts.epoch;
+    var isMain = !(opts.emphasis === "fork");
     return apiFetch("/api/ai/session/" + encodeURIComponent(sessionId))
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        if (isMain && slideName != null && !isCurrentAiSlide(slideName, epoch)) return;
         var s = data && data.session;
         var t = (data && data.transcript) || [];
         // 清空容器里的旧内容（保留 fork 头部/输入框——只清 stream 区）
         container.innerHTML = "";
         if (t && t.length) {
-          renderAiTranscript(t, { container: container, emphasis: (opts && opts.emphasis) || "main" });
+          renderAiTranscript(t, { container: container, emphasis: opts.emphasis || "main" });
         } else {
-          appendTraceRow("info", "（暂无对话记录）", container);
+          appendStatusRow(container, "info", "（暂无对话记录）");
         }
+        // 事件序号仅在单个 session 内有意义：fork 不得推进 main 游标
         if (s && s.last_event_seq != null) {
-          aiLastSeq = Math.max(aiLastSeq, Number(s.last_event_seq) || 0);
+          var seqN = Number(s.last_event_seq) || 0;
+          if (opts.emphasis === "fork") {
+            var fctx = forkTraceCtx(container);
+            fctx.lastSeq = Math.max(fctx.lastSeq || 0, seqN);
+          } else if (!slideName || isCurrentAiSlide(slideName, epoch)) {
+            mainAiCtx.lastSeq = Math.max(mainAiCtx.lastSeq || 0, seqN);
+          }
         }
       })
       .catch(function () {
-        appendTraceRow("info", "（对话记录加载失败）", container);
+        if (isMain && slideName != null && !isCurrentAiSlide(slideName, epoch)) return;
+        appendStatusRow(container, "info", "（对话记录加载失败）");
       });
   }
 
-  // 断线重挂：页面刷新/重开切片后，GET session + 带 Last-Event-ID 重放进行中的 run
-  function restoreAiSession() {
-    if (!state.slide) return;
+  // 断线重挂：页面刷新/重开切片后，GET session + 带 Last-Event-ID 重放进行中的 run。
+  // slideName/epoch 在调用时固定，异步回调必须校验仍为当前切片。
+  function restoreAiSession(slideName, epoch) {
+    if (!slideName) return;
+    if (epoch == null) epoch = aiSlideEpoch;
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) return;
-    apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(state.slide.name))
-      .then(function (r) { return r.json(); })
+    if (!isCurrentAiSlide(slideName, epoch)) return;
+    apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(slideName))
+      .then(function (r) {
+        if (!isCurrentAiSlide(slideName, epoch)) return null;
+        return r.json();
+      })
       .then(function (data) {
+        if (!data || !isCurrentAiSlide(slideName, epoch)) return;
         var sessions = (data && data.sessions) || [];
         var main = null;
         for (var i = 0; i < sessions.length; i++) {
           if (sessions[i].kind === "main") { main = sessions[i]; break; }
         }
         if (!main) { setAiRunningUi(false); return; }
+        if (!isCurrentAiSlide(slideName, epoch)) return;
         aiSessionId = main.id;
+        var txOpts = { emphasis: "main", slideName: slideName, epoch: epoch };
         if (main.status === "running") {
           // 有进行中的 run：重挂 SSE（带 last seq），并把已有 transcript 渲染出来
           aiRunning = true;
           aiPaused = false;
           setAiRunningUi(true);
-          appendTraceRow("info", "检测到进行中的读片，恢复事件流…");
-          loadAndRenderTranscript(main.id, els.aiTrace, { emphasis: "main" });
-          attachAiStream(main.id);
+          appendStatusRow(els.aiTrace, "info", "检测到进行中的读片，恢复事件流…");
+          loadAndRenderTranscript(main.id, els.aiTrace, txOpts);
+          attachAiStream(main.id, slideName, epoch);
         } else if (main.status === "paused" || main.status === "finished" || main.status === "error") {
           aiPaused = (main.status === "paused");
           setAiRunningUi(false);
-          // 渲染完整 SMS 式对话记录（#1）：paused/finished/error 都把历史铺出来
-          loadAndRenderTranscript(main.id, els.aiTrace, { emphasis: "main" });
-          if (main.status === "paused") {
-            appendTraceRow("info", "(已暂停，可继续)");
-          } else if (main.status === "finished") {
-            appendTraceRow("finished", "读片已完成");
-          } else {
-            appendTraceRow("error", "上次读片异常终止");
-          }
+          // 渲染完整 SMS 式对话记录：paused/finished/error 都把历史铺出来
+          loadAndRenderTranscript(main.id, els.aiTrace, txOpts).then(function () {
+            if (!isCurrentAiSlide(slideName, epoch)) return;
+            if (main.status === "paused") {
+              appendStatusRow(els.aiTrace, "paused", "(已暂停，可继续)");
+            } else if (main.status === "finished") {
+              appendStatusRow(els.aiTrace, "finished", "读片已完成");
+            } else {
+              appendStatusRow(els.aiTrace, "error", "上次读片异常终止");
+            }
+          });
         }
       })
-      .catch(function () { /* 静默 */ });
+      .catch(function () { /* 静默：过期/网络失败不影响切片 */ });
   }
 
-  function attachAiStream(sessionId) {
-    var url = "/api/ai/session/" + encodeURIComponent(sessionId) + "/stream?after_seq=" + aiLastSeq;
+  function attachAiStream(sessionId, slideName, epoch) {
+    if (slideName == null) slideName = state.slide && state.slide.name;
+    if (epoch == null) epoch = aiSlideEpoch;
+    if (!isCurrentAiSlide(slideName, epoch)) return;
+    var url = "/api/ai/session/" + encodeURIComponent(sessionId) + "/stream?after_seq=" + (mainAiCtx.lastSeq || 0);
     if (aiStreamCtrl) { try { aiStreamCtrl.abort(); } catch (e) {} }
     aiStreamCtrl = new AbortController();
     fetch(url, {
-      headers: { "Last-Event-ID": String(aiLastSeq || 0) },
+      headers: { "Last-Event-ID": String(mainAiCtx.lastSeq || 0) },
       signal: aiStreamCtrl.signal,
       credentials: "same-origin",
     }).then(function (resp) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
       if (!resp.ok || !resp.body) { throw new Error("HTTP " + resp.status); }
-      return pumpAiSse(resp.body.getReader());
+      return pumpAiSse(resp.body.getReader(), slideName, epoch);
     }).catch(function (e) {
       if (e && e.name === "AbortError") return;
+      if (!isCurrentAiSlide(slideName, epoch)) return;
       // 重挂失败：后台继续，稍后手动"继续"或刷新
       toast("事件流重挂失败", "error");
     });
   }
 
-  // 按 SSE 事件类型渲染轨迹流 + canvas overlay
-  function handleAiEvent(type, p) {
+  // 按 SSE 事件类型渲染轨迹流 + canvas overlay。
+  // ctx: {container, bubbleEl, thinkingEl, isFork} — 主/fork 必须显式传入，禁止全局目标。
+  function ensureAiCtx(ctx) {
+    if (ctx) {
+      if (!ctx.container) ctx.container = els.aiTrace;
+      return ctx;
+    }
+    if (!mainAiCtx.container) mainAiCtx.container = els.aiTrace;
+    return mainAiCtx;
+  }
+
+  function handleAiEvent(type, p, ctx) {
+    ctx = ensureAiCtx(ctx);
+    var container = ctx.container;
     if (type === "slide_opened") {
       if (p.viewport) {
         aiOverlay = [{ x: p.viewport.x, y: p.viewport.y, w: p.viewport.w, h: p.viewport.h,
                        magnification: "概览" }];
         redrawAnnoCanvas();
       }
-      appendTraceRow("info", "已打开切片 " + (p.slide || "") + "，开始读片…");
+      appendStatusRow(container, "info", "已打开切片 " + (p.slide || "") + "，开始读片…");
       return;
     }
     if (type === "session_resumed" || type === "fork_resumed" || type === "fork_created") {
-      appendTraceRow("info", (type === "fork_created" ? "批注对话已建立" : "会话已恢复"));
+      appendStatusRow(container, "info",
+        type === "fork_created" ? "批注对话已建立" : "会话已恢复");
       return;
     }
     if (type === "agent_thinking") {
-      setThinkingRow();
+      setThinkingRow(ctx);
       return;
     }
     if (type === "text_delta") {
-      appendTextBubble(p.text || "");
+      appendTextBubble(p.text || "", ctx);
       return;
     }
     if (type === "tool_started") {
-      clearThinkingRow();
+      clearThinkingRow(ctx);
       if (p.tool === "goto") {
-        appendTraceRow("tool", "→ goto (" + fmtNum(p.x) + "," + fmtNum(p.y) +
+        appendProcessStep(container, "→ goto (" + fmtNum(p.x) + "," + fmtNum(p.y) +
           ") @ " + (p.magnification || "") + (p.reason ? " · " + p.reason : ""));
+      } else if (p.tool === "snapshot") {
+        appendProcessStep(container, "📷 抓取快照…");
+      } else if (p.tool === "finish" || p.tool === "mark_observation" ||
+                 p.tool === "complete_snapshot_review" || p.tool === "create_annotation") {
+        // 结果会以卡片/状态呈现，过程区不重复刷工具名
       } else {
-        appendTraceRow("tool", "→ " + p.tool);
+        appendProcessStep(container, "→ " + p.tool);
       }
       return;
     }
     if (type === "snapshot_captured") {
-      clearThinkingRow();
+      clearThinkingRow(ctx);
       var bb = p.bboxLevel0 || {};
       aiOverlay.push({ x: bb.x, y: bb.y, w: bb.w, h: bb.h,
                        magnification: p.magnification || "" });
-      // 只保留最近一次框（按需求"完成后保留最近一次框"；过程中也只显示最新）
       if (aiOverlay.length > 1) aiOverlay = aiOverlay.slice(-1);
       redrawAnnoCanvas();
-      // 友好卡片：只显示"📷 快照 @倍率（点击跳转）"，不暴露 out_w/out_h 原始参数
-      var row = appendTraceRow("snapshot", "📷 快照 @" + fmtAiMag(p.magnification) +
-                               "　（点击跳转）");
-      row.dataset.bbox = JSON.stringify(bb);
+      appendSnapshotCard(container, { magnification: p.magnification, bbox: bb });
       return;
     }
     if (type === "observation") {
-      clearThinkingRow();
-      // 观察卡：标题（label）+ 正文（note），no_annotation_reason 显示为小字备注。
-      // 不显示原始 JSON / h / snapshot_id（任务1：卡片化）。
-      appendObservationCard(p);
+      clearThinkingRow(ctx);
+      appendObservationCard(p, container);
       return;
     }
     if (type === "snapshot_reviewed") {
-      clearThinkingRow();
-      // 判读卡：一行简洁状态 + summary 副标题。不显示 snapshot_id/disposition 原文。
+      clearThinkingRow(ctx);
       var disp = p.disposition || "";
       var title = (disp === "annotated") ? "✓ 快照已判读（已标注）"
                 : (disp === "no_annotation") ? "✓ 快照已判读（无需标注）"
                 : "✓ 快照已判读";
-      appendReviewCard(title, p.summary || "", disp === "no_annotation" ? (p.no_annotation_reason || "") : "");
+      appendReviewCard(title, p.summary || "",
+                       disp === "no_annotation" ? (p.no_annotation_reason || "") : "",
+                       container);
       return;
     }
     if (type === "annotation_created") {
-      clearThinkingRow();
-      var aRow = appendTraceRow("annotation", "📌 AI 建议 · " + (p.label || "") +
-                     (p.note ? "（" + p.note + "）" : "") +
-                     " @(" + fmtNum(p.x) + "," + fmtNum(p.y) + "," + p.side_px + "px)");
-      if (p.annotation_id) aRow.dataset.annotationId = p.annotation_id;
-      if (aiTraceTarget) {
-        // fork 无 create_annotation，但保险起见也挂 💬
-      } else {
-        attachForkBtn(aRow, p.annotation_id);
-      }
-      // 刷新标注层与面板，让 AI 标注出现在现有标注体系
+      clearThinkingRow(ctx);
+      appendAnnotationCard(p, container, { showFork: !ctx.isFork });
       refreshCurrentAnnotations();
       loadAnnotationsIndex();
       return;
     }
     if (type === "session_compacted") {
-      clearThinkingRow();
+      clearThinkingRow(ctx);
       if (p && p.reason === "context_length_exceeded") {
-        appendTraceRow("info", "上下文已满，已压缩并继续");
+        appendProcessStep(container, "上下文已满，已压缩并继续");
       } else {
-        appendTraceRow("info", "上下文已压缩，继续读片…");
+        appendProcessStep(container, "上下文已压缩，继续读片…");
       }
       return;
     }
     if (type === "agent_paused") {
-      clearThinkingRow();
-      appendTraceRow("paused", "已暂停，可继续（" + (p.summary || "") + "）");
-      aiPaused = true;
-      finishAiRun();
+      clearThinkingRow(ctx);
+      appendStatusRow(container, "paused", "已暂停，可继续（" + (p.summary || "") + "）");
+      if (!ctx.isFork) {
+        aiPaused = true;
+        finishAiRun();
+      }
       return;
     }
     if (type === "agent_finished") {
-      clearThinkingRow();
-      appendTraceRow("finished", p.summary || "(完成)");
-      redrawAnnoCanvas();
-      finishAiRun();
+      clearThinkingRow(ctx);
+      appendStatusRow(container, "finished", p.summary || "(完成)");
+      if (!ctx.isFork) {
+        redrawAnnoCanvas();
+        finishAiRun();
+      }
       return;
     }
     if (type === "agent_retrying") {
-      // 瞬时错误（网络抖动）退避重试：提示但不终止（区别于 agent_error）
-      if (p && p.reason) appendTraceRow("info", "⟳ " + p.reason);
+      if (p && p.reason) appendProcessStep(container, "⟳ " + p.reason);
       return;
     }
     if (type === "agent_error") {
-      clearThinkingRow();
-      appendTraceRow("error", p.error || "出错");
-      finishAiRun();
+      clearThinkingRow(ctx);
+      appendStatusRow(container, "error", p.error || "出错");
+      if (!ctx.isFork) finishAiRun();
       return;
     }
   }
 
   // event_reset：事件缓冲已滚过客户端断点 → 清空轨迹，GET session 全量
   // transcript 重建轨迹，再继续接 live 流（§5.6 event_reset 语义）
-  function handleAiEventReset(payload) {
+  function handleAiEventReset(payload, slideName, epoch) {
+    if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
     resetAiTrace();
-    appendTraceRow("info", "对话历史过长，正在刷新到最新状态…");
+    appendStatusRow(els.aiTrace, "info", "对话历史过长，正在刷新到最新状态…");
     if (!aiSessionId) {
       toast("对话历史过长，已刷新到最新状态", "info");
       return;
     }
-    apiFetch("/api/ai/session/" + encodeURIComponent(aiSessionId))
+    var sid = aiSessionId;
+    apiFetch("/api/ai/session/" + encodeURIComponent(sid))
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
         var s = data && data.session;
         var t = data && data.transcript;
         resetAiTrace();  // 清掉刷新期间追加的 live 行，以全量 transcript 为准
         if (t && t.length) {
           renderAiTranscript(t);
         } else {
-          appendTraceRow("info", "对话历史过长，已刷新到最新状态");
+          appendStatusRow(els.aiTrace, "info", "对话历史过长，已刷新到最新状态");
         }
+        // event_reset 只发生在 main 流：推进 main 游标
         if (s && s.last_event_seq != null) {
-          aiLastSeq = Math.max(aiLastSeq, Number(s.last_event_seq) || 0);
+          mainAiCtx.lastSeq = Math.max(mainAiCtx.lastSeq || 0, Number(s.last_event_seq) || 0);
         }
         toast("已刷新到最新状态", "success");
       })
       .catch(function () {
-        appendTraceRow("info", "对话历史过长，已刷新到最新状态");
+        if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
+        appendStatusRow(els.aiTrace, "info", "对话历史过长，已刷新到最新状态");
         toast("对话历史过长，已刷新到最新状态", "info");
       });
   }
 
-  // 把 GET session 的脱敏 transcript（canonical messages）渲染成 SMS 聊天气泡。
-  // user → 右气泡；assistant 文本 → 左气泡；tool 调用（goto/snapshot/annotation）
-  // → 紧凑灰色系统行；image_ref → "📷 快照 @倍率"占位行（可点击跳 bbox）。
-  // opts.emphasis: "main"（跑批，工具行多，文本气泡次要）/ "fork"（问答，气泡为主）。
+  // 把 GET session 的脱敏 transcript 渲染成统一聊天气泡。
+  // user → 右气泡；assistant 文本 → 左气泡；观察/判读/标注/快照 → 附件卡片；
+  // goto / tool result / 抓取请求 → 过程折叠区。主/fork 共用。
   function renderAiTranscript(msgs, opts) {
     var target = (opts && opts.container) || els.aiTrace;
     opts = opts || {};
+    var toolResults = {};
+    for (var ri = 0; ri < msgs.length; ri++) {
+      var rm = msgs[ri] || {};
+      if (rm.role === "tool" && rm.tool_call_id) {
+        toolResults[rm.tool_call_id] = messageText(rm);
+      }
+    }
     for (var i = 0; i < msgs.length; i++) {
       var m = msgs[i] || {};
       var role = m.role || "";
       var text = messageText(m);
-      // system / spot_updated / spot_deleted 等 user-system 行：当作紧凑系统行
       var isSystem = (role === "system") ||
                      (role === "user" && (m.spot_updated || m.spot_deleted ||
                                           /^spot_(updated|deleted)/.test(text)));
       if (isSystem) {
-        if (text) appendSysRow(target, truncateStr(text, 400));
+        if (text) appendProcessStep(target, truncateStr(text, 400));
         continue;
       }
       if (role === "user") {
         appendChatBubble(target, "user", text);
       } else if (role === "assistant") {
-        // assistant 文本（无 tool_calls）→ 左气泡（fork 里是回答，main 里是总结）
         var tcs = m.tool_calls || [];
-        if (text) {
-          appendChatBubble(target, "assistant", text);
-        }
-        // tool_calls → 友好渲染（任务1：不再 dump 原始 JSON 参数）
-        // mark_observation/complete_snapshot_review → 卡片；snapshot/goto/create_annotation → 简洁行
+        if (text) appendChatBubble(target, "assistant", text);
         for (var j = 0; j < tcs.length; j++) {
-          var fn = tcs[j].function || {};
+          var tc = tcs[j] || {};
+          var fn = tc.function || {};
           var nm = fn.name || "";
           var args = parseToolArgs(fn.arguments);
+          var tcId = tc.id || "";
+          var tcOk = isSuccessfulToolResult(nm, toolResults[tcId]);
           if (nm === "mark_observation") {
+            if (!tcOk) continue;
             appendObservationCard({
               label: args.label || "", note: args.note || "",
               no_annotation_reason: args.no_annotation_reason || "", bbox: {},
             }, target);
           } else if (nm === "complete_snapshot_review") {
+            if (!tcOk) continue;
             var disp = args.disposition || "";
             appendReviewCard(
               disp === "annotated" ? "✓ 快照已判读（已标注）"
@@ -3721,35 +3817,54 @@
               disp === "no_annotation" ? (args.no_annotation_reason || "") : "",
               target);
           } else if (nm === "goto") {
-            appendSysRow(target, "→ goto (" + fmtNum(args.x) + "," + fmtNum(args.y) +
+            appendProcessStep(target, "→ goto (" + fmtNum(args.x) + "," + fmtNum(args.y) +
               ") @ " + (args.level != null ? args.level : "?") +
-              (args.reason ? " · " + args.reason : ""), "tool");
+              (args.reason ? " · " + args.reason : ""));
           } else if (nm === "create_annotation") {
-            appendSysRow(target, "📌 " + (args.label || "AI 建议") +
-              (args.note ? "（" + truncateStr(args.note, 80) + "）" : ""), "tool");
+            if (!tcOk) continue;
+            appendAnnotationCard({
+              label: args.label || "AI 建议",
+              note: args.note || "",
+              x: args.x, y: args.y, side_px: args.side_px,
+            }, target, { showFork: false });
           } else if (nm === "snapshot") {
-            // 不显示 out_w/out_h 原始参数（image_ref 占位行由后续 tool 结果渲染）
-            appendSysRow(target, "📷 抓取快照…", "tool");
+            appendProcessStep(target, "📷 抓取快照…");
           } else if (nm === "finish") {
-            // finish 的总结已在 assistant 文本气泡里，不重复
+            // finish 总结已在 assistant 文本 / 状态行
           } else {
-            appendSysRow(target, "→ " + nm, "tool");
+            appendProcessStep(target, "→ " + nm);
           }
         }
       } else if (role === "tool") {
-        // tool 结果：含 image_ref 的渲染为 📷 快照行（可点跳 bbox）；纯文本结果
-        // 中若含守卫拒绝信息（snapshot_id/pending），转成用户可读的紧凑行
         var imgRef = findImageRef(m);
         if (imgRef) {
-          appendSnapshotPlaceholder(target, imgRef);
+          appendSnapshotCard(target, {
+            magnification: imgRef.magnification,
+            bbox: imgRef.src || {},
+          });
         }
         var resText = messageText(m);
         if (resText && !imgRef) {
-          appendSysRow(target, "⇠ " + friendlyToolResult(resText), "tool");
+          var trimmed = String(resText).trim();
+          if (/^已记录观察|^已关闭快照|^已落标注/.test(trimmed)) continue;
+          appendProcessStep(target, "⇠ " + friendlyToolResult(resText));
         }
       }
     }
     target.scrollTop = target.scrollHeight;
+  }
+
+  // 根据工具名 + 结果文本判断是否真正执行成功（用于历史恢复卡片门控）
+  function isSuccessfulToolResult(name, resultText) {
+    if (resultText == null || resultText === "") return false;
+    var t = String(resultText);
+    if (/必须引用|不匹配|必须提供|必须是|不允许|落标注失败|未知工具|用户已取消/.test(t)) {
+      return false;
+    }
+    if (name === "mark_observation") return /已记录观察/.test(t);
+    if (name === "complete_snapshot_review") return /已关闭快照/.test(t);
+    if (name === "create_annotation") return /已落标注/.test(t);
+    return true;
   }
 
   function messageText(m) {
@@ -3779,11 +3894,16 @@
     return null;
   }
 
-  // SMS 气泡：side="user"（右，accent 底）/ "assistant"（左，灰底）
-  function appendChatBubble(container, side, text) {
-    if (!text) return;
+  function clearAiEmpty(container) {
+    if (!container) return;
     var empty = container.querySelector(".ai-trace-empty");
     if (empty) empty.remove();
+  }
+
+  // SMS 气泡：side="user"（右）/ "assistant"（左）
+  function appendChatBubble(container, side, text) {
+    if (!text) return null;
+    clearAiEmpty(container);
     var row = document.createElement("div");
     row.className = "ai-chat-bubble " + side;
     row.textContent = text;
@@ -3792,56 +3912,101 @@
     return row;
   }
 
-  // 紧凑系统行（灰色小字，工具调用 / tool 结果 / system / spot_*）
-  function appendSysRow(container, text, sub) {
+  // 居中状态行（完成 / 暂停 / 错误 / 提示）
+  function appendStatusRow(container, cls, text) {
     if (!text) return null;
-    var empty = container.querySelector(".ai-trace-empty");
-    if (empty) empty.remove();
+    clearAiEmpty(container);
     var row = document.createElement("div");
-    row.className = "ai-chat-sys" + (sub ? " " + sub : "");
+    row.className = "ai-status " + (cls || "info");
     row.textContent = text;
     container.appendChild(row);
     container.scrollTop = container.scrollHeight;
     return row;
   }
 
-  // image_ref 占位行："📷 快照 @倍率"，可点击跳转 bbox
-  function appendSnapshotPlaceholder(container, imgRef) {
-    var empty = container.querySelector(".ai-trace-empty");
-    if (empty) empty.remove();
-    var row = document.createElement("div");
-    row.className = "ai-chat-sys snapshot";
-    var mag = imgRef.magnification;
-    var label = "📷 快照" + (mag ? " @" + fmtAiMag(mag) : "");
-    row.textContent = label;
-    row.title = "点击跳转到该区域";
-    var src = imgRef.src;
-    if (src && src.x != null && src.w) {
-      row.dataset.bbox = JSON.stringify(src);
-      row.style.cursor = "pointer";
-      row.addEventListener("click", function () {
-        try {
-          var bb = JSON.parse(row.dataset.bbox || "{}");
-          if (bb.x != null && viewer && viewer.viewport) {
-            viewer.viewport.fitBounds(
-              viewer.viewport.imageToViewportRectangle(bb.x, bb.y, bb.w, bb.h));
-          }
-        } catch (e) {}
-      });
+  // 过程折叠：相邻过程步并入同一个 details；遇到气泡/卡片后下次新建
+  function appendProcessStep(container, text, cls) {
+    if (!text || !container) return null;
+    clearAiEmpty(container);
+    var fold = null;
+    var last = container.lastElementChild;
+    if (last && last.classList && last.classList.contains("ai-process-fold")) {
+      fold = last;
+    } else {
+      fold = document.createElement("details");
+      fold.className = "ai-process-fold";
+      var sum = document.createElement("summary");
+      sum.className = "ai-process-summary";
+      sum.textContent = "查看读片过程（0 步）";
+      var body = document.createElement("div");
+      body.className = "ai-process-body";
+      fold.appendChild(sum);
+      fold.appendChild(body);
+      fold._stepCount = 0;
+      container.appendChild(fold);
     }
-    container.appendChild(row);
+    var bodyEl = fold.querySelector(".ai-process-body");
+    var row = document.createElement("div");
+    row.className = "ai-process-step" + (cls ? " " + cls : "");
+    row.textContent = text;
+    bodyEl.appendChild(row);
+    fold._stepCount = (fold._stepCount || 0) + 1;
+    fold.querySelector(".ai-process-summary").textContent =
+      "查看读片过程（" + fold._stepCount + " 步）";
     container.scrollTop = container.scrollHeight;
     return row;
   }
 
-  // 观察卡：标题（label）+ 正文（note）+ 可选的"未落标注"小字备注。
-  // 不显示原始 JSON / h / snapshot_id（任务1：卡片化）。
-  // container 默认主轨迹（live 流），恢复历史时由调用方传入。
-  // live 流走 handleAiEvent（fork 时 aiTraceTarget 已被切到 fork 流）。
+  // 兼容旧调用：映射到状态 / 过程
+  function appendSysRow(container, text, sub) {
+    if (sub === "tool" || sub === "snapshot") return appendProcessStep(container, text, sub);
+    return appendStatusRow(container, "info", text);
+  }
+
+  function appendSnapshotPlaceholder(container, imgRef) {
+    return appendSnapshotCard(container, {
+      magnification: imgRef && imgRef.magnification,
+      bbox: (imgRef && imgRef.src) || {},
+    });
+  }
+
+  function bindSnapshotJump(el, bbox) {
+    if (!el || !bbox || bbox.x == null || !bbox.w) return;
+    el.dataset.bbox = JSON.stringify(bbox);
+    el.style.cursor = "pointer";
+    el.title = "点击跳转到该区域";
+    el.addEventListener("click", function () {
+      try {
+        var bb = JSON.parse(el.dataset.bbox || "{}");
+        if (bb.x != null && viewer && viewer.viewport) {
+          viewer.viewport.fitBounds(
+            viewer.viewport.imageToViewportRectangle(bb.x, bb.y, bb.w, bb.h));
+        }
+      } catch (e) {}
+    });
+  }
+
+  // 快照附件卡
+  function appendSnapshotCard(container, opts) {
+    opts = opts || {};
+    clearAiEmpty(container);
+    var card = document.createElement("div");
+    card.className = "ai-card snapshot";
+    var title = document.createElement("div");
+    title.className = "ai-card-title";
+    title.textContent = "📷 快照" + (opts.magnification != null && opts.magnification !== ""
+      ? " @" + fmtAiMag(opts.magnification) : "") + "　（点击跳转）";
+    card.appendChild(title);
+    bindSnapshotJump(card, opts.bbox || {});
+    container.appendChild(card);
+    container.scrollTop = container.scrollHeight;
+    return card;
+  }
+
+  // 观察卡
   function appendObservationCard(p, container) {
-    var target = container || aiTraceTarget || els.aiTrace;
-    var empty = target.querySelector(".ai-trace-empty");
-    if (empty) empty.remove();
+    var target = container || els.aiTrace;
+    clearAiEmpty(target);
     var card = document.createElement("div");
     card.className = "ai-card observation";
     var title = document.createElement("div");
@@ -3866,11 +4031,10 @@
     return card;
   }
 
-  // 判读卡：一行状态 + 可选 summary 副标题 + 可选 reason 备注。
+  // 判读卡
   function appendReviewCard(title, summary, reason, container) {
-    var target = container || aiTraceTarget || els.aiTrace;
-    var empty = target.querySelector(".ai-trace-empty");
-    if (empty) empty.remove();
+    var target = container || els.aiTrace;
+    clearAiEmpty(target);
     var card = document.createElement("div");
     card.className = "ai-card review";
     var head = document.createElement("div");
@@ -3894,6 +4058,40 @@
     return card;
   }
 
+  // 标注附件卡
+  function appendAnnotationCard(p, container, opts) {
+    opts = opts || {};
+    var target = container || els.aiTrace;
+    clearAiEmpty(target);
+    var card = document.createElement("div");
+    card.className = "ai-card annotation";
+    var title = document.createElement("div");
+    title.className = "ai-card-title";
+    title.textContent = "📌 " + (p.label || "AI 建议");
+    card.appendChild(title);
+    var parts = [];
+    if (p.note) parts.push(p.note);
+    if (p.x != null || p.y != null || p.side_px != null) {
+      parts.push("@(" + fmtNum(p.x) + "," + fmtNum(p.y) + "," + (p.side_px || "?") + "px)");
+    }
+    if (parts.length) {
+      var body = document.createElement("div");
+      body.className = "ai-card-body";
+      body.textContent = parts.join(" ");
+      card.appendChild(body);
+    }
+    if (p.annotation_id) card.dataset.annotationId = p.annotation_id;
+    if (opts.showFork && p.annotation_id) {
+      var actions = document.createElement("div");
+      actions.className = "ai-card-actions";
+      card.appendChild(actions);
+      attachForkBtn(actions, p.annotation_id);
+    }
+    target.appendChild(card);
+    target.scrollTop = target.scrollHeight;
+    return card;
+  }
+
   // 解析 tool_call 的 arguments（OpenAI 为 JSON 字符串，已解析对象也兼容）
   function parseToolArgs(argsStr) {
     if (typeof argsStr === "string") {
@@ -3904,15 +4102,16 @@
   }
 
   // 把 tool 结果文本里的内部细节（snapshot_id / tool_call_id / pending 措辞）
-  // 转成用户可读，避免暴露 call_xxx 这类内部 id（任务1：守卫信息可读化）。
+  // 转成用户可读，避免暴露 call_xxx / toolu_xxx 这类内部 id（任务1：守卫信息可读化）。
   function friendlyToolResult(text) {
     var t = String(text || "");
-    // 含 tool_call_id（call_xxx）→ 抽象成"该操作未关联到当前快照"
-    if (/call_[A-Za-z0-9]{6,}/.test(t) && /snapshot_id|pending|必须引用/.test(t)) {
+    // OpenAI call_* / Anthropic toolu_* → 抽象成"该操作未关联到当前快照"
+    if (/(?:call_|toolu_)[A-Za-z0-9_-]{4,}/.test(t) && /snapshot_id|pending|必须引用|不匹配/.test(t)) {
       return "该观察未关联到当前快照，已忽略（请先抓取并消化快照）";
     }
-    // 仅暴露 snapshot_id 的行也折叠
-    t = t.replace(/snapshot_id[（(]?\s*[:：]?\s*call_[A-Za-z0-9]+[)）]?/gi, "");
+    // 仅暴露 snapshot_id 的行也折叠（覆盖 call_ / toolu_）
+    t = t.replace(/snapshot_id[（(]?\s*[:：]?\s*(?:call_|toolu_)[A-Za-z0-9_-]+[)）]?/gi, "");
+    t = t.replace(/(?:call_|toolu_)[A-Za-z0-9_-]{4,}/g, "");
     return truncateStr(t.trim(), 200);
   }
 
@@ -3958,7 +4157,10 @@
   function resetAiTrace() {
     els.aiTrace.innerHTML = "";
     aiOverlay = [];
-    aiTextBubbleEl = null;
+    mainAiCtx.bubbleEl = null;
+    mainAiCtx.thinkingEl = null;
+    mainAiCtx.container = els.aiTrace;
+    // lastSeq 在 fresh start 时单独清零；这里只清 DOM
     redrawAnnoCanvas();
   }
 
@@ -4054,10 +4256,11 @@
   function sendForkQuestion(annotationId, question, streamEl, wrapEl) {
     question = (question || "").trim();
     if (!question) return;
-    appendTraceRow("fork-q", "🙋 " + question, streamEl);
+    appendChatBubble(streamEl, "user", question);
     var input = wrapEl ? wrapEl.querySelector("input") : null;
     if (input) input.value = "";
-    appendTraceRow("fork-wait", "思考中…", streamEl);
+    var ctx = forkTraceCtx(streamEl);
+    setThinkingRow(ctx);
     fetch("/api/ai/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4065,19 +4268,18 @@
       credentials: "same-origin",
     }).then(function (resp) {
       if (resp.status === 410) {
-        appendTraceRow("fork-err", "该标注已删除，对话已归档（只读）", streamEl);
+        appendStatusRow(streamEl, "error", "该标注已删除，对话已归档（只读）");
         if (wrapEl) wrapEl.classList.add("fork-readonly");
         throw new Error("gone");
       }
       if (!resp.ok || !resp.body) {
         return resp.text().then(function (t) { throw new Error(t || ("HTTP " + resp.status)); });
       }
-      // 流入 fork 对话流
-      aiTraceTarget = streamEl;
+      // 流入 fork 对话流（显式 ctx，不碰主会话）
       return pumpForkSse(resp.body.getReader(), streamEl, wrapEl);
     }).catch(function (e) {
       if (e && e.message === "gone") return;
-      appendTraceRow("fork-err", "发送失败: " + (e && e.message ? e.message : e), streamEl);
+      appendStatusRow(streamEl, "error", "发送失败: " + (e && e.message ? e.message : e));
     });
   }
 
@@ -4086,7 +4288,7 @@
     var buffer = "";
     function pump() {
       return reader.read().then(function (result) {
-        if (result.done) { aiTraceTarget = null; return; }
+        if (result.done) return;
         buffer += decoder.decode(result.value, { stream: true });
         var idx;
         while ((idx = buffer.indexOf("\n\n")) >= 0) {
@@ -4098,7 +4300,7 @@
             if (line.indexOf("event:") === 0) type = line.slice(6).trim();
             else if (line.indexOf("data:") === 0) dataStr += line.slice(5).trim();
           });
-          if (type === "session_ended") { aiTraceTarget = null; continue; }
+          if (type === "session_ended") continue;
           var payload = {};
           if (dataStr) { try { payload = JSON.parse(dataStr); } catch (e) {} }
           handleForkEvent(type, payload, streamEl, wrapEl);
@@ -4109,76 +4311,66 @@
     return pump();
   }
 
+  function forkTraceCtx(streamEl) {
+    if (!streamEl._aiCtx) {
+      streamEl._aiCtx = {
+        container: streamEl,
+        bubbleEl: null,
+        thinkingEl: null,
+        isFork: true,
+        lastSeq: 0,
+      };
+    }
+    streamEl._aiCtx.container = streamEl;
+    return streamEl._aiCtx;
+  }
+
   function handleForkEvent(type, p, streamEl, wrapEl) {
-    // 复用主轨迹渲染，但把追加目标切到 fork 流
-    var prev = aiTraceTarget;
-    aiTraceTarget = streamEl;
-    if (type === "agent_thinking") { setThinkingRowFork(streamEl); aiTraceTarget = prev; return; }
-    if (type === "text_delta") { appendTextBubbleFork(p.text || "", streamEl); aiTraceTarget = prev; return; }
-    handleAiEvent(type, p);
-    aiTraceTarget = prev;
+    var ctx = forkTraceCtx(streamEl);
+    handleAiEvent(type, p, ctx);
     // 收尾清理
     if (type === "agent_paused" || type === "agent_finished" || type === "agent_error") {
-      var waits = streamEl.querySelectorAll(".ai-trace-row.fork-wait, .ai-trace-row.thinking");
+      var waits = streamEl.querySelectorAll(".ai-chat-thinking, .ai-trace-row.fork-wait, .ai-trace-row.thinking");
       waits.forEach(function (w) { if (w.parentNode) w.parentNode.removeChild(w); });
+      ctx.thinkingEl = null;
     }
   }
 
-  var forkBubbleEl = null;
-  function appendTextBubbleFork(text, streamEl) {
-    if (!forkBubbleEl || forkBubbleEl.closed || forkBubbleEl.parentNode !== streamEl) {
-      forkBubbleEl = document.createElement("div");
-      forkBubbleEl.className = "ai-trace-row bubble fork-ai";
-      forkBubbleEl.textContent = "";
-      forkBubbleEl.closed = false;
-      streamEl.appendChild(forkBubbleEl);
+  function appendTextBubble(text, ctx) {
+    ctx = ensureAiCtx(ctx);
+    var container = ctx.container;
+    clearAiEmpty(container);
+    // 增量 append 到当前助手气泡（若无则新建）
+    if (!ctx.bubbleEl || ctx.bubbleEl.closed || ctx.bubbleEl.parentNode !== container) {
+      ctx.bubbleEl = document.createElement("div");
+      ctx.bubbleEl.className = "ai-chat-bubble assistant";
+      ctx.bubbleEl.textContent = "";
+      ctx.bubbleEl.closed = false;
+      container.appendChild(ctx.bubbleEl);
     }
-    forkBubbleEl.textContent += text;
-    streamEl.scrollTop = streamEl.scrollHeight;
+    ctx.bubbleEl.textContent += text;
+    container.scrollTop = container.scrollHeight;
   }
 
-  var forkThinkingEl = null;
-  function setThinkingRowFork(streamEl) {
-    if (forkThinkingEl && forkThinkingEl.parentNode === streamEl) return;
-    forkThinkingEl = document.createElement("div");
-    forkThinkingEl.className = "ai-trace-row thinking";
-    forkThinkingEl.textContent = "思考中…";
-    streamEl.appendChild(forkThinkingEl);
-    streamEl.scrollTop = streamEl.scrollHeight;
-  }
-
-  function appendTextBubble(text) {
-    // 增量 append 到当前气泡（若无则新建）
-    if (!aiTextBubbleEl || aiTextBubbleEl.closed) {
-      aiTextBubbleEl = document.createElement("div");
-      aiTextBubbleEl.className = "ai-trace-row bubble";
-      aiTextBubbleEl.textContent = "";
-      aiTextBubbleEl.closed = false;
-      els.aiTrace.appendChild(aiTextBubbleEl);
-    }
-    aiTextBubbleEl.textContent += text;
-    els.aiTrace.scrollTop = els.aiTrace.scrollHeight;
-  }
-
-  var thinkingRowEl = null;
-  function setThinkingRow() {
-    var target = aiTraceTarget || els.aiTrace;
-    if (thinkingRowEl && thinkingRowEl.parentNode === target) return;
-    var empty = target.querySelector(".ai-trace-empty");
-    if (empty) empty.remove();
-    thinkingRowEl = document.createElement("div");
-    thinkingRowEl.className = "ai-trace-row thinking";
-    thinkingRowEl.textContent = "思考中…";
-    target.appendChild(thinkingRowEl);
+  function setThinkingRow(ctx) {
+    ctx = ensureAiCtx(ctx);
+    var target = ctx.container;
+    if (ctx.thinkingEl && ctx.thinkingEl.parentNode === target) return;
+    clearAiEmpty(target);
+    ctx.thinkingEl = document.createElement("div");
+    ctx.thinkingEl.className = "ai-chat-thinking";
+    ctx.thinkingEl.textContent = "思考中…";
+    target.appendChild(ctx.thinkingEl);
     target.scrollTop = target.scrollHeight;
   }
-  function clearThinkingRow() {
-    if (thinkingRowEl && thinkingRowEl.parentNode) {
-      thinkingRowEl.parentNode.removeChild(thinkingRowEl);
+  function clearThinkingRow(ctx) {
+    ctx = ensureAiCtx(ctx);
+    if (ctx.thinkingEl && ctx.thinkingEl.parentNode) {
+      ctx.thinkingEl.parentNode.removeChild(ctx.thinkingEl);
     }
-    thinkingRowEl = null;
+    ctx.thinkingEl = null;
     // 关闭当前 text 气泡：下一段 text_delta 会新建一个
-    if (aiTextBubbleEl) { aiTextBubbleEl.closed = true; }
+    if (ctx.bubbleEl) { ctx.bubbleEl.closed = true; }
   }
 
   // ---------- 启动 ----------

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260803fix" />
+  <link rel="stylesheet" href="/static/style.css?v=20260804slide" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -293,9 +293,14 @@
           <button id="ai-reconfig-btn" class="link-btn">重新配置</button>
         </div>
 
-        <!-- 2. 任务输入 -->
-        <div class="ai-task-wrap">
-          <textarea id="ai-task" class="ai-task" rows="3"
+        <!-- 对话区（实时 / 历史恢复 / fork 共用同一套气泡渲染） -->
+        <div id="ai-trace" class="ai-trace">
+          <div class="ai-trace-empty">点击「开始」让 AI 读片。对话会显示在这里。</div>
+        </div>
+
+        <!-- 底部输入（固定） -->
+        <div class="ai-composer">
+          <textarea id="ai-task" class="ai-task" rows="2"
                     placeholder="让 AI 做什么，如：扫一遍这张片，标出可疑区域并总结"></textarea>
           <div class="ai-task-actions">
             <button id="ai-task-jump" class="tool-btn small" title="把当前 ROI/选中标注的坐标写进任务">判读当前选区</button>
@@ -304,11 +309,6 @@
             <button id="ai-fresh-btn" class="btn small" style="display:none;" title="归档旧对话开新，不影响标注与批注">🔄 新会话</button>
             <button id="ai-stop-btn" class="btn small" style="display:none;">停止</button>
           </div>
-        </div>
-
-        <!-- 3. 轨迹流 -->
-        <div id="ai-trace" class="ai-trace">
-          <div class="ai-trace-empty">点击「开始」让 AI 读片。轨迹会显示在这里。</div>
         </div>
       </div>
     </main>
@@ -320,6 +320,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260803cards"></script>
+  <script src="/static/app.js?v=20260804slide"></script>
 </body>
 </html>
