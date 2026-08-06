@@ -346,6 +346,11 @@ pending_snapshot_review: {snapshot_id, bbox, image_ref}
 - 每次 `/ask` / `run` / `continue`：取 `change_seq > spot_cursor` 的变更，**追加一条 `spot_updated` / `spot_deleted` 消息**到历史尾部，再续跑/续聊；更新 `spot_cursor`。
 - **`spot_updated` 携带完整当前 spot 快照**（bbox、note、revision、change_seq），不只描述 note——因为人工也可能改几何（几何变更同样递增 revision 与 change_seq）。
 
+### 7.4 渐进导航：goto ±2 层 clamp + 快照坐标刻度尺
+- 单次 `goto` 最多变 **±2 层**（`MAX_LEVEL_DELTA=2`，像真实显微镜物镜转盘）。超步长先夹步长（结果消息带警告"请渐进变倍"），再做有效层范围 clamp；仅超范围保持原"请求 level=… 已夹到有效层 …"句式。
+- 快照图像顶缘/左缘带**青色 level-0 坐标刻度尺**（`_overlay_coord_ticks`，视觉尺子）：模型读图内特征坐标一律以刻度为准，倍率/bbox 仍走文本返回。
+- 注入的标注线索（spot 索引 / `spot_updated` / fork spot 卡）统一写明**左上角坐标 + 中心坐标**，goto 看线索用中心坐标——否则视野偏半格，目标落到右下角（"导航偏移"的根因）。
+
 ---
 
 ## 8. 默认参数与已定稿开放点

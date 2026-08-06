@@ -744,6 +744,38 @@ class SessionRunner:
             data["updated_at"] = _now()
             self._save()
 
+    def ensure_current_system_prompt(self) -> bool:
+        """continue / fork resume：把落库 system 同步为当前 SYSTEM_PROMPT。
+
+        旧会话若仍是肿瘤倾向旧文案，续跑会继续带偏模型；这里就地替换所有
+        role=system 消息。若没有 system（compact 等边界），在头部插入一条。
+        返回是否改动了 canonical。
+        """
+        import ai_agent
+        current = ai_agent.SYSTEM_PROMPT
+        with _SessionLock(self.session_id):
+            data = self._refresh()
+            self._assert_lease_in_lock(data)
+            msgs = data.setdefault("canonical_messages", [])
+            changed = False
+            found = False
+            for i, m in enumerate(msgs):
+                if not isinstance(m, dict) or m.get("role") != "system":
+                    continue
+                found = True
+                if m.get("content") != current:
+                    nm = dict(m)
+                    nm["content"] = current
+                    msgs[i] = nm
+                    changed = True
+            if not found:
+                msgs.insert(0, {"role": "system", "content": current})
+                changed = True
+            if changed:
+                data["updated_at"] = _now()
+                self._save()
+            return changed
+
     # 别名（文档接口命名）
     def commit_bundle_and_checkpoint(self) -> None:
         self.commit_bundle()
@@ -786,6 +818,7 @@ class SessionRunner:
 
         需要 slide 上下文（region 取图 + slide fingerprint），通过
         `set_materializer(materializer_fn)` 注入。物化失败按 §3.3 降级文本。
+        同时剥离 UI-only 字段（display_text），避免发给模型 API。
         """
         data = self._refresh()
         msgs = data.get("canonical_messages") or []
@@ -793,22 +826,22 @@ class SessionRunner:
         out = []
         for i, m in enumerate(msgs):
             if i < compacted_upto:
-                out.append(dict(m))  # 已进摘要，image_ref 不再物化
+                out.append(_strip_ui_fields(m))  # 已进摘要，image_ref 不再物化
                 continue
             out.append(self._materialize_one(m))
         return out
 
     def _materialize_one(self, msg: dict) -> dict:
-        content = msg.get("content")
+        m = _strip_ui_fields(msg)
+        content = m.get("content")
         if not isinstance(content, list):
-            return dict(msg)
+            return m
         new_content = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "image_ref":
                 new_content.append(self._materialize_image_ref(part))
             else:
                 new_content.append(part)
-        m = dict(msg)
         m["content"] = new_content
         return m
 
@@ -928,11 +961,15 @@ class SessionRunner:
         visible = [r for r in rois if not r.get("deleted")]
         if not visible:
             return
-        lines = ["当前切片标注库快照："]
+        lines = ["当前切片标注库快照（待复核线索，非诊断事实）："]
         for r in visible:
-            lines.append("- 位置 level-0 ({x},{y}) 边长 {s}px：{note}（revision {rv}, change_seq {cs}）".format(
-                x=r.get("x", 0), y=r.get("y", 0), s=r.get("side_px", 0),
-                note=r.get("note", ""), rv=r.get("revision", 1), cs=r.get("change_seq", 0)))
+            s = int(r.get("side_px", 0) or 0)
+            x0 = float(r.get("x", 0) or 0)
+            y0 = float(r.get("y", 0) or 0)
+            lines.append("- 位置 level-0 左上角 ({x:.0f},{y:.0f})，边长 {s}px"
+                         "（中心 ({cx:.0f},{cy:.0f})，goto 请对准中心）：{note}".format(
+                             x=x0, y=y0, s=s, cx=x0 + s / 2.0, cy=y0 + s / 2.0,
+                             note=r.get("note", "")))
         spot_msg = {
             "role": "user",
             "content": "\n".join(lines),
@@ -965,12 +1002,17 @@ class SessionRunner:
                                  r.get("annotation_id") or ""),
                              "spot_deleted": r.get("annotation_id")})
             else:
+                s = int(r.get("side_px", 0) or 0)
+                x0 = float(r.get("x", 0) or 0)
+                y0 = float(r.get("y", 0) or 0)
                 msgs.append({"role": "user", "content":
-                             "spot_updated：位置 level-0 ({x},{y}) 边长 {s}px，"
-                             "判读：「{note}」（revision {rv}, change_seq {cs}）。".format(
-                                 x=r.get("x", 0), y=r.get("y", 0), s=r.get("side_px", 0),
-                                 note=r.get("note", ""), rv=r.get("revision", 1),
-                                 cs=r.get("change_seq", 0)),
+                             "spot_updated：已有标注线索（待复核，非诊断事实）——"
+                             "位置 level-0 左上角 ({x:.0f},{y:.0f})，边长 {s}px"
+                             "（中心 ({cx:.0f},{cy:.0f})；goto 看这里请把视野中心对准中心坐标），"
+                             "原标注文案：「{note}」。"
+                             "请独立观察后决定采纳、修正或忽略。".format(
+                                 x=x0, y=y0, s=s, cx=x0 + s / 2.0, cy=y0 + s / 2.0,
+                                 note=r.get("note", "")),
                              "spot_updated": r.get("annotation_id")})
         with _SessionLock(self.session_id):
             data = self._refresh()
@@ -1125,6 +1167,17 @@ class SessionRunner:
 # --------------------------------------------------------------------------- #
 # canonical / request 消息转换辅助
 # --------------------------------------------------------------------------- #
+_UI_ONLY_KEYS = ("display_text",)
+
+
+def _strip_ui_fields(msg: dict) -> dict:
+    """复制消息并去掉仅供前端渲染的字段（不发给模型）。"""
+    m = dict(msg)
+    for k in _UI_ONLY_KEYS:
+        m.pop(k, None)
+    return m
+
+
 def _canonical_tool_content(result) -> Any:
     """tool result 规范化：str 直接用；含 image_base64 的 dict 转 image_ref。"""
     if isinstance(result, dict) and result.get("image_base64"):

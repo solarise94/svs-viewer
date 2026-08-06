@@ -2,7 +2,7 @@
 """AI 读片助手后端核心（纯逻辑，不依赖 Flask）。
 
 借鉴 VirtualMicroscope 的四件纯逻辑：状态机 / 提示词 / 图像预算 / 轨迹事件，
-但放宽它的过度设计（不做渐进 zoom、不做 ±2 clamp、手写 tool-call 循环）。
+带 ±2 clamp 渐进 zoom（单次 goto 最多变 2 层）+ 快照坐标刻度尺，手写 tool-call 循环。
 
 设计要点（对应 docs/ai-session-architecture.md）：
 - ``AgentState`` 只描述"当前视口在 level-0 的哪里、放大多少"，不持有图像。
@@ -27,6 +27,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 import ai_protocol
+
+
+# 单次 goto 最多变的金字塔层数（像真实显微镜物镜转盘，禁止跨层盲跳）。
+MAX_LEVEL_DELTA = 2
 
 
 # =========================================================================== #
@@ -54,10 +58,9 @@ class AgentState:
         pyramidLevel 缩放：ds = level_downsamples[level]，覆盖边长 =
         viewportPx * ds。中心对齐到 centerX/centerY。
         """
-        if not level_downsamples:
-            ds = 1.0
-        else:
-            lvl = max(0, min(self.pyramidLevel, len(level_downsamples) - 1))
+        lvl = self.effective_level(level_downsamples)
+        ds = 1.0
+        if level_downsamples:
             ds = float(level_downsamples[lvl]) or 1.0
         side = max(1, self.viewportPx * ds)
         x = self.centerX - side / 2.0
@@ -65,39 +68,49 @@ class AgentState:
         return {"x": int(round(x)), "y": int(round(y)),
                 "w": int(round(side)), "h": int(round(side))}
 
+    def effective_level(self, level_downsamples: Tuple[float, ...]) -> int:
+        """把 pyramidLevel 夹到有效金字塔下标（含 0）。"""
+        if not level_downsamples:
+            return 0
+        return max(0, min(int(self.pyramidLevel), len(level_downsamples) - 1))
+
     def magnification_label(self, level_downsamples: Tuple[float, ...]) -> str:
-        """返回放大倍率描述，如 "20x (high power)" 或 "4x downsample"。
+        """返回不会让弱模型误判层级的显式倍率描述。
 
         base = 10/mpp（物镜等效倍率：病理切片约定 mpp(µm/px) = 10/objective，
         故 objective = 10/mpp；与 _read_metadata 的估算公式一致）；
         实际倍率 = base / ds。无 mpp 时用 "Nx downsample" 表达。
         """
-        if not level_downsamples:
-            ds = 1.0
-        else:
-            lvl = max(0, min(self.pyramidLevel, len(level_downsamples) - 1))
+        lvl = self.effective_level(level_downsamples)
+        ds = 1.0
+        if level_downsamples:
             ds = float(level_downsamples[lvl]) or 1.0
         if self.mpp and self.mpp > 0:
             base = 10.0 / self.mpp
             mag = base / ds if ds > 0 else base
-            tier = _mag_tier(mag)
-            return "{:.0f}x ({})".format(mag, tier)
-        return "{:.1f}x downsample".format(ds)
+            tier = _mag_tier(mag, base)
+            # mag<1 的概览层用一位小数，避免显示成 "0x"（应为 "0.3x"）
+            if mag < 1:
+                return "{:.1f}x（{}，level={}）".format(mag, tier, lvl)
+            return "{:.0f}x（{}，level={}）".format(mag, tier, lvl)
+        return "level={}（level 越大倍率越低）".format(lvl)
 
     @staticmethod
     def pick_overview_level(width: int, height: int,
                             level_downsamples: Tuple[float, ...],
                             viewport_px: int) -> int:
-        """选能看全片的最低倍层（ds 最小、且 viewportPx*ds 仍覆盖整片）。
+        """选能看全片的最低倍层（ds 最小、且 viewportPx*ds 基本覆盖整片）。
 
-        从 level 0（最高倍、ds 最小）往高找，第一个满足 viewportPx*ds >= max(w,h)
-        的即返回——这是"恰好能看全片"的最高倍层，提供最紧凑的概览。
+        从 level 0（最高倍、ds 最小）往高找，第一个满足 viewportPx*ds >= max(w,h)*0.95
+        的即返回。5% 容差：严格全覆盖是全有或全无——只差一点边条就掉一整级
+        （如 66061 宽的片在 vp=1024 下 level 6 覆盖 65536，差 0.8% 就掉到
+        level 7，概览从 0.6x 变 0.3x）；中心对齐时容差只裁两侧窄边，整体印象无损。
         都不满足则返回最高层（最大 ds，至少能看到尽量大的范围）。
         """
         if not level_downsamples:
             return 0
-        need = float(max(width, height))
-        # 从小到大（低 level → 高 level，ds 递增）找第一个覆盖整片的
+        need = float(max(width, height)) * 0.95
+        # 从小到大（低 level → 高 level，ds 递增）找第一个基本覆盖整片的
         for lvl in range(len(level_downsamples)):
             ds = float(level_downsamples[lvl]) or 1.0
             if viewport_px * ds >= need:
@@ -124,15 +137,41 @@ class AgentState:
         )
 
 
-def _mag_tier(mag: float) -> str:
-    """物镜倍率分档描述。"""
+def _mag_tier(mag: float, base_mag: Optional[float] = None) -> str:
+    """物镜倍率分档，并说明它相对本片 level-0 的位置。"""
+    if base_mag and base_mag >= 30 and mag < base_mag * 0.75 and mag >= 12:
+        return "中低倍"
     if mag >= 30:
-        return "high power"
+        return "高倍"
     if mag >= 15:
-        return "medium power"
+        return "中低倍"
     if mag >= 5:
-        return "low power"
-    return "overview"
+        return "低倍"
+    return "全片概览"
+
+
+def magnification_guide(info: dict) -> str:
+    """生成当前切片的确定性倍率表，避免让模型按 level 数字猜倍率。"""
+    downsamples = tuple(info.get("level_downsamples") or (1.0,))
+    mpp = info.get("mpp")
+    if not mpp or float(mpp) <= 0:
+        levels = ["level {}=downsample {:g}".format(i, float(ds) or 1.0)
+                  for i, ds in enumerate(downsamples)]
+        return ("倍率规则：level 0 是最高倍率/最高分辨率，level 越大倍率越低；"
+                + "；".join(levels) + "。")
+    base = 10.0 / float(mpp)
+    levels = []
+    for i, raw_ds in enumerate(downsamples):
+        ds = float(raw_ds) or 1.0
+        mag = base / ds
+        # mag<1 的概览层用一位小数，避免显示成 "0x"（应为 "0.3x"）
+        if mag < 1:
+            levels.append("level {}≈{:.1f}x（{}）".format(i, mag, _mag_tier(mag, base)))
+        else:
+            levels.append("level {}≈{:.0f}x（{}）".format(i, mag, _mag_tier(mag, base)))
+    return ("本片倍率规则：" + "；".join(levels)
+            + "。level 0 最高倍，越大越低倍；本片 level 0≈{base:.0f}x 为高倍，"
+              "约 20x 只算中低倍。".format(base=base))
 
 
 # =========================================================================== #
@@ -144,7 +183,9 @@ def _goto_schema() -> Dict[str, Any]:
         "function": {
             "name": "goto",
             "description": "把虚拟显微镜移到指定 level-0 坐标与金字塔层级。"
-                           "直接跳转，不做渐进 zoom。reason 简述为何看这里。",
+                           "单次最多变 ±2 层（像物镜转盘），超出会被夹取并提示。"
+                           "放大=level 减 1~2，缩小=level 加 1~2。"
+                           "reason 简述为何看这里。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -165,10 +206,7 @@ def _snapshot_schema() -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": "snapshot",
-            "description": "在当前位置抓取一张快照（输出图像尺寸 out_w × out_h 像素）。"
-                           "图像会作为 image content 回喂给你。看清细节时调用。"
-                           "每次快照后必须消化：create_annotation / mark_observation / "
-                           "complete_snapshot_review 后才能移动或结束。",
+            "description": "抓取当前视野的快照图像回喂给你。看清细节时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -186,23 +224,18 @@ def _mark_observation_schema() -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": "mark_observation",
-            "description": "记录一条结构化观察（写入轨迹，不在切片上落标记）。"
-                           "用于对当前快照判读后的记录：含 bbox、镜下所见、"
-                           "以及'不需标注的理由'。必须引用当前待消化的 snapshot_id。",
+            "description": "记录对当前快照的一条观察（写入轨迹，不落标记）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "snapshot_id": {"type": "string", "description": "当前 pending 快照的 id"},
                     "x": {"type": "number", "description": "观察区域 level-0 X（左上）"},
                     "y": {"type": "number", "description": "观察区域 level-0 Y（左上）"},
                     "w": {"type": "number", "description": "观察区域宽度"},
                     "h": {"type": "number", "description": "观察区域高度"},
                     "label": {"type": "string", "description": "简短标题"},
                     "note": {"type": "string", "description": "镜下所见描述"},
-                    "no_annotation_reason": {"type": "string",
-                                             "description": "为何无需落标注（可空）"},
                 },
-                "required": ["snapshot_id", "label"],
+                "required": ["label"],
             },
         },
     }
@@ -214,12 +247,10 @@ def _create_annotation_schema() -> Dict[str, Any]:
         "function": {
             "name": "create_annotation",
             "description": "在切片上落一个矩形标注（写入标注库，管理员可见可编辑）。"
-                           "看清需要关注的目标时调用，一次一个。坐标为 level-0 像素。"
-                           "必须引用当前待消化的 snapshot_id（同一张图可补标多个）。",
+                           "看清需要关注的目标时调用，一次一个。坐标为 level-0 像素。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "snapshot_id": {"type": "string", "description": "当前 pending 快照的 id"},
                     "label": {"type": "string", "description": "标注标题/标签"},
                     "x": {"type": "number", "description": "矩形左上角 level-0 X"},
                     "y": {"type": "number", "description": "矩形左上角 level-0 Y"},
@@ -227,7 +258,7 @@ def _create_annotation_schema() -> Dict[str, Any]:
                                 "description": "矩形边长（level-0 像素，1~40000）"},
                     "note": {"type": "string", "description": "备注：镜下所见与是否需关注"},
                 },
-                "required": ["snapshot_id", "label", "x", "y", "side_px"],
+                "required": ["label", "x", "y", "side_px"],
             },
         },
     }
@@ -238,21 +269,19 @@ def _complete_snapshot_review_schema() -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": "complete_snapshot_review",
-            "description": "显式关闭当前待消化的快照（§7.2）。"
-                           "disposition=annotated：已对这张图完成标注（可已标多个）；"
-                           "disposition=no_annotation：无需标注（必须给 no_annotation_reason）。"
-                           "关闭后才能 goto / 抓新快照 / finish。",
+            "description": "关闭当前快照的判读（服务端跟踪当前快照，无需传 id）。"
+                           "annotated=已落标注；no_annotation=无需标注。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "snapshot_id": {"type": "string", "description": "当前 pending 快照的 id"},
                     "disposition": {"type": "string",
                                     "enum": ["annotated", "no_annotation"]},
-                    "summary": {"type": "string", "description": "对这张图的判读小结"},
+                    "summary": {"type": "string",
+                                "description": "对这张图的判读小结（可空：缺省时服务端取本次观察的 note）"},
                     "no_annotation_reason": {"type": "string",
-                                             "description": "仅 disposition=no_annotation 时必填"},
+                                             "description": "仅 disposition=no_annotation 时给"},
                 },
-                "required": ["snapshot_id", "disposition", "summary"],
+                "required": ["disposition"],
             },
         },
     }
@@ -288,50 +317,61 @@ def tools_for_kind(kind: str) -> List[Dict[str, Any]]:
 # =========================================================================== #
 # SYSTEM_PROMPT（中文）
 # =========================================================================== #
-SYSTEM_PROMPT = """你是控制虚拟显微镜的病理专家助手。你通过调用工具在数字病理切片上\
-移动视口、抓取快照、记录观察、落标注并给出总结。
+SYSTEM_PROMPT = """你是控制虚拟显微镜的病理专家助手，通过工具在数字病理切片上移动视口、抓快照、记录观察、落标注并给出中文总结。
 
-工作方式：
-- 所有坐标都是 level-0 像素（切片最高分辨率层的原始像素坐标）。
-- 从低倍概览开始（用 goto 跳到能看全片的层级），先建立整体印象，不必渐进 zoom。
-- 看清目标后立即用 create_annotation 落矩形标记，note 里写清镜下所见与是否需要关注。
-- 多个目标逐个处理，一次一个标注。
-- 阶段性发现可用 mark_observation 记录（不落标记，仅写入轨迹）。
-- 全部完成后调用 finish 给出中文总结。
+坐标与倍率：
+- 所有坐标都是 level-0 像素（最高分辨率层的原始坐标）；goto 的 x,y 是视野中心。
+- 倍率名称以用户消息里的本片倍率表为准：本片 level 0 才是高倍，约 20x/21x 只是中低倍。
 
-快照消化（强制流程）：
-- 每次 snapshot 后、下一次 goto / 新 snapshot / finish 之前，必须消化当前快照：
-  对需关注的区域调用 create_annotation（必须带当前 snapshot_id），
-  然后调用 complete_snapshot_review(disposition="annotated") 关闭；
-  若该区域无需标注，则调用 mark_observation + complete_snapshot_review(\
-disposition="no_annotation", no_annotation_reason=...)。
-- 同一张快照可以补标多个 create_annotation，之后一次性 complete_snapshot_review。
+读片节奏（建议）：
+- 初始视野已是全片概览。先建立整体印象，再主动挑 1-3 个最可疑的灶性异常区逐级放大确认并标注，不要只停留在中低倍泛泛描述全片结构。
+- 渐进变倍：单次 goto 建议只变 1~2 层（放大=level 减，缩小=level 加）；跨层盲跳会因坐标漂移落到空白区，超出时服务端会夹取并提示。
+- 放大节奏：goto 到候选大致坐标 → snapshot 确认目标在视野 → 再降 1~2 级，直到目标清晰；需要细胞学证据时一直到 level 0。
+- 快照图顶缘与左缘有青色 level-0 坐标刻度，从图上读坐标以刻度为准，不要凭感觉猜。
+- 选点选灶性紫染密集/结构异常区；切片边缘大片均一浅色区（空白玻片、标签、折痕）不是线索。若进去发现视野大部分空白，退回上一层确认过的组织坐标换点。
+- 多个目标逐个处理：标完一个先升回概览再找下一个；同一区域同一层级抓 1-2 张快照通常足够。
 
-语境：
-- 病理切片通常很大（万级像素），ROI 一般是 6mm 物理尺寸级别（约数千像素）。
-- level 越大越低倍（看全片用大 level，看细胞细节用 0）。
-"""
+快照消化：
+- 建议每抓一张快照就完成消化再移动：先 mark_observation 记镜下所见；需关注的区域用 create_annotation 落标（同一张图可标多个）；最后 complete_snapshot_review 关闭。没消化就移动时工具会拦下并告诉你怎么继续。
+- 描述保持客观（结构、细胞形态、间质、炎症等），对肿瘤/炎症/退变/反应性改变保持鉴别中立；缺少高倍细胞学证据时不要优先归为肿瘤。标注 note 写所见与鉴别要点，不只写诊断结论。
+
+其他：
+- 「已有标注」是待复核线索，不是诊断事实；其位置坐标是矩形左上角（消息附中心坐标），去看它时 goto 中心坐标。
+- goto 返回"已在目标位置"时，改换坐标或 level，不要重复同一 goto。
+- 全部完成后调用 finish 给出中文总结。"""
 
 
 # =========================================================================== #
 # 初始消息构建
 # =========================================================================== #
+DEFAULT_TASK = (
+    "客观扫读这张片：先低倍定位，再高倍确认；描述镜下所见，标出值得关注的区域并总结"
+)
+
+
 def make_main_messages(slide_name: str, task: str, info: dict) -> List[Dict[str, Any]]:
-    """fresh main 的初始 messages（system + 用户任务）。"""
+    """fresh main 的初始 messages（system + 用户任务）。
+
+    display_text 仅供 UI 恢复气泡用，发模型前会被 materialize 剥离。
+    """
     width = int(info.get("width") or 0)
     height = int(info.get("height") or 0)
     level_downsamples = tuple(info.get("level_downsamples") or (1.0,))
     mpp = info.get("mpp")
+    task_text = (task or "").strip() or DEFAULT_TASK
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": (
-            "切片：{}（{}×{} 像素，mpp={}，金字塔 {} 层）。\n"
-            "任务：{}".format(
-                slide_name, width, height,
-                "{:.4f}".format(mpp) if mpp else "未知",
-                len(level_downsamples), task or "扫一遍这张片，标出可疑区域并总结"
-            )
-        )},
+        {"role": "user",
+         "content": (
+             "切片：{}（{}×{} 像素，mpp={}，金字塔 {} 层）。\n"
+             "{}\n"
+             "任务：{}".format(
+                 slide_name, width, height,
+                 "{:.4f}".format(mpp) if mpp else "未知",
+                 len(level_downsamples), magnification_guide(info), task_text
+             )
+         ),
+         "display_text": task_text},
     ]
 
 
@@ -348,19 +388,22 @@ def make_fork_messages(slide_name: str, info: dict, spot: dict, question: str,
     y = int(geom.get("y") or 0)
     side = int(geom.get("side_px") or 0)
     note = spot.get("note") or ""
-    revision = spot.get("revision") or 1
-    change_seq = spot.get("change_seq") or 0
     size_mm = spot.get("size_mm") or 0.0
     phys = ("，物理约 {:.1f} mm".format(size_mm)) if size_mm else ""
     spot_text = (
-        "关于切片「{}」的一处已标注区域：\n"
-        "位置 level-0 ({}, {}), 边长 {} 像素{}（change_seq {})\n"
-        "你之前的判读：「{}」（revision {}, change_seq {}）\n"
-        "用户的问题：{}".format(
-            slide_name, x, y, side, phys, change_seq,
-            note, revision, change_seq, question or "请谈谈这个区域"
+        "关于切片「{}」的一处已标注区域（待复核线索，非诊断事实）：\n"
+        "位置 level-0 左上角 ({x}, {y})，边长 {side} 像素{phys}"
+        "（中心 ({cx}, {cy})，goto 请对准中心）\n"
+        "原标注文案：「{note}」\n"
+        "{guide}\n"
+        "用户的问题：{question}".format(
+            slide_name, x=x, y=y, side=side, phys=phys,
+            cx=x + side // 2, cy=y + side // 2,
+            note=note, guide=magnification_guide(info),
+            question=question or "请谈谈这个区域"
         )
     )
+    q_text = question or "请谈谈这个区域"
     parts = [{"type": "text", "text": spot_text}]
     if image_b64:
         parts.append({"type": "image_url",
@@ -369,7 +412,7 @@ def make_fork_messages(slide_name: str, info: dict, spot: dict, question: str,
         parts.append(image_ref)
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": parts},
+        {"role": "user", "content": parts, "display_text": q_text},
     ]
 
 
@@ -423,6 +466,25 @@ def _is_transient_error(exc: Exception) -> bool:
         if kw in msg:
             return True
     return False
+
+
+def _pause_cancelled(runner: Any) -> bool:
+    """若用户已取消，立即把会话置为可继续的暂停态。"""
+    if not runner.is_cancelled():
+        return False
+    runner.emit_event("agent_paused", {"summary": "已停止", "can_continue": True})
+    runner.pause()
+    return True
+
+
+def _wait_retry_or_cancel(runner: Any, delay: float) -> bool:
+    """可取消的退避等待；False 表示已处理取消。"""
+    deadline = time.monotonic() + max(0.0, delay)
+    while time.monotonic() < deadline:
+        if _pause_cancelled(runner):
+            return False
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+    return not _pause_cancelled(runner)
 
 
 def run_agent(initial_messages: List[Dict[str, Any]],
@@ -486,9 +548,7 @@ def run_agent(initial_messages: List[Dict[str, Any]],
 
         for step in range(max_steps):
             # 用户取消：不再发模型请求，未开始的 bundle 由 commit 补"用户已取消"
-            if runner.is_cancelled():
-                runner.emit_event("agent_paused", {"summary": "已停止", "can_continue": True})
-                runner.pause()
+            if _pause_cancelled(runner):
                 return
 
             runner.emit_event("agent_thinking", {"step": step})
@@ -540,15 +600,21 @@ def run_agent(initial_messages: List[Dict[str, Any]],
                         runner.emit_event("agent_retrying", {
                             "step": step, "attempt": transient_attempts,
                             "max": max_transient, "delay": delay,
-                            "reason": "网络波动，{}s 后重试（{}/{}）".format(
-                                delay, transient_attempts, max_transient),
+                            "reason": "reconnection {}/{} ({}s)".format(
+                                transient_attempts, max_transient, delay),
                         })
-                        time.sleep(delay)
+                        if not _wait_retry_or_cancel(runner, delay):
+                            return
                         continue
                     runner.emit_event("agent_error", {"error": "调用模型失败：{}".format(e),
                                                       "step": step})
                     runner.mark_error()
                     return
+
+            # 模型 HTTP 请求本身不可强制打断；返回后再次查取消标记并丢弃
+            # 停止期间产生的文本/tool_calls，避免“点了停止仍继续落标”。
+            if _pause_cancelled(runner):
+                return
 
             # 记录 usage（compact 触发判断，§3.5）
             choice = (data.get("choices") or [{}])[0]
@@ -657,6 +723,23 @@ def _finish_summary(msg: dict) -> str:
     return text or "(无总结)"
 
 
+def _clamp_pyramid_level(level: int, level_downsamples: Tuple[float, ...]) -> int:
+    """把请求的金字塔 level 夹到 [0, n-1]；空金字塔视为仅 level 0。"""
+    if not level_downsamples:
+        return 0
+    return max(0, min(int(level), len(level_downsamples) - 1))
+
+
+def _parse_goto_level(args: dict, default_level: int) -> int:
+    """解析 goto.level：区分「缺省」与合法的 0（不能用 `or`，否则 0 被吞掉）。"""
+    if "level" not in args or args.get("level") is None:
+        return int(default_level)
+    try:
+        return int(args.get("level"))
+    except (TypeError, ValueError):
+        return int(default_level)
+
+
 def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
                   level_downsamples: Tuple[float, ...], runner: Any,
                   kind: str, ctx: dict) -> Tuple[Any, bool]:
@@ -673,17 +756,62 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
                     "create_annotation/mark_observation）后再移动。"), False
         gx = _to_num(args.get("x"))
         gy = _to_num(args.get("y"))
-        glvl = int(args.get("level") or st.pyramidLevel)
+        requested = _parse_goto_level(args, st.pyramidLevel)
+        # 先把过期/越界的持久化 level 归一到有效层，再判断 no-op
+        prev_eff = st.effective_level(level_downsamples)
+        if st.pyramidLevel != prev_eff:
+            st.pyramidLevel = prev_eff
+        # 步长 clamp：单次最多变 ±MAX_LEVEL_DELTA 层（像物镜转盘），超步长先夹
+        # 步长并生成警告文本给模型看；再做既有范围 clamp。
+        cur = st.pyramidLevel
+        if abs(requested - cur) > MAX_LEVEL_DELTA:
+            step_req = cur + (MAX_LEVEL_DELTA if requested > cur else -MAX_LEVEL_DELTA)
+            step_note = ("单次 goto 最多变 2 层（当前 level={cur}）；"
+                         "请求 level={requested} 已夹到 {step_req}。"
+                         "请渐进变倍：确认本层视野后再继续。".format(
+                             cur=cur, requested=requested, step_req=step_req))
+        else:
+            step_req = requested
+            step_note = ""
+        glvl = _clamp_pyramid_level(step_req, level_downsamples)
+        same_xy = (round(float(gx)) == round(float(st.centerX)) and
+                   round(float(gy)) == round(float(st.centerY)))
+        same_lvl = glvl == st.pyramidLevel
+        if same_xy and same_lvl:
+            mag = st.magnification_label(level_downsamples)
+            if requested != glvl:
+                return ("已在目标位置 ({:.0f},{:.0f})（{}）。"
+                        "请求 level={} 已夹到有效层 {}；请改换坐标或切换其他 level，"
+                        "不要重复相同的 goto。".format(
+                            st.centerX, st.centerY, mag, requested, glvl)), False
+            return ("已在目标位置 ({:.0f},{:.0f})（{}）。"
+                    "请改换坐标、切换其他 level，或直接 snapshot / 继续判读，"
+                    "不要重复相同的 goto。".format(
+                        st.centerX, st.centerY, mag)), False
         st.centerX, st.centerY = float(gx), float(gy)
-        st.pyramidLevel = max(0, glvl)
+        st.pyramidLevel = glvl
         mag = st.magnification_label(level_downsamples)
         runner.emit_event("tool_started", {
             "tool": "goto", "x": st.centerX, "y": st.centerY,
             "level": st.pyramidLevel, "magnification": mag,
             "reason": args.get("reason") or "",
+            "requested_level": requested,
         })
-        return ("已移动到 ({:.0f},{:.0f}) level={}，当前 {}。".format(
-            st.centerX, st.centerY, st.pyramidLevel, mag)), False
+        # note 拼接：无 clamp 空；仅步长 clamp 用 step_note；步长+请求越界都用
+        # step_note + 范围夹取说明；仅范围 clamp 保持既有格式（全角括号包裹）。
+        # 「范围 clamp」= 原始请求 level 超出有效金字塔范围（含步长夹到界内后
+        # 仍越界的情况，如 99→2），而非仅 step_req!=glvl。
+        note = ""
+        req_out_of_range = (_clamp_pyramid_level(requested, level_downsamples) != requested)
+        if step_note and req_out_of_range:
+            note = "（{}；请求 level={} 已夹到有效层 {}）".format(
+                step_note, requested, glvl)
+        elif step_note:
+            note = "（{}）".format(step_note)
+        elif requested != glvl:
+            note = "（请求 level={} 已夹到有效层 {}）".format(requested, glvl)
+        return ("已移动到 ({:.0f},{:.0f})，当前 {}{}。".format(
+            st.centerX, st.centerY, mag, note)), False
 
     if name == "snapshot":
         if runner.is_snapshot_pending():
@@ -702,7 +830,9 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
             return "抓取快照失败：{}".format(e), False
         img_b64 = r.get("image_base64") or ""
         src = r.get("src") or bb
-        mag = r.get("magnification") or st.magnification_label(level_downsamples)
+        # region 的裸数字只用于内部换算；给模型/UI 的值必须保留 level 与
+        # 高低倍语义，否则弱模型容易把约 21x 当成本片高倍。
+        mag = st.magnification_label(level_downsamples)
         runner.emit_event("snapshot_captured", {
             "bboxLevel0": src, "magnification": mag,
             "out_w": r.get("width"), "out_h": r.get("height"),
@@ -716,10 +846,23 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
             "magnification": mag,
         }
         runner.set_pending_snapshot(tc_id, src, image_ref)
-        tool_text = ("快照区域 level-0 bbox={bx},{by},{bw},{bh}，放大 {mag}，"
-                     "输出 {w}×{h} 像素。".format(
-                         bx=src.get("x"), by=src.get("y"), bw=src.get("w"), bh=src.get("h"),
-                         mag=mag, w=r.get("width"), h=r.get("height")))
+        tool_text = ("快照区域 level-0 bbox={bx},{by},{bw},{bh}，放大 {mag}，".format(
+            bx=src.get("x"), by=src.get("y"), bw=src.get("w"), bh=src.get("h"),
+            mag=mag))
+        # 覆盖度分档引导（参考 pi-tools.ts snapshotBlocks）：coverage = bbox 宽 /
+        # 切片宽线性百分比；width 缺失时 cov=0 走中倍档。
+        slide_w = float((ctx.get("info") or {}).get("width") or 0)
+        bw = float(src.get("w") or 0)
+        cov = (bw / slide_w * 100.0) if slide_w > 0 and bw > 0 else 0.0
+        if cov > 90:
+            hint = "全片概览级：选定候选区，消化本快照后 goto 该处并降 1-2 级放大。"
+        elif cov > 40:
+            hint = "低倍：看到目标就消化本快照、goto 其坐标并降 1-2 级确认。"
+        elif 0 < cov < 15:
+            hint = "高倍：目标清晰即可 create_annotation 落标，不必再放大。"
+        else:
+            hint = "中倍：目标清晰可标注；否则消化后继续降 1-2 级。"
+        tool_text += "覆盖全片约 {cov:.1f}%。{hint}".format(cov=cov, hint=hint)
         return {
             "text": tool_text,
             "image_base64": img_b64,
@@ -734,9 +877,8 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
     if name == "mark_observation":
         pending = runner.snapshot_state()
         snap_id = pending.get("snapshot_id")
-        if args.get("snapshot_id") != snap_id or not snap_id:
-            return ("mark_observation 必须引用当前 pending 的 snapshot_id（当前：{}）。"
-                    .format(snap_id or "无")), False
+        if not snap_id:
+            return "当前没有待消化的快照；请先 snapshot。", False
         label = args.get("label") or ""
         note = args.get("note") or ""
         x = _to_num(args.get("x"))
@@ -747,7 +889,7 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
             "label": label,
             "note": note,
             "bbox": {"x": x, "y": y, "w": w, "h": h},
-            "no_annotation_reason": args.get("no_annotation_reason") or "",
+            "no_annotation_reason": "",
             "snapshot_id": snap_id,
             "ts": time.time(),
         }
@@ -766,9 +908,8 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
             return "fork 会话不允许 create_annotation（批注只做问答，不改标注库）。", False
         pending = runner.snapshot_state()
         snap_id = pending.get("snapshot_id")
-        if args.get("snapshot_id") != snap_id or not snap_id:
-            return ("create_annotation 必须引用当前 pending 的 snapshot_id（当前：{}）。"
-                    .format(snap_id or "无")), False
+        if not snap_id:
+            return "当前没有待消化的快照；请先 snapshot。", False
         alabel = args.get("label") or "AI 建议"
         ax = _to_num(args.get("x"))
         ay = _to_num(args.get("y"))
@@ -788,24 +929,31 @@ def _execute_tool(name: str, args: dict, tc_id: str, st: "AgentState",
             "side_px": aside, "note": anote, "index": index,
             "annotation_id": roi.get("annotation_id") if roi else None,
         })
-        return ("已落标注「{}」于 ({:.0f},{:.0f}) 边长 {} 像素。".format(
-            alabel, ax, ay, aside)), False
+        return ("已落标注「{}」于左上角 ({:.0f},{:.0f}) 边长 {} 像素"
+                "（中心 ({:.0f},{:.0f})）。".format(
+                    alabel, ax, ay, aside, ax + aside / 2.0, ay + aside / 2.0)), False
 
     if name == "complete_snapshot_review":
         pending = runner.snapshot_state()
         snap_id = pending.get("snapshot_id")
-        if args.get("snapshot_id") != snap_id or not snap_id:
-            return ("complete_snapshot_review 的 snapshot_id 与当前 pending（{}）不匹配。"
-                    .format(snap_id or "无")), False
+        if not snap_id:
+            return "当前没有待消化的快照；请先 snapshot。", False
         disposition = args.get("disposition") or ""
         if disposition not in ("annotated", "no_annotation"):
             return "disposition 必须是 annotated 或 no_annotation。", False
         if disposition == "no_annotation" and not (args.get("no_annotation_reason") or "").strip():
-            return "disposition=no_annotation 时必须提供 no_annotation_reason。", False
+            return "disposition=no_annotation 时请给 no_annotation_reason（一句话即可，如：导航确认 / 无明确异常）。", False
+        summary = (args.get("summary") or "").strip()
+        if not summary:
+            # 兜底：缺省时取本次观察里最后一条该快照的 note/label
+            for obs in reversed(runner.get_data().get("observations") or []):
+                if obs.get("snapshot_id") == snap_id:
+                    summary = obs.get("note") or obs.get("label") or ""
+                    break
         runner.complete_snapshot_review(snap_id)
         runner.emit_event("snapshot_reviewed", {
             "snapshot_id": snap_id, "disposition": disposition,
-            "summary": args.get("summary") or "",
+            "summary": summary,
             "no_annotation_reason": args.get("no_annotation_reason") or "",
         })
         return ("已关闭快照 {sid}（{disp}）。".format(sid=snap_id, disp=disposition)), False

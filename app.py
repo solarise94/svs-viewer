@@ -1281,6 +1281,62 @@ def _slide_fingerprint(safe: str) -> str:
         return ""
 
 
+def _overlay_coord_ticks(img, x0, y0, w0, h0):
+    """在 AI 快照图像顶缘/左缘画 level-0 坐标刻度（视觉尺子）。
+
+    只画刻度与数值，不画网格/倍率文字——倍率等结构化信息随文本返回；
+    图像刻度的唯一用途是让模型看着图内特征读出它的 level-0 坐标。
+    移植自 VirtualMicroscope services/slide-server/reader.py overlay_viewfinder。
+    """
+    from PIL import ImageDraw, ImageFont
+
+    try:
+        iw, ih = img.size
+        draw = ImageDraw.Draw(img, "RGBA")
+        font_size = max(12, min(iw, ih) // 48)
+        try:
+            # Pillow>=10.1 支持 size；旧版 TypeError 时回退默认字体
+            font = ImageFont.load_default(size=font_size)
+        except TypeError:
+            font = ImageFont.load_default()
+        tick_color = (0, 255, 255, 230)  # 青色
+        shadow = (0, 0, 0, 220)
+        n_ticks = 5
+
+        # X 轴刻度（顶缘）：竖短线 + level-0 X 值
+        for i in range(n_ticks):
+            frac = i / (n_ticks - 1)
+            px = min(int(iw * frac), iw - 1)  # 最右刻度线防出画布
+            l0x = int(x0 + w0 * frac)
+            draw.line([(px, 0), (px, 10)], fill=tick_color, width=2)
+            label = str(l0x)
+            # 最右侧刻度文字防溢出：估算宽度，超界则左移
+            try:
+                tw = draw.textlength(label, font=font)
+            except Exception:  # noqa: BLE001
+                tw = 0
+            tx = px + 2
+            if tx + tw > iw:
+                tx = max(0, iw - tw - 2)
+            draw.text((tx + 1, 1), label, fill=shadow, font=font)
+            draw.text((tx, 0), label, fill=tick_color, font=font)
+
+        # Y 轴刻度（左缘）：横短线 + level-0 Y 值
+        for i in range(n_ticks):
+            frac = i / (n_ticks - 1)
+            py = min(int(ih * frac), ih - 1)  # 最下刻度线防出画布
+            l0y = int(y0 + h0 * frac)
+            draw.line([(0, py), (10, py)], fill=tick_color, width=2)
+            # 底部标签防出界：保证读数完整可见
+            ty = min(py + 1, ih - font_size - 2)
+            draw.text((2, ty + 1), str(l0y), fill=shadow, font=font)
+            draw.text((1, ty), str(l0y), fill=tick_color, font=font)
+    except Exception:  # noqa: BLE001
+        # 画刻度失败不影响出图
+        pass
+    return img
+
+
 def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
     """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。"""
     with slide_cache.borrow_pair(entry) as pair:
@@ -1319,6 +1375,8 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
                 ds_lvl = 1.0
             base = 10.0 / mpp
             mag = base / ds_lvl if ds_lvl > 0 else base
+    # AI 快照图像画 level-0 坐标刻度尺（视觉尺子，失败不影响出图）
+    _overlay_coord_ticks(region, x2, y2, w2, h2)
     buf = io.BytesIO()
     region.save(buf, format="JPEG", quality=85)
     img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -1342,7 +1400,8 @@ def api_ai_run():
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     task = body.get("task") or ""
-    fresh = bool(body.get("fresh"))
+    # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
+    fresh = bool(body.get("fresh")) or request.args.get("fresh") == "1"
     safe = _validate_ai_slide(slide)
     _require_ai_configured()
 
@@ -1413,8 +1472,9 @@ def api_ai_ask():
         # 追加用户问题
         with ai_session._SessionLock(runner.session_id):
             data = runner.get_data()
+            q_text = question or "请谈谈这个区域"
             data.setdefault("canonical_messages", []).append(
-                {"role": "user", "content": question or "请谈谈这个区域"})
+                {"role": "user", "content": q_text, "display_text": q_text})
             ai_session.write_session(runner.session_id, data)
         initial_messages = None  # 用 canonical 续跑
     else:
@@ -1445,11 +1505,21 @@ def api_ai_ask():
 
 @app.route("/api/ai/cancel", methods=["POST"])
 def api_ai_cancel():
-    """显式取消（写 cancel_requested，§5.4）。body: {session_id}。"""
+    """显式取消（写 cancel_requested，§5.4）。body: {session_id?, slide?}。
+
+    slide 是首个 SSE 事件/会话 id 尚未到达浏览器时的兜底，只解析该切片的
+    main 会话，避免“刚启动就点停止”漏掉后台 worker。
+    """
     body = request.get_json(silent=True) or {}
     session_id = body.get("session_id")
     if not isinstance(session_id, str) or not session_id:
-        return jsonify(error="缺少 session_id"), 400
+        slide = body.get("slide")
+        if not isinstance(slide, str) or not slide:
+            return jsonify(error="缺少 session_id 或 slide"), 400
+        safe = _sanitize_name(slide)
+        session_id = ai_session.list_session_ids_by_slide(safe).get("main")
+        if not session_id:
+            return jsonify(error="会话不存在"), 404
     data = ai_session.read_session(session_id)
     if data is None:
         return jsonify(error="会话不存在"), 404
@@ -1666,10 +1736,14 @@ def _start_main_worker(runner, ctx, materializer, task, fresh, resumed=False):
                 })
             else:
                 # continue：从落库 state + messages 续跑（§4.1/§3.3）
+                runner.ensure_current_system_prompt()
                 runner.inject_spot_changes()
                 data = runner.get_data()
                 initial = runner.materialize_request_messages()
                 st = ai_agent.AgentState.from_dict(data.get("agent_state"), mpp)
+                # 旧会话可能持久化了越界 pyramid_level；恢复时夹到有效层
+                st.pyramidLevel = st.effective_level(downsamples)
+                runner.set_agent_state(st.to_dict())
                 runner.emit_event("session_resumed", {
                     "session_id": runner.session_id,
                     "status": data.get("status"),
@@ -1699,13 +1773,17 @@ def _start_fork_worker(runner, ctx, materializer, annotation_id, question):
     def worker():
         try:
             runner.start_heartbeat_thread()
+            runner.ensure_current_system_prompt()
             runner.inject_spot_changes()
             data = runner.get_data()
             initial = runner.materialize_request_messages()
             info = ctx.get("info") or {}
             mpp = info.get("mpp")
-            # fork 初始视口：定位到根标注中心
+            downsamples = tuple(info.get("level_downsamples") or (1.0,))
+            # fork 初始视口：定位到根标注中心；归一越界 level
             st = ai_agent.AgentState.from_dict(data.get("agent_state"), mpp)
+            st.pyramidLevel = st.effective_level(downsamples)
+            runner.set_agent_state(st.to_dict())
             runner.emit_event("fork_resumed", {
                 "session_id": runner.session_id,
                 "annotation_id": annotation_id,
@@ -1817,7 +1895,8 @@ def _sse_response(session_id: str):
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no"})
+                             "X-Accel-Buffering": "no",
+                             "X-AI-Session-ID": session_id})
 
 
 
