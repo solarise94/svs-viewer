@@ -46,6 +46,7 @@ os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)  # ai_config 写入前�
 open(os.path.join(os.environ["UPLOAD_DIR"], "a.svs"), "wb").close()
 
 import app as app_mod  # noqa: E402
+import ai_agent  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -278,7 +279,62 @@ def test_main_flow():
     r = client.get("/api/ai/session/" + sid)
     detail = r.get_json()
     check("detail 返回 transcript", isinstance(detail.get("transcript"), list))
+    # display_text：UI 气泡用，不暴露 canonical 切片上下文
+    user_msgs = [m for m in (detail.get("transcript") or []) if m.get("role") == "user"]
+    check("user 消息带 display_text",
+          any(m.get("display_text") == "扫一遍" for m in user_msgs))
     return sid
+
+
+def test_fresh_query_param():
+    """前端历史上把 fresh=1 放 query；后端应与 JSON body 双重兼容。"""
+    print("== test_fresh_query_param ==")
+    reset_all()
+    script = [
+        _choice({"role": "assistant", "content": "好",
+                 "tool_calls": [_tool_call("f1", "finish", {"summary": "完"})]}),
+        _choice({"role": "assistant", "content": "新",
+                 "tool_calls": [_tool_call("f2", "finish", {"summary": "新会话"})]}),
+        _choice({"role": "assistant", "content": "续",
+                 "tool_calls": [_tool_call("f3", "finish", {"summary": "续跑"})]}),
+    ]
+    mock = MockModel(script)
+    import requests
+    requests.post = mock
+    client = app_mod.app.test_client()
+
+    # 第一次：body 无 fresh，但 query fresh=1 → 应走 fresh（slide_opened，非 session_resumed）
+    resp = client.post("/api/ai/run?fresh=1",
+                       json={"slide": "a.svs", "task": "第一次"},
+                       content_type="application/json")
+    check("query fresh=1 → 200", resp.status_code == 200)
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("query fresh 发 slide_opened", "slide_opened" in types)
+    check("query fresh 不发 session_resumed", "session_resumed" not in types)
+    sid1 = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid1 = p.get("session_id")
+
+    # 第二次：再 fresh=1 → 归档旧 main，新 session（不应复用 sid1）
+    resp2 = client.post("/api/ai/run?fresh=1",
+                        json={"slide": "a.svs", "task": "第二次", "fresh": True},
+                        content_type="application/json")
+    events2 = _parse_sse(resp2.get_data(as_text=True))
+    sid2 = None
+    for (_, t, p) in events2:
+        if t == "slide_opened" and p:
+            sid2 = p.get("session_id")
+    check("再次 fresh 新建 session", bool(sid2) and sid2 != sid1)
+
+    # 第三次：无 fresh → 复用现有 main，发 session_resumed
+    resp3 = client.post("/api/ai/run",
+                        json={"slide": "a.svs", "task": "续"},
+                        content_type="application/json")
+    events3 = _parse_sse(resp3.get_data(as_text=True))
+    types3 = [t for (_, t, _) in events3]
+    check("无 fresh 发 session_resumed", "session_resumed" in types3)
 
 
 def test_pause_continue():
@@ -356,6 +412,8 @@ def test_cancel():
     for (_, t, p) in events:
         if t == "slide_opened" and p:
             sid = p.get("session_id")
+    check("SSE 响应头立即带 session id",
+          resp.headers.get("X-AI-Session-ID") == sid)
     # 取消
     r = client.post("/api/ai/cancel", json={"session_id": sid})
     check("cancel 200", r.status_code == 200)
@@ -367,6 +425,233 @@ def test_cancel():
     # 未开始的 create_annotation（snapshot 未 pending → 会被拒/或取消）不落标
     rois = share_store.list_rois("admin")
     check("取消后无 X 标注", all(x.get("label") != "X" for x in rois))
+
+    # 首个 SSE 事件尚未到浏览器时，前端只能用 slide 取消。
+    r2 = client.post("/api/ai/cancel", json={"slide": "a.svs"})
+    check("按 slide 兜底取消 200", r2.status_code == 200)
+
+
+def test_cancel_discards_model_response():
+    """模型请求期间取消：响应返回后不得再输出文本或执行工具。"""
+    print("== test_cancel_discards_model_response ==")
+    reset_all()
+
+    class CancelBeforeReturn(MockModel):
+        def __call__(self, url, headers=None, json=None, timeout=None):
+            sid = ai_session.list_session_ids_by_slide("a.svs").get("main")
+            if sid:
+                ai_session.SessionRunner(sid).mark_cancelled()
+            return super().__call__(url, headers=headers, json=json, timeout=timeout)
+
+    script = [_choice({"role": "assistant", "content": "这段不应显示",
+                       "tool_calls": [_tool_call("late", "finish", {"summary": "不应完成"})]})]
+    import requests
+    requests.post = CancelBeforeReturn(script)
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": True})
+    events = _parse_sse(resp.get_data(as_text=True))
+    types = [t for (_, t, _) in events]
+    check("取消后进入 paused", "agent_paused" in types)
+    check("取消后不发 text_delta", "text_delta" not in types)
+    check("取消后不 finished", "agent_finished" not in types)
+
+
+def test_slide_magnification_guide():
+    print("== test_slide_magnification_guide ==")
+    info = {"mpp": 0.242, "level_downsamples": (1.0, 2.0, 4.0)}
+    guide = ai_agent.magnification_guide(info)
+    check("0.242 mpp 的 level 0 明确为约 41x 高倍",
+          "level 0≈41x（高倍）" in guide, guide)
+    check("downsample 2 明确为约 21x 中低倍",
+          "level 1≈21x（中低倍）" in guide, guide)
+    st = ai_agent.AgentState(0, 0, 1024, 1, 0.242)
+    label = st.magnification_label((1.0, 2.0, 4.0))
+    check("快照倍率标签保留 level 与低倍语义",
+          "21x" in label and "低倍" in label and "level=1" in label, label)
+
+
+def test_pick_overview_level_tolerance():
+    """概览层选择带 5% 容差：差 0.8% 不该掉一整级（0.6x → 0.3x 回归）。"""
+    print("== test_pick_overview_level_tolerance ==")
+    ds = (1.0, 2.00004, 4.00016, 8.00091, 16.00279, 32.01112, 64.04444, 128.17787)
+    # 真实案例：66061×46199 的片，vp=1024 时 level 6 覆盖 65582（差 0.7%）
+    lvl = ai_agent.AgentState.pick_overview_level(66061, 46199, ds, 1024)
+    check("差 0.7% 时选 level 6 而非掉到 7", lvl == 6, lvl)
+    # 差太多仍按原规则掉级：宽度 ×1.2 后 level 6 覆盖 < 95%，选 7
+    lvl2 = ai_agent.AgentState.pick_overview_level(80000, 46199, ds, 1024)
+    check("覆盖不足 95% 仍掉到 level 7", lvl2 == 7, lvl2)
+    # 小片精确命中不受影响
+    lvl3 = ai_agent.AgentState.pick_overview_level(60000, 40000, ds, 1024)
+    check("精确覆盖仍选 level 6", lvl3 == 6, lvl3)
+
+
+class _FakeGotoRunner:
+    def __init__(self):
+        self.events = []
+        self._pending = False
+
+    def is_snapshot_pending(self):
+        return self._pending
+
+    def emit_event(self, typ, payload):
+        self.events.append((typ, payload))
+
+
+def test_goto_level_zero_and_clamp():
+    """level=0 不得被 or 吞掉；越界 level 夹到有效层；同坐标同 level 为 no-op。"""
+    print("== test_goto_level_zero_and_clamp ==")
+    downs = (1.0, 4.0, 16.0)  # level 0/1/2
+    st = ai_agent.AgentState(5000, 4000, 1024, 2, 0.25)
+    runner = _FakeGotoRunner()
+
+    # 当前 level 2 → 请求 level 0（最高倍）
+    result, done = ai_agent._execute_tool(
+        "goto", {"x": 100, "y": 200, "level": 0, "reason": "高倍确认"},
+        "g0", st, downs, runner, "main", {})
+    check("level0 goto 未结束", done is False)
+    check("状态 pyramidLevel=0", st.pyramidLevel == 0, st.pyramidLevel)
+    check("结果含 level=0", "level=0" in str(result), result)
+    check("坐标已更新", round(st.centerX) == 100 and round(st.centerY) == 200)
+    check("发出 tool_started", any(t == "tool_started" for t, _ in runner.events))
+    ev = [p for t, p in runner.events if t == "tool_started"][-1]
+    check("事件 level=0", ev.get("level") == 0, ev)
+    check("倍率标签为高倍 level0",
+          "level=0" in (ev.get("magnification") or ""), ev.get("magnification"))
+
+    # 越界 level=99 → 夹到最后一层 2
+    n_ev = len(runner.events)
+    result2, _ = ai_agent._execute_tool(
+        "goto", {"x": 300, "y": 400, "level": 99},
+        "g99", st, downs, runner, "main", {})
+    check("越界夹到 max level=2", st.pyramidLevel == 2, st.pyramidLevel)
+    check("结果提示夹取", "夹到有效层" in str(result2), result2)
+    ev2 = [p for t, p in runner.events[n_ev:] if t == "tool_started"][-1]
+    check("事件持久化 level=2 非 99", ev2.get("level") == 2, ev2)
+    check("事件保留 requested_level=99", ev2.get("requested_level") == 99, ev2)
+    check("倍率标签用有效层", "level=2" in (ev2.get("magnification") or ""),
+          ev2.get("magnification"))
+
+    # 同坐标同实际 level → no-op，不发新事件
+    n_ev2 = len(runner.events)
+    result3, _ = ai_agent._execute_tool(
+        "goto", {"x": 300, "y": 400, "level": 2},
+        "gnoop", st, downs, runner, "main", {})
+    check("noop 不推进状态", st.pyramidLevel == 2 and round(st.centerX) == 300)
+    check("noop 提示勿重复", "不要重复" in str(result3), result3)
+    check("noop 不发 tool_started", len(runner.events) == n_ev2)
+
+    # 缺省 level 字段时回退当前层（仍可移动坐标）
+    result4, _ = ai_agent._execute_tool(
+        "goto", {"x": 10, "y": 20},
+        "gdef", st, downs, runner, "main", {})
+    check("缺省 level 保持当前层", st.pyramidLevel == 2, st.pyramidLevel)
+    check("缺省 level 仍可改坐标", round(st.centerX) == 10 and round(st.centerY) == 20)
+
+    # 旧状态 pyramidLevel=99：同坐标请求越界 level 仍说明夹取，并归一状态
+    st_stale = ai_agent.AgentState(10, 20, 1024, 99, 0.25)
+    n_ev3 = len(runner.events)
+    result5, _ = ai_agent._execute_tool(
+        "goto", {"x": 10, "y": 20, "level": 99},
+        "gstale", st_stale, downs, runner, "main", {})
+    check("旧状态 99 归一为 2", st_stale.pyramidLevel == 2, st_stale.pyramidLevel)
+    check("同坐标越界仍返回夹取说明", "夹到有效层" in str(result5), result5)
+    check("请求 99 出现在夹取说明里", "level=99" in str(result5), result5)
+    check("归一+夹取 no-op 不发 tool_started", len(runner.events) == n_ev3)
+
+
+def test_continue_refreshes_system_prompt_and_level():
+    """旧会话 continue：刷新 system 为当前政策；越界 pyramid_level 归一。"""
+    print("== test_continue_refreshes_system_prompt_and_level ==")
+    reset_all()
+    cfg_path = os.path.join(os.environ["SHARE_DATA_DIR"], "ai_config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"base_url": "http://mock/v1", "api_key": "k", "model": "m",
+                   "max_tokens": 256, "max_steps": 1}, f, ensure_ascii=False)
+    script = [
+        _choice({"role": "assistant", "content": "",
+                 "tool_calls": [_tool_call("g1", "goto", {"x": 100, "y": 200, "level": 1,
+                                                          "reason": "看看"})]}),
+        _choice({"role": "assistant", "content": "完了",
+                 "tool_calls": [_tool_call("f1", "finish", {"summary": "总结"})]}),
+    ]
+    mock = MockModel(script)
+    import requests
+    requests.post = mock
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "t", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    sid = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid = p.get("session_id")
+    check("有 session", bool(sid))
+
+    # 污染：旧肿瘤倾向 system + 越界 level
+    OLD_SYS = "你是助手。看清目标后立即落标，优先标出可疑肿瘤区域。"
+    with ai_session._SessionLock(sid):
+        data = ai_session.read_session(sid)
+        msgs = data.get("canonical_messages") or []
+        for i, m in enumerate(msgs):
+            if m.get("role") == "system":
+                msgs[i] = dict(m, content=OLD_SYS)
+        data["canonical_messages"] = msgs
+        st = data.get("agent_state") or {}
+        st["pyramid_level"] = 99
+        data["agent_state"] = st
+        data["status"] = "paused"
+        ai_session.write_session(sid, data)
+
+    data_before = ai_session.read_session(sid)
+    check("污染后 system 是旧文案",
+          any(m.get("role") == "system" and m.get("content") == OLD_SYS
+              for m in (data_before.get("canonical_messages") or [])))
+    check("污染后 level=99",
+          (data_before.get("agent_state") or {}).get("pyramid_level") == 99)
+
+    resp2 = client.post("/api/ai/continue", json={"slide": "a.svs"})
+    _parse_sse(resp2.get_data(as_text=True))
+    data_after = ai_session.read_session(sid)
+    sys_msgs = [m for m in (data_after.get("canonical_messages") or [])
+                if m.get("role") == "system"]
+    check("continue 后 system 已换新政策",
+          sys_msgs and sys_msgs[0].get("content") == ai_agent.SYSTEM_PROMPT)
+    check("continue 后 system 含诊断中立",
+          "缺少高倍" in (sys_msgs[0].get("content") or ""))
+    # mock slide downs=(1,4,16) → max level 2
+    check("continue 后 pyramid_level 归一",
+          (data_after.get("agent_state") or {}).get("pyramid_level") == 2,
+          data_after.get("agent_state"))
+
+
+def test_goto_level_zero_in_flow():
+    """端到端：概览层起步后模型请求 level 0，事件与 transcript 均应落到 0。"""
+    print("== test_goto_level_zero_in_flow ==")
+    reset_all()
+    script = [
+        _choice({"role": "assistant", "content": "",
+                 "tool_calls": [_tool_call("g0", "goto",
+                                          {"x": 123, "y": 456, "level": 0,
+                                           "reason": "高倍确认细胞"})]}),
+        _choice({"role": "assistant", "content": "完",
+                 "tool_calls": [_tool_call("f0", "finish", {"summary": "ok"})]}),
+    ]
+    mock = MockModel(script)
+    import requests
+    requests.post = mock
+    client = app_mod.app.test_client()
+    resp = client.post("/api/ai/run", json={"slide": "a.svs", "task": "高倍看一下", "fresh": 1})
+    events = _parse_sse(resp.get_data(as_text=True))
+    gotos = [p for (_, t, p) in events if t == "tool_started" and p and p.get("tool") == "goto"]
+    check("有 goto 事件", len(gotos) >= 1)
+    check("flow goto level=0", gotos[0].get("level") == 0, gotos[0])
+    # 会话 agent_state 也应为 0
+    sid = None
+    for (_, t, p) in events:
+        if t == "slide_opened" and p:
+            sid = p.get("session_id")
+    data = ai_session.read_session(sid) if sid else None
+    st = (data or {}).get("agent_state") or {}
+    check("持久化 pyramid_level=0", st.get("pyramid_level") == 0, st)
 
 
 def test_fork_flow():
@@ -743,6 +1028,100 @@ def test_snapshot_reviewed_has_no_annotation_reason():
               p.get("no_annotation_reason") == "仅见炎症细胞")
 
 
+class _FakeDigestRunner:
+    """消化工具用 fake runner：snapshot_state + observations + 事件。"""
+
+    def __init__(self, pending_id="snap1", observations=None):
+        self._pending = pending_id
+        self.observations = list(observations or [])
+        self.events = []
+        self.completed = None
+
+    def snapshot_state(self):
+        return {"snapshot_id": self._pending} if self._pending else {}
+
+    def get_data(self):
+        return {"observations": self.observations}
+
+    def add_observation(self, obs):
+        self.observations.append(obs)
+
+    def emit_event(self, typ, payload):
+        self.events.append((typ, payload))
+
+    def complete_snapshot_review(self, snap_id):
+        self.completed = snap_id
+        self._pending = None
+        return True
+
+
+def _digest_ctx():
+    return ai_agent.AgentState(0, 0, 1024, 0, 0.25), (1.0, 4.0, 16.0)
+
+
+def test_digest_without_snapshot_id():
+    """不带 snapshot_id 也能 mark_observation / complete（服务端跟踪 pending）。"""
+    print("== test_digest_without_snapshot_id ==")
+    st, downs = _digest_ctx()
+    runner = _FakeDigestRunner(pending_id="snap1")
+    # mark_observation 不带 snapshot_id
+    res, done = ai_agent._execute_tool(
+        "mark_observation", {"label": "ob", "note": "所见", "x": 1, "y": 2, "w": 3, "h": 4},
+        "t1", st, downs, runner, "main", {})
+    check("mark_observation 不带 id 成功", done is False and "已记录观察" in str(res), res)
+    check("观察落库带 snapshot_id", bool(runner.observations) and
+          runner.observations[-1].get("snapshot_id") == "snap1")
+    # complete 不带 snapshot_id
+    res2, done2 = ai_agent._execute_tool(
+        "complete_snapshot_review", {"disposition": "annotated", "summary": "s"},
+        "t2", st, downs, runner, "main", {})
+    check("complete 不带 id 成功", done2 is False and "已关闭快照" in str(res2), res2)
+    check("complete 关闭的是当前 pending", runner.completed == "snap1")
+
+
+def test_complete_fallback_summary():
+    """complete 缺省 summary 时兜底到最后一条该快照 observation 的 note。"""
+    print("== test_complete_fallback_summary ==")
+    st, downs = _digest_ctx()
+    runner = _FakeDigestRunner(
+        pending_id="snap9",
+        observations=[{"snapshot_id": "snap9", "note": "未见异常病灶", "label": "正常"},
+                      {"snapshot_id": "snap0", "note": "别处", "label": "x"}])
+    res, done = ai_agent._execute_tool(
+        "complete_snapshot_review", {"disposition": "annotated"},
+        "t1", st, downs, runner, "main", {})
+    check("缺省 summary 仍成功", done is False and "已关闭快照" in str(res), res)
+    reviewed = [p for (t, p) in runner.events if t == "snapshot_reviewed"]
+    check("snapshot_reviewed 发出", len(reviewed) == 1)
+    check("兜底 summary 取最后观察 note",
+          reviewed and reviewed[0].get("summary") == "未见异常病灶",
+          reviewed[0] if reviewed else None)
+
+
+def test_digest_no_pending():
+    """无 pending 快照时三个消化工具都返回"当前没有待消化的快照"。"""
+    print("== test_digest_no_pending ==")
+    st, downs = _digest_ctx()
+    runner = _FakeDigestRunner(pending_id=None)
+    for name, args in [
+        ("mark_observation", {"label": "ob"}),
+        ("create_annotation", {"label": "L", "x": 1, "y": 1, "side_px": 10}),
+        ("complete_snapshot_review", {"disposition": "annotated"}),
+    ]:
+        res, done = ai_agent._execute_tool(name, args, "t", st, downs, runner, "main", {})
+        check("无 pending 被拦：{}".format(name),
+              "当前没有待消化的快照；请先 snapshot。" in str(res), res)
+
+
+def test_guide_shows_0_3x_not_0x():
+    """guide 中 mag<1 的层显示为 0.3x 而非 0x。"""
+    print("== test_guide_shows_0_3x_not_0x ==")
+    info = {"mpp": 0.25, "level_downsamples": (1.0, 4.0, 16.0, 64.0, 128.0)}
+    guide = ai_agent.magnification_guide(info)
+    check("全片概览层显示 0.3x", "≈0.3x" in guide, guide)
+    check("不显示为 0x", "≈0x" not in guide, guide)
+
+
 def reset_all():
     """清空 share_store 与 ai_sessions。"""
     share_store.SHARE_FILE.unlink(missing_ok=True)
@@ -766,8 +1145,15 @@ if __name__ == "__main__":
     _monkeypatch_region()
 
     test_main_flow()
+    test_fresh_query_param()
     test_pause_continue()
     test_cancel()
+    test_cancel_discards_model_response()
+    test_slide_magnification_guide()
+    test_pick_overview_level_tolerance()
+    test_goto_level_zero_and_clamp()
+    test_continue_refreshes_system_prompt_and_level()
+    test_goto_level_zero_in_flow()
     test_fork_flow()
     test_reconnect_replay()
     test_context_continuity()
@@ -780,5 +1166,9 @@ if __name__ == "__main__":
     test_event_reset()
     test_length_truncation_pauses()
     test_snapshot_reviewed_has_no_annotation_reason()
+    test_digest_without_snapshot_id()
+    test_complete_fallback_summary()
+    test_digest_no_pending()
+    test_guide_shows_0_3x_not_0x()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

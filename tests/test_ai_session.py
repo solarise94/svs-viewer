@@ -448,6 +448,42 @@ def test_default_max_steps():
     check("_merge_config 可覆盖 max_steps", ai_session._merge_config({"max_steps": 3})["max_steps"] == 3)
 
 
+def test_display_text_stripped():
+    print("== test_display_text_stripped ==")
+    cfg = ai_session._merge_config({"base_url": "http://x", "api_key": "k", "model": "m"})
+    r = ai_session.SessionRunner.acquire("a.svs", "main", title="t", cfg=cfg, fresh=True)
+    r.append_message({
+        "role": "user",
+        "content": "切片：a.svs（1×1）。\n任务：扫一遍",
+        "display_text": "扫一遍",
+    })
+    data = r.get_data()
+    canon = data["canonical_messages"]
+    check("canonical 保留 display_text",
+          any(m.get("display_text") == "扫一遍" for m in canon))
+    req = r.materialize_request_messages()
+    check("request 剥离 display_text",
+          all("display_text" not in m for m in req))
+    check("request 仍有 content",
+          any(m.get("role") == "user" and "扫一遍" in str(m.get("content")) for m in req))
+
+
+def test_ensure_current_system_prompt():
+    print("== test_ensure_current_system_prompt ==")
+    import ai_agent
+    cfg = ai_session._merge_config({"base_url": "http://x", "api_key": "k", "model": "m"})
+    r = ai_session.SessionRunner.acquire("b.svs", "main", title="t", cfg=cfg, fresh=True)
+    r.append_message({"role": "system", "content": "旧版：优先找肿瘤"})
+    r.append_message({"role": "user", "content": "任务：看一下"})
+    changed = r.ensure_current_system_prompt()
+    check("旧 system 被替换", changed is True)
+    msgs = r.get_data()["canonical_messages"]
+    sys_msgs = [m for m in msgs if m.get("role") == "system"]
+    check("system 等于当前 SYSTEM_PROMPT",
+          sys_msgs and sys_msgs[0].get("content") == ai_agent.SYSTEM_PROMPT)
+    check("再次 ensure 无改动", r.ensure_current_system_prompt() is False)
+
+
 if __name__ == "__main__":
     test_migration_and_change_seq()
     test_acquire_and_fencing()
@@ -458,5 +494,7 @@ if __name__ == "__main__":
     test_spot_inject()
     test_force_compact()
     test_default_max_steps()
+    test_display_text_stripped()
+    test_ensure_current_system_prompt()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
