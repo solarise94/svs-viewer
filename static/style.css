@@ -1303,12 +1303,14 @@ button {
 .unfiled-list::-webkit-scrollbar,
 .anno-panel-list::-webkit-scrollbar,
 .picker-list::-webkit-scrollbar,
+.ai-trace::-webkit-scrollbar,
 #sidebar::-webkit-scrollbar { width: 8px; height: 8px; }
 .sidebar-scroll::-webkit-scrollbar-thumb,
 .share-list::-webkit-scrollbar-thumb,
 .unfiled-list::-webkit-scrollbar-thumb,
 .anno-panel-list::-webkit-scrollbar-thumb,
 .picker-list::-webkit-scrollbar-thumb,
+.ai-trace::-webkit-scrollbar-thumb,
 #sidebar::-webkit-scrollbar-thumb {
   background: rgba(0, 0, 0, 0.2);
   border-radius: 4px;
@@ -1320,6 +1322,7 @@ button {
 .unfiled-list::-webkit-scrollbar-thumb:hover,
 .anno-panel-list::-webkit-scrollbar-thumb:hover,
 .picker-list::-webkit-scrollbar-thumb:hover,
+.ai-trace::-webkit-scrollbar-thumb:hover,
 #sidebar::-webkit-scrollbar-thumb:hover {
   background: rgba(0, 0, 0, 0.35);
   background-clip: padding-box;
@@ -1329,6 +1332,7 @@ button {
 .unfiled-list::-webkit-scrollbar-track,
 .anno-panel-list::-webkit-scrollbar-track,
 .picker-list::-webkit-scrollbar-track,
+.ai-trace::-webkit-scrollbar-track,
 #sidebar::-webkit-scrollbar-track { background: transparent; }
 
 /* =========================================================================
@@ -1887,48 +1891,137 @@ button {
 }
 .link-btn:hover { opacity: 0.8; }
 
-/* 2. 底部输入（composer） */
+/* 2. 底部输入（iMessage 输入栏：+ 圆钮 / pill 输入 / 蓝色发送圆钮） */
 .ai-composer {
-  padding: 10px 12px;
+  padding: 8px 10px 10px;
   border-top: 0.5px solid var(--separator);
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
   flex-shrink: 0;
 }
-.ai-task {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 8px;
-  border: 0.5px solid var(--separator);
-  border-radius: var(--r-btn);
-  font-size: 13px;
-  resize: none;
-  min-height: 40px;
-  max-height: 96px;
-  font-family: inherit;
-  background: rgba(255, 255, 255, 0.9);
-  color: var(--text);
-}
-.ai-task:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-fill);
-}
-.ai-task-actions {
+/* 辅助行（继续/新会话）：低调小字，仅在需要时出现 */
+.ai-composer-aux {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-  flex-wrap: wrap;
+  justify-content: center;
+  gap: 14px;
+  padding: 0 2px 6px;
 }
+.ai-composer-aux:empty { display: none; padding: 0; }
+.ai-composer-aux .btn {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: var(--accent);
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.ai-composer-aux .btn:hover { background: var(--accent-fill); }
+.ai-composer-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+/* 左侧 + 圆钮（iMessage 的加号位，这里承载「判读当前选区」） */
+.ai-plus-btn {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  margin-bottom: 2px;
+  border: none;
+  border-radius: 50%;
+  background: var(--seg-bg);
+  color: var(--text-2);
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.ai-plus-btn:hover { background: var(--separator-strong); color: var(--text); }
+.ai-plus-btn:active { background: var(--accent-fill); color: var(--accent); }
+/* 输入 pill：白底细灰描边，iMessage 输入框形制 */
+.ai-task {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 5px 12px;
+  border: 0.5px solid rgba(0, 0, 0, 0.18);
+  border-radius: 13px;
+  font-size: 13px;
+  line-height: 1.4;
+  resize: none;
+  overflow-y: auto;
+  min-height: 30px;
+  max-height: 96px;
+  font-family: inherit;
+  background: #fff;
+  color: var(--text);
+}
+.ai-task::placeholder { color: var(--text-3); }
+.ai-task:focus {
+  outline: none;
+  border-color: rgba(0, 0, 0, 0.28);
+  box-shadow: none;
+}
+/* 发送圆钮：蓝底白色上箭头（iMessage 发送键） */
+.ai-send-btn {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  margin-bottom: 2px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.12s ease, transform 0.1s ease;
+}
+.ai-send-btn:hover { background: var(--accent-hover); }
+.ai-send-btn:active { transform: scale(0.92); }
+.ai-send-btn svg { width: 15px; height: 15px; display: block; }
+/* 停止钮：同款圆钮，灰底方点 */
+.ai-send-btn.stop { background: var(--seg-bg); color: var(--text-2); }
+.ai-send-btn.stop:hover { background: var(--separator-strong); color: var(--text); }
 
-/* 3. 对话流（气泡 + 附件卡片 + 过程折叠） */
+/* 3. 对话流（iMessage 会话区：白底 + 气泡 + 附件卡片 + 过程折叠） */
 .ai-trace {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 12px;
+  padding: 12px 12px 8px;
+  background: #fff;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
+}
+/* 时间分隔（iMessage 顶部居中小灰字：1月15日 周四 15:57） */
+.ai-msg-ts {
+  align-self: center;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 2px 8px;
+  margin: 6px 0 10px;
+  letter-spacing: 0.01em;
+  animation: ai-fade-in 0.18s ease;
+  user-select: none;
+}
+/* 已读回执（iMessage 「已读」小灰字，右对齐） */
+.ai-read-receipt {
+  align-self: flex-end;
+  font-size: 11px;
+  color: var(--text-3);
+  margin: 3px 2px 0 0;
+  animation: ai-fade-in 0.25s ease;
+  user-select: none;
 }
 .ai-trace-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 28px 8px; }
 .ai-trace-row {
@@ -1979,38 +2072,209 @@ button {
   border-left: 3px solid #e74c3c;
 }
 
-/* SMS 气泡：user 右蓝、assistant 左灰（实时/历史/fork 统一） */
+/* 会话区子元素间距：组间 8px，同侧连发（.grp）2px，回执/时间戳各自微调 */
+.ai-trace > * + * { margin-top: 8px; }
+.ai-trace > .ai-msg-ts { margin-top: 14px; }
+.ai-trace > .ai-msg-ts:first-child { margin-top: 0; }
+.ai-trace > .ai-chat-bubble.grp { margin-top: 2px; }
+.ai-trace > .ai-read-receipt { margin-top: 3px; }
+
+/* iOS Messages 气泡：user 右蓝、assistant 左灰；.tail 画 iMessage 尾巴 */
 .ai-chat-bubble {
-  font-size: 12.5px;
-  line-height: 1.5;
-  padding: 8px 11px;
-  border-radius: 14px;
-  max-width: 88%;
+  position: relative;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 7px 11px;
+  border-radius: 13px;
+  max-width: 82%;
   word-break: break-word;
-  white-space: pre-wrap;
   animation: ai-fade-in 0.18s ease;
   align-self: flex-start;
+  font-family: var(--font);
 }
 .ai-chat-bubble.user {
   align-self: flex-end;
   background: var(--accent);
   color: #fff;
-  border-bottom-right-radius: 4px;
+  white-space: pre-wrap;
 }
 .ai-chat-bubble.assistant {
   align-self: flex-start;
-  background: var(--hover);
+  background: #e9e9eb;
   color: var(--text);
-  border: 0.5px solid var(--separator-weak);
-  border-bottom-left-radius: 4px;
+  white-space: pre-wrap;
 }
+/* 尾巴：同色块延伸 + 会话底色挖弧（经典 iMessage 尾巴画法，缩小匹配 13px 气泡） */
+.ai-chat-bubble.user.tail::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  bottom: 0;
+  right: -5px;
+  width: 14px;
+  height: 14px;
+  background: var(--accent);
+  border-bottom-left-radius: 11px;
+}
+.ai-chat-bubble.user.tail::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  bottom: 0;
+  right: -5px;
+  width: 6px;
+  height: 14px;
+  background: #fff;
+  border-bottom-left-radius: 8px;
+}
+.ai-chat-bubble.assistant.tail::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  bottom: 0;
+  left: -5px;
+  width: 14px;
+  height: 14px;
+  background: #e9e9eb;
+  border-bottom-right-radius: 11px;
+}
+.ai-chat-bubble.assistant.tail::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  bottom: 0;
+  left: -5px;
+  width: 6px;
+  height: 14px;
+  background: #fff;
+  border-bottom-right-radius: 8px;
+}
+.ai-chat-bubble.assistant.ai-md {
+  white-space: normal;
+}
+.ai-chat-bubble.ai-md > *:first-child { margin-top: 0; }
+.ai-chat-bubble.ai-md > *:last-child { margin-bottom: 0; }
+.ai-chat-bubble.ai-md p {
+  margin: 0 0 0.55em;
+  line-height: 1.45;
+}
+.ai-chat-bubble.ai-md h1,
+.ai-chat-bubble.ai-md h2,
+.ai-chat-bubble.ai-md h3 {
+  margin: 0.65em 0 0.35em;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text);
+}
+.ai-chat-bubble.ai-md h1 { font-size: 1.12em; }
+.ai-chat-bubble.ai-md h2 { font-size: 1.06em; }
+.ai-chat-bubble.ai-md h3 { font-size: 1.0em; }
+.ai-chat-bubble.ai-md ul,
+.ai-chat-bubble.ai-md ol {
+  margin: 0.3em 0 0.55em;
+  padding-left: 1.35em;
+}
+.ai-chat-bubble.ai-md li {
+  margin: 0.18em 0;
+  line-height: 1.45;
+}
+.ai-chat-bubble.ai-md blockquote {
+  margin: 0.4em 0 0.55em;
+  padding: 0.15em 0 0.15em 0.75em;
+  border-left: 3px solid rgba(0, 0, 0, 0.12);
+  color: var(--text-2);
+}
+.ai-chat-bubble.ai-md code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.ai-chat-bubble.ai-md .ai-md-pre {
+  margin: 0.45em 0 0.55em;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.05);
+  overflow-x: auto;
+}
+.ai-chat-bubble.ai-md .ai-md-pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.86em;
+  line-height: 1.4;
+  white-space: pre;
+}
+.ai-chat-bubble.ai-md a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ai-chat-bubble.ai-md strong { font-weight: 600; }
+.ai-chat-bubble.ai-md em { font-style: italic; }
+
+/* iMessage 「正在输入」三点气泡 */
 .ai-chat-thinking {
+  position: relative;
   align-self: flex-start;
-  color: var(--text-3);
-  font-size: 12px;
-  font-style: italic;
-  padding: 2px 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 9px 11px;
+  border-radius: 13px;
+  background: #e9e9eb;
   animation: ai-fade-in 0.18s ease;
+}
+.ai-chat-thinking::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  bottom: 0;
+  left: -5px;
+  width: 14px;
+  height: 14px;
+  background: #e9e9eb;
+  border-bottom-right-radius: 11px;
+}
+.ai-chat-thinking::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  bottom: 0;
+  left: -5px;
+  width: 6px;
+  height: 14px;
+  background: #fff;
+  border-bottom-right-radius: 8px;
+}
+.ai-chat-thinking .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #98989d;
+  animation: ai-typing-blink 1.2s infinite ease-in-out;
+}
+.ai-chat-thinking .dot:nth-child(2) { animation-delay: 0.2s; }
+.ai-chat-thinking .dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes ai-typing-blink {
+  0%, 60%, 100% { opacity: 0.35; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+
+/* 低调重连提示 */
+.ai-reconnect {
+  align-self: center;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-3);
+  opacity: 0.72;
+  padding: 2px 8px;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+  animation: ai-fade-in 0.15s ease;
+  user-select: none;
 }
 
 /* 状态行（居中） */
@@ -2041,121 +2305,117 @@ button {
 }
 .ai-status.info { color: var(--text-3); }
 
-/* 过程折叠区：goto / tool result 等收纳 */
-.ai-process-fold {
-  align-self: center;
-  width: 100%;
-  margin: 2px 0;
+/* OpenAI 风格工具调用 */
+.ai-tool-call {
+  align-self: flex-start;
+  max-width: 92%;
+  margin: 1px 0;
   border-radius: 10px;
   background: rgba(0, 0, 0, 0.03);
-  border: 0.5px solid var(--separator-weak);
-  animation: ai-fade-in 0.18s ease;
+  animation: ai-fade-in 0.15s ease;
 }
-.ai-process-fold > summary {
+.ai-tool-call > summary {
   list-style: none;
   cursor: pointer;
-  text-align: center;
-  font-size: 12px;
-  color: var(--text-3);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   padding: 6px 10px;
   user-select: none;
 }
-.ai-process-fold > summary::-webkit-details-marker { display: none; }
-.ai-process-fold > summary::before { content: "▸ "; }
-.ai-process-fold[open] > summary::before { content: "▾ "; }
-.ai-process-body {
-  padding: 0 10px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.ai-process-step {
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-3);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  word-break: break-word;
-}
-.ai-process-step.snapshot {
-  color: #0099A8;
-  cursor: pointer;
-}
-.ai-process-step.snapshot:hover { text-decoration: underline; }
-
-.ai-chat-sys {
+.ai-tool-call > summary::-webkit-details-marker { display: none; }
+.ai-tool-call > summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--text-3);
+  flex-shrink: 0;
   align-self: center;
-  font-size: 11px;
-  line-height: 1.45;
-  padding: 2px 6px;
+  transition: transform 0.12s ease;
+}
+.ai-tool-call[open] > summary::before {
+  transform: rotate(180deg);
+}
+.ai-tool-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-2);
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.ai-tool-brief {
+  font-size: 12px;
   color: var(--text-3);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.ai-tool-body {
+  padding: 0 10px 8px 22px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+  font-family: var(--mono);
+  white-space: pre-wrap;
   word-break: break-word;
 }
-.ai-chat-sys.tool { color: var(--text-2); }
-.ai-chat-sys.snapshot {
-  color: #0099A8;
-  background: rgba(0, 229, 255, 0.08);
-  border-radius: var(--r-row);
-  cursor: pointer;
-  padding: 5px 10px;
-}
-.ai-chat-sys.snapshot:hover { background: rgba(0, 229, 255, 0.16); }
 
-/* 附件卡片（观察 / 判读 / 快照 / 标注） */
-.ai-card {
+/* 对话内嵌附件（无边框，替代旧卡片） */
+.ai-attach {
   align-self: flex-start;
-  max-width: 92%;
-  margin: 0;
-  padding: 8px 10px;
-  border-radius: var(--r-panel);
-  border: 0.5px solid var(--separator-strong);
-  background: var(--hover);
+  max-width: 88%;
+  margin: 2px 0;
+  padding: 8px 12px;
+  border-radius: 14px;
+  border: none;
+  background: rgba(0, 0, 0, 0.04);
   animation: ai-fade-in 0.18s ease;
   word-break: break-word;
 }
-.ai-card .ai-card-title {
-  font-size: 12.5px;
+.ai-attach-title {
+  font-size: 13px;
   font-weight: 600;
   color: var(--text);
   line-height: 1.4;
 }
-.ai-card .ai-card-body {
-  font-size: 12px;
-  line-height: 1.5;
+.ai-attach-body {
+  font-size: 13px;
+  line-height: 1.45;
   color: var(--text-2);
   margin-top: 3px;
   white-space: pre-wrap;
 }
-.ai-card .ai-card-sub {
-  font-size: 11px;
+.ai-attach-sub {
+  font-size: 11.5px;
   color: var(--text-3);
   margin-top: 4px;
   line-height: 1.4;
 }
-.ai-card .ai-card-actions {
+.ai-attach-actions {
   display: flex;
   align-items: center;
   gap: 6px;
   margin-top: 4px;
 }
-.ai-card.observation {
-  border-left: 3px solid #00B8C4;
-  background: rgba(0, 184, 196, 0.06);
+.ai-attach.observation {
+  background: rgba(0, 122, 255, 0.06);
 }
-.ai-card.review {
-  border-left: 3px solid #28a745;
-  background: rgba(40, 167, 69, 0.06);
+.ai-attach.review {
+  background: rgba(52, 199, 89, 0.08);
 }
-.ai-card.review .ai-card-title { color: #1a7d34; }
-.ai-card.snapshot {
-  border-left: 3px solid #00B8C4;
-  background: rgba(0, 229, 255, 0.06);
+.ai-attach.review .ai-attach-title { color: #1a7d34; }
+.ai-attach.snapshot {
+  background: rgba(0, 122, 255, 0.05);
   cursor: pointer;
+  color: var(--accent);
 }
-.ai-card.snapshot:hover { background: rgba(0, 229, 255, 0.12); }
-.ai-card.annotation {
-  border-left: 3px solid #DAA520;
-  background: rgba(255, 215, 0, 0.08);
+.ai-attach.snapshot:hover { background: rgba(0, 122, 255, 0.1); }
+.ai-attach.snapshot .ai-attach-title { color: var(--accent); font-weight: 500; }
+.ai-attach.annotation {
+  background: rgba(255, 149, 0, 0.08);
 }
 
 .fork-chat-stream {
@@ -2163,10 +2423,11 @@ button {
   flex-direction: column;
   gap: 5px;
 }
-.fork-chat-stream .ai-card { padding: 5px 8px; max-width: 96%; }
-.fork-chat-stream .ai-card .ai-card-title { font-size: 12px; }
-.fork-chat-stream .ai-card .ai-card-body { font-size: 11.5px; }
-.fork-chat-stream .ai-chat-bubble { font-size: 12px; max-width: 92%; padding: 5px 8px; }
+.fork-chat-stream .ai-attach { padding: 6px 10px; max-width: 96%; }
+.fork-chat-stream .ai-attach-title { font-size: 12px; }
+.fork-chat-stream .ai-attach-body { font-size: 12px; }
+.fork-chat-stream .ai-chat-bubble { font-size: 13px; max-width: 92%; padding: 7px 11px; }
+.fork-chat-stream .ai-tool-call { max-width: 96%; }
 
 /* 手机端：AI 面板贴底显示 */
 @media (max-width: 768px) {

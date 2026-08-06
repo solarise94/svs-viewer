@@ -60,13 +60,13 @@
 
   // ---------- AI 读片助手状态 ----------
   var aiPanelOpen = false;
-  var aiOverlay = [];        // canvas 叠加：agent 的 bbox（goto/snapshot），青色虚线框
+  var aiOverlay = [];        // canvas 叠加：agent 的 bbox（goto/snapshot）
   var aiConfig = null;       // {base_url, api_key_set, api_key_mask, model, max_tokens, ...}
-  // AI 判读区配色（#3）：overlay 半透明填充 + 描边；AI 落标（进标注库 source=ai）填充
-  // 颜色/透明度集中在此常量调，人工标注保持更淡（drawAnnoItem 内按 source 区分）。
-  var AI_OVERLAY_FILL = "rgba(0,229,255,0.10)";   // agent goto/snapshot 判读区填充
-  var AI_OVERLAY_STROKE = "#00E5FF";               // agent 判读区虚线描边
-  var AI_ANNO_FILL = "rgba(0,229,255,0.14)";       // 进标注库的 AI 标注填充（比人工略浓）
+  // AI 判读区配色：在 H&E 粉白底上需高对比；外圈深色描边 + 琥珀色主色 + 标签底衬
+  var AI_OVERLAY_FILL = "rgba(255, 149, 0, 0.14)";
+  var AI_OVERLAY_STROKE = "#FF9500";
+  var AI_OVERLAY_HALO = "rgba(0, 0, 0, 0.82)";
+  var AI_ANNO_FILL = "rgba(255, 149, 0, 0.16)";   // 进标注库的 AI 标注填充（比人工略浓）
   var aiRunning = false;     // 是否有进行中的 run（同时只允一个）
   var aiAbortCtrl = null;    // AbortController，停止用
   var aiSessionId = null;    // 当前 main session id（events 里带）
@@ -194,6 +194,7 @@
     aiConfigSave: $("ai-config-save"),
     aiConfigHint: $("ai-config-hint"),
     aiTask: $("ai-task"),
+    aiComposerAux: $("ai-composer-aux"),
     aiTaskJump: $("ai-task-jump"),
     aiStartBtn: $("ai-start-btn"),
     aiContinueBtn: $("ai-continue-btn"),
@@ -1671,7 +1672,7 @@
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
-    // AI overlay（agent 的 goto/snapshot bbox）：青色虚线框 + 半透明填充，区别于人工标注
+    // AI overlay（agent 的 goto/snapshot bbox）：高对比虚线框 + 半透明填充
     if (hasAiOverlay) {
       aiOverlay.forEach(function (bb) {
         var tl = imgToCanvas(bb.x, bb.y);
@@ -1679,18 +1680,34 @@
         var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
         var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
         annoCtx.save();
-        // 半透明青色填充：判读区更醒目（#3），颜色/透明度集中在此常量调
         annoCtx.fillStyle = AI_OVERLAY_FILL;
         annoCtx.fillRect(x, y, w, h);
+        annoCtx.setLineDash([7, 4]);
+        // 深色外描边：在粉白组织上托住主色
+        annoCtx.lineWidth = 4;
+        annoCtx.strokeStyle = AI_OVERLAY_HALO;
+        annoCtx.strokeRect(x, y, w, h);
         annoCtx.lineWidth = 2;
         annoCtx.strokeStyle = AI_OVERLAY_STROKE;
-        annoCtx.setLineDash([6, 4]);
         annoCtx.strokeRect(x, y, w, h);
         annoCtx.setLineDash([]);
         if (!animating && bb.magnification) {
-          annoCtx.fillStyle = "rgba(0,229,255,0.9)";
-          annoCtx.font = "12px -apple-system, sans-serif";
-          annoCtx.fillText("AI · " + fmtAiMag(bb.magnification), x + 4, y + 14);
+          var label = "AI · " + fmtAiMag(bb.magnification);
+          annoCtx.font = "600 12px -apple-system, BlinkMacSystemFont, sans-serif";
+          var tw = annoCtx.measureText(label).width;
+          var padX = 6, padY = 3, boxH = 18;
+          var bx = x + 3, by = y + 3;
+          annoCtx.fillStyle = "rgba(0, 0, 0, 0.78)";
+          if (typeof annoCtx.roundRect === "function") {
+            annoCtx.beginPath();
+            annoCtx.roundRect(bx, by, tw + padX * 2, boxH, 4);
+            annoCtx.fill();
+          } else {
+            annoCtx.fillRect(bx, by, tw + padX * 2, boxH);
+          }
+          annoCtx.fillStyle = "#FFFFFF";
+          annoCtx.textBaseline = "middle";
+          annoCtx.fillText(label, bx + padX, by + boxH / 2 + 0.5);
         }
         annoCtx.restore();
       });
@@ -2425,6 +2442,7 @@
   // =========================================================================
   function openAnnoPanel() {
     if (!state.slide || !currentAnnotations) { toast("当前切片暂无标注", "info"); return; }
+    if (aiPanelOpen) closeAiPanel();
     annoPanelOpen = true;
     els.annoPanel.style.display = "flex";
     els.annoPanelTitle.textContent = "标注：" + truncateMiddle(state.slide.name, 28);
@@ -3129,7 +3147,25 @@
       var cur = els.aiTask.value || "";
       els.aiTask.value = prefix + cur;
       els.aiTask.focus();
+      autoGrowAiTask();
     });
+    // iMessage 输入手感：回车直接发送（Shift+回车换行），输入框随内容长高
+    els.aiTask.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        if (!aiRunning) startAiRun();
+      }
+    });
+    els.aiTask.addEventListener("input", autoGrowAiTask);
+    autoGrowAiTask();
+  }
+
+  // 输入框自适应高度（pill 内 1~5 行）
+  function autoGrowAiTask() {
+    var el = els.aiTask;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 96) + "px";
   }
 
   // =========================================================================
@@ -3230,6 +3266,7 @@
 
   function openAiPanel() {
     if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (annoPanelOpen) closeAnnoPanel();
     aiPanelOpen = true;
     els.aiPanel.style.display = "flex";
   }
@@ -3253,7 +3290,7 @@
     return null;
   }
 
-  // 开始 AI run（POST /api/ai/run?fresh=1，SSE）
+  // 开始 AI run（POST /api/ai/run，body.fresh=true，SSE）
   function startAiRun() {
     if (!state.slide) { toast("请先打开一个切片", "info"); return; }
     if (aiRunning) { toast("已有任务进行中", "info"); return; }
@@ -3263,11 +3300,15 @@
       els.aiConfigCollapsed.style.display = "none";
       return;
     }
-    var task = (els.aiTask.value || "").trim();
-    if (!task) { toast("请输入任务描述", "info"); els.aiTask.focus(); return; }
+    var DEFAULT_AI_TASK = "客观扫读这张片：先低倍定位，再高倍确认；描述镜下所见，标出值得关注的区域并总结";
+    var task = (els.aiTask.value || "").trim() || DEFAULT_AI_TASK;
+    if (!(els.aiTask.value || "").trim()) {
+      els.aiTask.value = task;
+    }
 
-    // 重置轨迹流，立即显示用户任务气泡
+    // 重置轨迹流，iMessage 时间分隔 + 立即显示用户任务气泡
     resetAiTrace();
+    appendMsgTs(els.aiTrace, new Date());
     aiRunning = true;
     aiPaused = false;
     setAiRunningUi(true);
@@ -3276,25 +3317,30 @@
     appendChatBubble(els.aiTrace, "user", task);
     var slideName = state.slide.name;
     var epoch = aiSlideEpoch;
+    aiAbortCtrl = new AbortController();
+    var runCtrl = aiAbortCtrl;
 
     fetch("/api/ai/run?fresh=1", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slide: slideName, task: task }),
+      body: JSON.stringify({ slide: slideName, task: task, fresh: true }),
+      signal: runCtrl.signal,
       credentials: "same-origin",
     }).then(function (resp) {
       if (!isCurrentAiSlide(slideName, epoch)) return;
+      var sid = resp.headers.get("X-AI-Session-ID");
+      if (sid) aiSessionId = sid;
       if (!resp.ok || !resp.body) {
-        return resp.text().then(function (t) {
-          throw new Error(t || ("HTTP " + resp.status));
-        });
+        return aiResponseError(resp).then(function (msg) { throw new Error(msg); });
       }
-      pumpAiSse(resp.body.getReader(), slideName, epoch);
+      return pumpAiSse(resp.body.getReader(), slideName, epoch, runCtrl);
     }).catch(function (e) {
       if (!isCurrentAiSlide(slideName, epoch)) return;
+      if (e && e.name === "AbortError") return;
+      if (aiAbortCtrl !== runCtrl) return;
       toast("AI 运行失败: " + (e && e.message ? e.message : e), "error");
       appendStatusRow(els.aiTrace, "error", "AI 运行失败: " + (e && e.message ? e.message : e));
-      finishAiRun();
+      finishAiRun(runCtrl);
     });
   }
 
@@ -3312,26 +3358,33 @@
     appendStatusRow(els.aiTrace, "info", "继续读片…");
     var slideName = state.slide.name;
     var epoch = aiSlideEpoch;
+    aiAbortCtrl = new AbortController();
+    var runCtrl = aiAbortCtrl;
     fetch("/api/ai/continue", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slide: slideName }),
+      signal: runCtrl.signal,
       credentials: "same-origin",
     }).then(function (resp) {
       if (!isCurrentAiSlide(slideName, epoch)) return;
+      var sid = resp.headers.get("X-AI-Session-ID");
+      if (sid) aiSessionId = sid;
       if (!resp.ok || !resp.body) {
-        return resp.text().then(function (t) { throw new Error(t || ("HTTP " + resp.status)); });
+        return aiResponseError(resp).then(function (msg) { throw new Error(msg); });
       }
-      pumpAiSse(resp.body.getReader(), slideName, epoch);
+      return pumpAiSse(resp.body.getReader(), slideName, epoch, runCtrl);
     }).catch(function (e) {
       if (!isCurrentAiSlide(slideName, epoch)) return;
+      if (e && e.name === "AbortError") return;
+      if (aiAbortCtrl !== runCtrl) return;
       toast("继续失败: " + (e && e.message ? e.message : e), "error");
       appendStatusRow(els.aiTrace, "error", "继续失败: " + (e && e.message ? e.message : e));
-      finishAiRun();
+      finishAiRun(runCtrl);
     });
   }
 
-  // 新会话（fresh）：归档旧 main 开新，不影响标注与批注
+  // 新会话（fresh）：归档旧 main 开新；保留当前任务文案，由 startAiRun 发起
   function freshAiRun() {
     if (!state.slide) { toast("请先打开一个切片", "info"); return; }
     if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
@@ -3340,28 +3393,45 @@
       return;
     }
     if (!confirm("归档旧对话开新会话，不影响已落标注与批注对话，确认？")) return;
-    els.aiTask.value = "";
     startAiRun();
   }
 
   function stopAiRun() {
-    // 走 /cancel（不只是断开 SSE，§5.4）
-    if (aiSessionId) {
-      apiFetch("/api/ai/cancel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: aiSessionId }),
-      }).catch(function () {});
-    }
+    // session_id 可能在首个 SSE 事件前尚未到达；slide 让后端解析当前 main。
+    var slideName = state.slide && state.slide.name;
+    apiFetch("/api/ai/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: aiSessionId, slide: slideName }),
+    }).catch(function () {});
     if (aiAbortCtrl) { try { aiAbortCtrl.abort(); } catch (e) {} }
+    if (aiStreamCtrl) { try { aiStreamCtrl.abort(); } catch (e) {} }
+    aiPaused = true;
+    appendStatusRow(els.aiTrace, "paused", "已停止，可继续");
     finishAiRun();
   }
 
-  function finishAiRun() {
+  function finishAiRun(expectedCtrl) {
+    if (expectedCtrl && aiAbortCtrl !== expectedCtrl) return;
     aiRunning = false;
     setAiRunningUi(false);
     aiAbortCtrl = null;
     aiStreamCtrl = null;
+  }
+
+  // 不把代理/Flask 返回的整页 HTML 错误塞进聊天气泡。
+  function aiResponseError(resp) {
+    return resp.text().then(function (raw) {
+      var text = (raw || "").trim();
+      try {
+        var body = JSON.parse(text);
+        if (body && body.error) return String(body.error);
+      } catch (e) {}
+      var title = text.match(/<title[^>]*>([^<]+)<\/title>/i);
+      if (title && title[1]) return "HTTP " + resp.status + " " + title[1].replace(/^\d+\s*/, "");
+      if (/<(?:!doctype|html|body)\b/i.test(text)) return "HTTP " + resp.status + " 服务器内部错误";
+      return text || ("HTTP " + resp.status);
+    });
   }
 
   // 运行中/暂停/空闲的按钮组状态
@@ -3370,27 +3440,31 @@
       els.aiStartBtn.style.display = "none";
       els.aiContinueBtn.style.display = "none";
       els.aiFreshBtn.style.display = "none";
-      els.aiStopBtn.style.display = "inline-block";
+      els.aiStopBtn.style.display = "inline-flex";
+      els.aiComposerAux.style.display = "none";
     } else if (aiPaused) {
-      els.aiStartBtn.style.display = "none";
+      els.aiStartBtn.style.display = "inline-flex";
       els.aiContinueBtn.style.display = "inline-block";
       els.aiFreshBtn.style.display = "inline-block";
       els.aiStopBtn.style.display = "none";
+      els.aiComposerAux.style.display = "flex";
     } else {
-      els.aiStartBtn.style.display = "inline-block";
+      els.aiStartBtn.style.display = "inline-flex";
       els.aiContinueBtn.style.display = "none";
       els.aiFreshBtn.style.display = "none";
       els.aiStopBtn.style.display = "none";
+      els.aiComposerAux.style.display = "none";
     }
   }
 
   // 通用 SSE 泵：解析帧 → handleAiEvent（同时推进 mainAiCtx.lastSeq）
   // slideName/epoch 可选：切片切换后丢弃过期流。
-  function pumpAiSse(reader, slideName, epoch) {
+  function pumpAiSse(reader, slideName, epoch, runCtrl) {
     var decoder = new TextDecoder("utf-8");
     var buffer = "";
     function stillCurrent() {
-      return slideName == null || epoch == null || isCurrentAiSlide(slideName, epoch);
+      var slideCurrent = slideName == null || epoch == null || isCurrentAiSlide(slideName, epoch);
+      return slideCurrent && (!runCtrl || aiAbortCtrl === runCtrl);
     }
     function pump() {
       return reader.read().then(function (result) {
@@ -3400,7 +3474,7 @@
         }
         if (result.done) {
           // 正常结束：若 run 是 paused 则保持按钮组
-          if (stillCurrent()) finishAiRun();
+          if (stillCurrent()) finishAiRun(runCtrl);
           return;
         }
         buffer += decoder.decode(result.value, { stream: true });
@@ -3486,7 +3560,7 @@
     aiOverlay = [];
     if (els.aiTrace) {
       els.aiTrace.innerHTML =
-        '<div class="ai-trace-empty">点击「开始」让 AI 读片。对话会显示在这里。</div>';
+        '<div class="ai-trace-empty">发条消息，AI 就开始读片。对话会显示在这里。</div>';
     }
     setAiRunningUi(false);
     redrawAnnoCanvas();
@@ -3511,7 +3585,8 @@
         // 清空容器里的旧内容（保留 fork 头部/输入框——只清 stream 区）
         container.innerHTML = "";
         if (t && t.length) {
-          renderAiTranscript(t, { container: container, emphasis: opts.emphasis || "main" });
+          renderAiTranscript(t, { container: container, emphasis: opts.emphasis || "main",
+                                  ts: s && s.created_at });
         } else {
           appendStatusRow(container, "info", "（暂无对话记录）");
         }
@@ -3556,13 +3631,16 @@
         aiSessionId = main.id;
         var txOpts = { emphasis: "main", slideName: slideName, epoch: epoch };
         if (main.status === "running") {
-          // 有进行中的 run：重挂 SSE（带 last seq），并把已有 transcript 渲染出来
+          // 有进行中的 run：先渲染 transcript 推进 lastSeq，再挂 SSE（避免重放重复）
           aiRunning = true;
           aiPaused = false;
           setAiRunningUi(true);
           appendStatusRow(els.aiTrace, "info", "检测到进行中的读片，恢复事件流…");
-          loadAndRenderTranscript(main.id, els.aiTrace, txOpts);
-          attachAiStream(main.id, slideName, epoch);
+          loadAndRenderTranscript(main.id, els.aiTrace, txOpts).then(function () {
+            if (isCurrentAiSlide(slideName, epoch)) {
+              attachAiStream(main.id, slideName, epoch);
+            }
+          });
         } else if (main.status === "paused" || main.status === "finished" || main.status === "error") {
           aiPaused = (main.status === "paused");
           setAiRunningUi(false);
@@ -3644,15 +3722,16 @@
     if (type === "tool_started") {
       clearThinkingRow(ctx);
       if (p.tool === "goto") {
-        appendProcessStep(container, "→ goto (" + fmtNum(p.x) + "," + fmtNum(p.y) +
-          ") @ " + (p.magnification || "") + (p.reason ? " · " + p.reason : ""));
+        appendToolCall(container, "goto",
+          "(" + fmtNum(p.x) + "," + fmtNum(p.y) + ") @ " +
+          (p.magnification || "") + (p.reason ? " · " + p.reason : ""));
       } else if (p.tool === "snapshot") {
-        appendProcessStep(container, "📷 抓取快照…");
+        appendToolCall(container, "snapshot", "抓取当前视野");
       } else if (p.tool === "finish" || p.tool === "mark_observation" ||
                  p.tool === "complete_snapshot_review" || p.tool === "create_annotation") {
-        // 结果会以卡片/状态呈现，过程区不重复刷工具名
+        // 结果会以附件/状态呈现，过程区不重复刷工具名
       } else {
-        appendProcessStep(container, "→ " + p.tool);
+        appendToolCall(container, p.tool || "tool", "");
       }
       return;
     }
@@ -3674,9 +3753,9 @@
     if (type === "snapshot_reviewed") {
       clearThinkingRow(ctx);
       var disp = p.disposition || "";
-      var title = (disp === "annotated") ? "✓ 快照已判读（已标注）"
-                : (disp === "no_annotation") ? "✓ 快照已判读（无需标注）"
-                : "✓ 快照已判读";
+      var title = (disp === "annotated") ? "已判读（已标注）"
+                : (disp === "no_annotation") ? "已判读（无需标注）"
+                : "已判读";
       appendReviewCard(title, p.summary || "",
                        disp === "no_annotation" ? (p.no_annotation_reason || "") : "",
                        container);
@@ -3692,9 +3771,9 @@
     if (type === "session_compacted") {
       clearThinkingRow(ctx);
       if (p && p.reason === "context_length_exceeded") {
-        appendProcessStep(container, "上下文已满，已压缩并继续");
+        appendToolCall(container, "compact", "上下文已满，已压缩并继续");
       } else {
-        appendProcessStep(container, "上下文已压缩，继续读片…");
+        appendToolCall(container, "compact", "上下文已压缩，继续读片…");
       }
       return;
     }
@@ -3717,7 +3796,7 @@
       return;
     }
     if (type === "agent_retrying") {
-      if (p && p.reason) appendProcessStep(container, "⟳ " + p.reason);
+      appendReconnectStatus(container, p);
       return;
     }
     if (type === "agent_error") {
@@ -3765,11 +3844,13 @@
   }
 
   // 把 GET session 的脱敏 transcript 渲染成统一聊天气泡。
-  // user → 右气泡；assistant 文本 → 左气泡；观察/判读/标注/快照 → 附件卡片；
-  // goto / tool result / 抓取请求 → 过程折叠区。主/fork 共用。
+  // user → 右气泡（display_text）；assistant 文本 → 左气泡；观察/判读/标注 → 无边附件；
+  // goto / tool result / 抓取请求 → OpenAI 风格工具调用。主/fork 共用。
   function renderAiTranscript(msgs, opts) {
     var target = (opts && opts.container) || els.aiTrace;
     opts = opts || {};
+    // iMessage 顶部时间分隔（fork 小窗不插）
+    if (opts.emphasis !== "fork") appendMsgTs(target, opts.ts);
     var toolResults = {};
     for (var ri = 0; ri < msgs.length; ri++) {
       var rm = msgs[ri] || {};
@@ -3785,11 +3866,11 @@
                      (role === "user" && (m.spot_updated || m.spot_deleted ||
                                           /^spot_(updated|deleted)/.test(text)));
       if (isSystem) {
-        if (text) appendProcessStep(target, truncateStr(text, 400));
+        if (text) appendToolCall(target, "context", truncateStr(text, 400));
         continue;
       }
       if (role === "user") {
-        appendChatBubble(target, "user", text);
+        appendChatBubble(target, "user", userDisplayText(m));
       } else if (role === "assistant") {
         var tcs = m.tool_calls || [];
         if (text) appendChatBubble(target, "assistant", text);
@@ -3810,15 +3891,16 @@
             if (!tcOk) continue;
             var disp = args.disposition || "";
             appendReviewCard(
-              disp === "annotated" ? "✓ 快照已判读（已标注）"
-              : disp === "no_annotation" ? "✓ 快照已判读（无需标注）"
-              : "✓ 快照已判读",
+              disp === "annotated" ? "已判读（已标注）"
+              : disp === "no_annotation" ? "已判读（无需标注）"
+              : "已判读",
               args.summary || "",
               disp === "no_annotation" ? (args.no_annotation_reason || "") : "",
               target);
           } else if (nm === "goto") {
-            appendProcessStep(target, "→ goto (" + fmtNum(args.x) + "," + fmtNum(args.y) +
-              ") @ " + (args.level != null ? args.level : "?") +
+            appendToolCall(target, "goto",
+              "(" + fmtNum(args.x) + "," + fmtNum(args.y) + ") @ " +
+              (args.level != null ? args.level : "?") +
               (args.reason ? " · " + args.reason : ""));
           } else if (nm === "create_annotation") {
             if (!tcOk) continue;
@@ -3828,11 +3910,11 @@
               x: args.x, y: args.y, side_px: args.side_px,
             }, target, { showFork: false });
           } else if (nm === "snapshot") {
-            appendProcessStep(target, "📷 抓取快照…");
+            appendToolCall(target, "snapshot", "抓取当前视野");
           } else if (nm === "finish") {
             // finish 总结已在 assistant 文本 / 状态行
           } else {
-            appendProcessStep(target, "→ " + nm);
+            appendToolCall(target, nm, "");
           }
         }
       } else if (role === "tool") {
@@ -3847,11 +3929,22 @@
         if (resText && !imgRef) {
           var trimmed = String(resText).trim();
           if (/^已记录观察|^已关闭快照|^已落标注/.test(trimmed)) continue;
-          appendProcessStep(target, "⇠ " + friendlyToolResult(resText));
+          appendToolCall(target, "result", friendlyToolResult(resText));
         }
       }
     }
     target.scrollTop = target.scrollHeight;
+  }
+
+  // UI 气泡文案：优先 display_text；旧会话从 canonical 里抽「任务：」「用户的问题：」
+  function userDisplayText(m) {
+    if (m && m.display_text) return String(m.display_text);
+    var text = messageText(m) || "";
+    var taskMatch = text.match(/任务：([\s\S]*)$/);
+    if (taskMatch) return taskMatch[1].trim();
+    var qMatch = text.match(/用户的问题：([\s\S]*)$/);
+    if (qMatch) return qMatch[1].trim();
+    return text;
   }
 
   // 根据工具名 + 结果文本判断是否真正执行成功（用于历史恢复卡片门控）
@@ -3900,12 +3993,204 @@
     if (empty) empty.remove();
   }
 
-  // SMS 气泡：side="user"（右）/ "assistant"（左）
+  // 轻量 Markdown（助手气泡）：先转义再套有限语法，避免 XSS
+  function escHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function inlineMarkdown(s) {
+    var t = escHtml(s);
+    // code 先占位，避免内部 * _ 被二次处理
+    var codes = [];
+    t = t.replace(/`([^`]+)`/g, function (_, code) {
+      codes.push("<code>" + code + "</code>");
+      return "\u0000C" + (codes.length - 1) + "\u0000";
+    });
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    t = t.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+    t = t.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    t = t.replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1<em>$2</em>");
+    t = t.replace(/\u0000C(\d+)\u0000/g, function (_, i) { return codes[Number(i)] || ""; });
+    return t;
+  }
+
+  function renderMarkdown(src) {
+    var text = String(src == null ? "" : src).replace(/\r\n/g, "\n");
+    var fences = [];
+    text = text.replace(/```[\w-]*\n?([\s\S]*?)```/g, function (_, code) {
+      fences.push("<pre class=\"ai-md-pre\"><code>" + escHtml(code.replace(/\n$/, "")) + "</code></pre>");
+      return "\n\u0000F" + (fences.length - 1) + "\u0000\n";
+    });
+    var lines = text.split("\n");
+    var out = [];
+    var i = 0;
+    var para = [];
+    var inUl = false;
+    var inOl = false;
+
+    function flushPara() {
+      if (!para.length) return;
+      out.push("<p>" + inlineMarkdown(para.join("\n")).replace(/\n/g, "<br>") + "</p>");
+      para = [];
+    }
+    function closeLists() {
+      if (inUl) { out.push("</ul>"); inUl = false; }
+      if (inOl) { out.push("</ol>"); inOl = false; }
+    }
+
+    while (i < lines.length) {
+      var line = lines[i];
+      var fence = line.match(/^\u0000F(\d+)\u0000$/);
+      if (fence) {
+        flushPara();
+        closeLists();
+        out.push(fences[Number(fence[1])] || "");
+        i += 1;
+        continue;
+      }
+      if (/^\s*$/.test(line)) {
+        flushPara();
+        closeLists();
+        i += 1;
+        continue;
+      }
+      var hm = line.match(/^(#{1,3})\s+(.+)$/);
+      if (hm) {
+        flushPara();
+        closeLists();
+        out.push("<h" + hm[1].length + ">" + inlineMarkdown(hm[2]) + "</h" + hm[1].length + ">");
+        i += 1;
+        continue;
+      }
+      var um = line.match(/^\s*[-*+]\s+(.+)$/);
+      if (um) {
+        flushPara();
+        if (inOl) { out.push("</ol>"); inOl = false; }
+        if (!inUl) { out.push("<ul>"); inUl = true; }
+        out.push("<li>" + inlineMarkdown(um[1]) + "</li>");
+        i += 1;
+        continue;
+      }
+      var om = line.match(/^\s*\d+\.\s+(.+)$/);
+      if (om) {
+        flushPara();
+        if (inUl) { out.push("</ul>"); inUl = false; }
+        if (!inOl) { out.push("<ol>"); inOl = true; }
+        out.push("<li>" + inlineMarkdown(om[1]) + "</li>");
+        i += 1;
+        continue;
+      }
+      var qm = line.match(/^\s*>\s?(.*)$/);
+      if (qm) {
+        flushPara();
+        closeLists();
+        out.push("<blockquote>" + inlineMarkdown(qm[1]) + "</blockquote>");
+        i += 1;
+        continue;
+      }
+      closeLists();
+      para.push(line);
+      i += 1;
+    }
+    flushPara();
+    closeLists();
+    return out.join("") || ("<p>" + inlineMarkdown(text) + "</p>");
+  }
+
+  function setBubbleContent(el, side, text) {
+    if (!el) return;
+    el._rawText = text == null ? "" : String(text);
+    if (side === "assistant") {
+      el.classList.add("ai-md");
+      el.innerHTML = renderMarkdown(el._rawText);
+    } else {
+      el.classList.remove("ai-md");
+      el.textContent = el._rawText;
+    }
+  }
+
+  // 聊天气泡：side="user"（右，纯文本）/ "assistant"（左，Markdown）。
+  // iMessage 分组：同侧连发收紧间距、尾巴只在组末气泡；异侧/插入元素则开新组。
   function appendChatBubble(container, side, text) {
     if (!text) return null;
     clearAiEmpty(container);
+    var prev = container.lastElementChild;
     var row = document.createElement("div");
     row.className = "ai-chat-bubble " + side;
+    if (prev && prev.classList.contains("ai-chat-bubble") && prev.classList.contains(side)) {
+      prev.classList.remove("tail");
+      row.classList.add("grp");
+    }
+    row.classList.add("tail");
+    setBubbleContent(row, side, text);
+    container.appendChild(row);
+    if (side === "assistant") markUserBubblesRead(container);
+    container.scrollTop = container.scrollHeight;
+    return row;
+  }
+
+  // iMessage 已读回执：助手一回话，右侧用户气泡补「已读」小灰字
+  function markUserBubblesRead(container) {
+    if (!container) return;
+    var unread = container.querySelectorAll(".ai-chat-bubble.user:not(.read)");
+    for (var i = 0; i < unread.length; i++) {
+      var b = unread[i];
+      b.classList.add("read");
+      var r = document.createElement("div");
+      r.className = "ai-read-receipt";
+      r.textContent = fmtMsgTs(new Date()) + " 已读";
+      if (b.nextSibling) container.insertBefore(r, b.nextSibling);
+      else container.appendChild(r);
+    }
+  }
+
+  // iMessage 顶部时间分隔文案：今天→「周X HH:MM」，今年→「M月D日 周X HH:MM」，否则带年份
+  function fmtMsgTs(d) {
+    var WD = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    var now = new Date();
+    var hm = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+    var sameDay = d.toDateString() === now.toDateString();
+    if (sameDay) return WD[d.getDay()] + " " + hm;
+    var md = (d.getMonth() + 1) + "月" + d.getDate() + "日 " + WD[d.getDay()] + " " + hm;
+    if (d.getFullYear() === now.getFullYear()) return md;
+    return d.getFullYear() + "年" + md;
+  }
+
+  // 会话区插入时间分隔行（ts 可为 epoch 秒/毫秒或 Date）
+  function appendMsgTs(container, ts) {
+    if (!container) return null;
+    clearAiEmpty(container);
+    var d = ts instanceof Date ? ts
+      : (typeof ts === "number" ? new Date(ts > 1e12 ? ts : ts * 1000) : new Date());
+    var row = document.createElement("div");
+    row.className = "ai-msg-ts";
+    row.textContent = fmtMsgTs(d);
+    container.appendChild(row);
+    return row;
+  }
+
+  // 低调重连提示：reconnection 1/3 (2s)
+  function appendReconnectStatus(container, p) {
+    if (!container) return null;
+    clearAiEmpty(container);
+    var attempt = (p && p.attempt) || 1;
+    var max = (p && p.max) || 3;
+    var delay = (p && p.delay != null) ? p.delay : 2;
+    var text = "reconnection " + attempt + "/" + max + " (" + delay + "s)";
+    var last = container.lastElementChild;
+    if (last && last.classList && last.classList.contains("ai-reconnect")) {
+      last.textContent = text;
+      container.scrollTop = container.scrollHeight;
+      return last;
+    }
+    var row = document.createElement("div");
+    row.className = "ai-reconnect";
     row.textContent = text;
     container.appendChild(row);
     container.scrollTop = container.scrollHeight;
@@ -3924,42 +4209,54 @@
     return row;
   }
 
-  // 过程折叠：相邻过程步并入同一个 details；遇到气泡/卡片后下次新建
-  function appendProcessStep(container, text, cls) {
-    if (!text || !container) return null;
+  // OpenAI 风格工具调用：折叠条显示工具名 + 摘要，展开看详情
+  function appendToolCall(container, name, detail) {
+    if (!container) return null;
     clearAiEmpty(container);
-    var fold = null;
-    var last = container.lastElementChild;
-    if (last && last.classList && last.classList.contains("ai-process-fold")) {
-      fold = last;
-    } else {
-      fold = document.createElement("details");
-      fold.className = "ai-process-fold";
-      var sum = document.createElement("summary");
-      sum.className = "ai-process-summary";
-      sum.textContent = "查看读片过程（0 步）";
-      var body = document.createElement("div");
-      body.className = "ai-process-body";
-      fold.appendChild(sum);
-      fold.appendChild(body);
-      fold._stepCount = 0;
-      container.appendChild(fold);
+    var el = document.createElement("details");
+    el.className = "ai-tool-call";
+    var sum = document.createElement("summary");
+    sum.className = "ai-tool-summary";
+    var label = document.createElement("span");
+    label.className = "ai-tool-name";
+    label.textContent = toolCallLabel(name);
+    sum.appendChild(label);
+    if (detail) {
+      var brief = document.createElement("span");
+      brief.className = "ai-tool-brief";
+      brief.textContent = truncateStr(String(detail), 72);
+      sum.appendChild(brief);
     }
-    var bodyEl = fold.querySelector(".ai-process-body");
-    var row = document.createElement("div");
-    row.className = "ai-process-step" + (cls ? " " + cls : "");
-    row.textContent = text;
-    bodyEl.appendChild(row);
-    fold._stepCount = (fold._stepCount || 0) + 1;
-    fold.querySelector(".ai-process-summary").textContent =
-      "查看读片过程（" + fold._stepCount + " 步）";
+    el.appendChild(sum);
+    if (detail && String(detail).length > 72) {
+      var body = document.createElement("div");
+      body.className = "ai-tool-body";
+      body.textContent = String(detail);
+      el.appendChild(body);
+    }
+    container.appendChild(el);
     container.scrollTop = container.scrollHeight;
-    return row;
+    return el;
   }
 
-  // 兼容旧调用：映射到状态 / 过程
+  function toolCallLabel(name) {
+    var map = {
+      goto: "Used goto",
+      snapshot: "Used snapshot",
+      result: "Tool result",
+      context: "Context update",
+      compact: "Compacted context",
+    };
+    return map[name] || ("Used " + (name || "tool"));
+  }
+
+  // 兼容旧调用
+  function appendProcessStep(container, text, cls) {
+    return appendToolCall(container, cls || "tool", text);
+  }
+
   function appendSysRow(container, text, sub) {
-    if (sub === "tool" || sub === "snapshot") return appendProcessStep(container, text, sub);
+    if (sub === "tool" || sub === "snapshot") return appendToolCall(container, sub, text);
     return appendStatusRow(container, "info", text);
   }
 
@@ -3986,16 +4283,16 @@
     });
   }
 
-  // 快照附件卡
+  // 快照附件（无边框，可跳转）
   function appendSnapshotCard(container, opts) {
     opts = opts || {};
     clearAiEmpty(container);
     var card = document.createElement("div");
-    card.className = "ai-card snapshot";
+    card.className = "ai-attach snapshot";
     var title = document.createElement("div");
-    title.className = "ai-card-title";
-    title.textContent = "📷 快照" + (opts.magnification != null && opts.magnification !== ""
-      ? " @" + fmtAiMag(opts.magnification) : "") + "　（点击跳转）";
+    title.className = "ai-attach-title";
+    title.textContent = "快照" + (opts.magnification != null && opts.magnification !== ""
+      ? " · " + fmtAiMag(opts.magnification) : "") + " · 点击跳转";
     card.appendChild(title);
     bindSnapshotJump(card, opts.bbox || {});
     container.appendChild(card);
@@ -4003,26 +4300,26 @@
     return card;
   }
 
-  // 观察卡
+  // 观察附件（对话内嵌，无边卡片）
   function appendObservationCard(p, container) {
     var target = container || els.aiTrace;
     clearAiEmpty(target);
     var card = document.createElement("div");
-    card.className = "ai-card observation";
+    card.className = "ai-attach observation";
     var title = document.createElement("div");
-    title.className = "ai-card-title";
-    title.textContent = "👁 " + (p.label || "观察");
+    title.className = "ai-attach-title";
+    title.textContent = p.label || "观察";
     card.appendChild(title);
     if (p.note) {
       var body = document.createElement("div");
-      body.className = "ai-card-body";
+      body.className = "ai-attach-body";
       body.textContent = p.note;
       card.appendChild(body);
     }
     var reason = p.no_annotation_reason;
     if (reason && String(reason).trim()) {
       var sub = document.createElement("div");
-      sub.className = "ai-card-sub";
+      sub.className = "ai-attach-sub";
       sub.textContent = "未落标注：" + reason;
       card.appendChild(sub);
     }
@@ -4031,25 +4328,25 @@
     return card;
   }
 
-  // 判读卡
+  // 判读附件
   function appendReviewCard(title, summary, reason, container) {
     var target = container || els.aiTrace;
     clearAiEmpty(target);
     var card = document.createElement("div");
-    card.className = "ai-card review";
+    card.className = "ai-attach review";
     var head = document.createElement("div");
-    head.className = "ai-card-title";
+    head.className = "ai-attach-title";
     head.textContent = title;
     card.appendChild(head);
     if (summary) {
       var body = document.createElement("div");
-      body.className = "ai-card-body";
+      body.className = "ai-attach-body";
       body.textContent = summary;
       card.appendChild(body);
     }
     if (reason && String(reason).trim()) {
       var sub = document.createElement("div");
-      sub.className = "ai-card-sub";
+      sub.className = "ai-attach-sub";
       sub.textContent = "原因：" + reason;
       card.appendChild(sub);
     }
@@ -4058,16 +4355,16 @@
     return card;
   }
 
-  // 标注附件卡
+  // 标注附件
   function appendAnnotationCard(p, container, opts) {
     opts = opts || {};
     var target = container || els.aiTrace;
     clearAiEmpty(target);
     var card = document.createElement("div");
-    card.className = "ai-card annotation";
+    card.className = "ai-attach annotation";
     var title = document.createElement("div");
-    title.className = "ai-card-title";
-    title.textContent = "📌 " + (p.label || "AI 建议");
+    title.className = "ai-attach-title";
+    title.textContent = p.label || "AI 建议";
     card.appendChild(title);
     var parts = [];
     if (p.note) parts.push(p.note);
@@ -4076,14 +4373,14 @@
     }
     if (parts.length) {
       var body = document.createElement("div");
-      body.className = "ai-card-body";
+      body.className = "ai-attach-body";
       body.textContent = parts.join(" ");
       card.appendChild(body);
     }
     if (p.annotation_id) card.dataset.annotationId = p.annotation_id;
     if (opts.showFork && p.annotation_id) {
       var actions = document.createElement("div");
-      actions.className = "ai-card-actions";
+      actions.className = "ai-attach-actions";
       card.appendChild(actions);
       attachForkBtn(actions, p.annotation_id);
     }
@@ -4340,15 +4637,29 @@
     ctx = ensureAiCtx(ctx);
     var container = ctx.container;
     clearAiEmpty(container);
-    // 增量 append 到当前助手气泡（若无则新建）
+    // 首个 text_delta 到达：打字点让位给正式气泡（不关闭当前气泡）
+    if (ctx.thinkingEl && ctx.thinkingEl.parentNode) {
+      ctx.thinkingEl.parentNode.removeChild(ctx.thinkingEl);
+      ctx.thinkingEl = null;
+    }
+    // 增量 append 到当前助手气泡（若无则新建）；累积原文后按 Markdown 重渲染
     if (!ctx.bubbleEl || ctx.bubbleEl.closed || ctx.bubbleEl.parentNode !== container) {
+      var prev = container.lastElementChild;
       ctx.bubbleEl = document.createElement("div");
       ctx.bubbleEl.className = "ai-chat-bubble assistant";
-      ctx.bubbleEl.textContent = "";
+      // iMessage 分组：同侧连发收紧、尾巴移交新气泡
+      if (prev && prev.classList.contains("ai-chat-bubble") && prev.classList.contains("assistant")) {
+        prev.classList.remove("tail");
+        ctx.bubbleEl.classList.add("grp");
+      }
+      ctx.bubbleEl.classList.add("tail");
+      ctx.bubbleEl._rawText = "";
       ctx.bubbleEl.closed = false;
       container.appendChild(ctx.bubbleEl);
+      markUserBubblesRead(container);
     }
-    ctx.bubbleEl.textContent += text;
+    ctx.bubbleEl._rawText = (ctx.bubbleEl._rawText || "") + (text || "");
+    setBubbleContent(ctx.bubbleEl, "assistant", ctx.bubbleEl._rawText);
     container.scrollTop = container.scrollHeight;
   }
 
@@ -4359,8 +4670,15 @@
     clearAiEmpty(target);
     ctx.thinkingEl = document.createElement("div");
     ctx.thinkingEl.className = "ai-chat-thinking";
-    ctx.thinkingEl.textContent = "思考中…";
+    ctx.thinkingEl.setAttribute("aria-label", "思考中…");
+    for (var i = 0; i < 3; i++) {
+      var dot = document.createElement("span");
+      dot.className = "dot";
+      ctx.thinkingEl.appendChild(dot);
+    }
     target.appendChild(ctx.thinkingEl);
+    // 助手已开始响应：右侧用户气泡补「已读」
+    markUserBubblesRead(target);
     target.scrollTop = target.scrollHeight;
   }
   function clearThinkingRow(ctx) {

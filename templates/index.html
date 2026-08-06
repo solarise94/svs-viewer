@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260804slide" />
+  <link rel="stylesheet" href="/static/style.css?v=20260804overlay" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -295,19 +295,27 @@
 
         <!-- 对话区（实时 / 历史恢复 / fork 共用同一套气泡渲染） -->
         <div id="ai-trace" class="ai-trace">
-          <div class="ai-trace-empty">点击「开始」让 AI 读片。对话会显示在这里。</div>
+          <div class="ai-trace-empty">发条消息，AI 就开始读片。对话会显示在这里。</div>
         </div>
 
-        <!-- 底部输入（固定） -->
+        <!-- 底部输入（iMessage 输入栏） -->
         <div class="ai-composer">
-          <textarea id="ai-task" class="ai-task" rows="2"
-                    placeholder="让 AI 做什么，如：扫一遍这张片，标出可疑区域并总结"></textarea>
-          <div class="ai-task-actions">
-            <button id="ai-task-jump" class="tool-btn small" title="把当前 ROI/选中标注的坐标写进任务">判读当前选区</button>
-            <button id="ai-start-btn" class="btn primary small">开始</button>
-            <button id="ai-continue-btn" class="btn primary small" style="display:none;">▶ 继续</button>
+          <div id="ai-composer-aux" class="ai-composer-aux" style="display:none;">
+            <button id="ai-continue-btn" class="btn small" style="display:none;">▶ 继续</button>
             <button id="ai-fresh-btn" class="btn small" style="display:none;" title="归档旧对话开新，不影响标注与批注">🔄 新会话</button>
-            <button id="ai-stop-btn" class="btn small" style="display:none;">停止</button>
+          </div>
+          <div class="ai-composer-bar">
+            <button id="ai-task-jump" class="ai-plus-btn" title="把当前 ROI/选中标注的坐标写进任务" aria-label="判读当前选区">+</button>
+            <textarea id="ai-task" class="ai-task" rows="1"></textarea>
+            <button id="ai-stop-btn" class="ai-send-btn stop" style="display:none;" title="停止读片" aria-label="停止">
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>
+            </button>
+            <button id="ai-start-btn" class="ai-send-btn" title="开始读片" aria-label="开始">
+              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <path d="M10 15V4.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+                <path d="M5 9l5-5 5 5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
           </div>
         </div>
       </div>
@@ -320,6 +328,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260804slide"></script>
+  <script src="/static/app.js?v=20260804overlay"></script>
 </body>
 </html>

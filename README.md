@@ -117,7 +117,7 @@ podman run -d --name svs-share -p 38000:38000 \
 3. GET `/api/ai/config` 回显时 API Key 脱敏为「前4 + \*\*\*\* + 后4」掩码（`api_key_set: true` + `api_key_mask`），不回显明文；PUT 时空串=清除、与掩码同值=不变。
 
 **使用**：
-- 打开任一切片后，在 AI 面板的任务框输入指令（如「扫一遍这张片，标出可疑区域并总结」），点「开始」。
+- 打开任一切片后，在 AI 面板的任务框输入指令（如「客观扫读这张片：先低倍定位，再高倍确认；描述镜下所见，标出值得关注的区域并总结」），点「开始」。任务框留空时也会使用该默认任务。
 - 「判读当前选区」快捷钮会把当前 ROI 框或选中标注的 level-0 坐标写进任务前缀，引导 AI 重点看该区域。
 - 运行中以 SSE（`text/event-stream`）实时推送轨迹：`slide_opened` / `agent_thinking` / `text_delta` / `tool_started` / `snapshot_captured` / `observation` / `annotation_created` / `agent_finished` / `agent_error`。`snapshot_captured` 只推 bbox 与放大倍率（不推图像 base64，省带宽），点击该行可跳转到对应区域。
 - 单轮步数上限默认 `max_steps=50`（可在 `ai_config.json` 覆盖，到上限自动暂停，可「▶ 继续」）。
