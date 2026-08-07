@@ -1,0 +1,1130 @@
+/**
+ * AI reading assistant sidecar — pi Agent runner (Step 3, core).
+ *
+ * Wraps a pi {@link Agent} to drive a reading session and translate pi
+ * lifecycle events into the SSE event vocabulary the frontend expects
+ * (ai_agent.py:490 `run_agent` + app.py:1941 `_start_main_worker` /
+ * 2012 `_start_fork_worker`).
+ *
+ * Run-level responsibilities (each aligned to the Python original):
+ *   - **acquire** the session (409 on conflict) and emit the setup event
+ *     (slide_opened / session_resumed / fork_created / fork_resumed);
+ *   - drive the pi agent loop with the domain tools (tools.ts) and a
+ *     transient-error-retrying streamFn wrapper;
+ *   - map pi events to SSE events (agent_thinking / text_delta /
+ *     agent_finished / agent_paused / agent_error / agent_retrying);
+ *   - enforce max_steps (shouldStopAfterTurn) and the pending-snapshot
+ *     plain-text guard (getFollowUpMessages);
+ *   - persist transcript + agent_state + usage and transition status
+ *     (finished/error/paused), which the SSE layer observes to emit
+ *     session_ended.
+ *
+ * The runner is **async-fire**: run/continue/ask return `{sessionId}` as soon
+ * as the session is acquired and the setup event emitted; the agent loop runs
+ * in the background and reports completion via the event bus (the SSE stream
+ * tails the bus and the session status).
+ */
+import { Agent, type AgentEvent } from "@earendil-works/pi-agent-core";
+import type {
+	AssistantMessage,
+	AssistantMessageEventStream,
+	Message,
+	Usage,
+} from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createRequire } from "node:module";
+
+import { SYSTEM_PROMPT, DEFAULT_TASK, makeMainMessages, makeForkMessages, type SpotDict } from "./prompts.js";
+import { buildModel, type AiEngineConfig } from "./pi-model.js";
+import {
+	AgentState,
+	createTools,
+	type SlideInfo,
+	type ToolContext,
+} from "./tools.js";
+import {
+	SessionConflict,
+	dehydrateMessages,
+	type ImageMeta,
+	type PersistedAgentMessage,
+	type SessionData,
+	type SessionStore,
+} from "./session-store.js";
+// Re-export so server.ts can catch it uniformly alongside RootAnnotationGone.
+export { SessionConflict };
+import type { FlaskClient, RegionResult, RoiDict } from "./flask-client.js";
+import { SessionEventBus } from "./events.js";
+
+// =========================================================================== //
+// Public config / option types
+// =========================================================================== //
+
+/**
+ * Per-run engine config + tuning knobs, injected by the caller (Flask proxy)
+ * in the request body. The sidecar never reads ai_config.json itself.
+ */
+export interface RunConfig extends AiEngineConfig {
+	/** Per-run step cap (ai_agent.py:504 default 50). */
+	max_steps?: number;
+	/** Active fork limit before oldest non-running fork is archived (app.py:1917). */
+	fork_active_limit?: number;
+}
+
+/** Common run arguments. `config` is required. */
+export interface RunArgs {
+	slide: string;
+	config: RunConfig;
+}
+
+/** Inject a test streamFn into the runner (mock model). */
+export interface AgentRunnerOverrides {
+	/** Override the streamFn used by the pi Agent (tests pass a fake). */
+	streamFn?: (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream;
+}
+
+// =========================================================================== //
+// Errors
+// =========================================================================== //
+
+/** Root annotation no longer exists (app.py:1705 returns 410). */
+export class RootAnnotationGone extends Error {
+	constructor(message = "该标注已删除") {
+		super(message);
+		this.name = "RootAnnotationGone";
+	}
+}
+
+// =========================================================================== //
+// AgentRunner
+// =========================================================================== //
+
+/**
+ * One per sidecar process. Owns the {@link SessionStore}, the live
+ * {@link SessionEventBus}, and the {@link FlaskClient}. Run methods are
+ * async-fire: they acquire + emit setup + kick off the loop, then return.
+ */
+export class AgentRunner {
+	readonly store: SessionStore;
+	readonly bus: SessionEventBus;
+	readonly flask: FlaskClient;
+	private readonly overrides: AgentRunnerOverrides;
+	/** Active agent per session, for cancel(). */
+	private readonly activeAgents = new Map<string, Agent>();
+
+	constructor(store: SessionStore, bus: SessionEventBus, flask: FlaskClient, overrides: AgentRunnerOverrides = {}) {
+		this.store = store;
+		this.bus = bus;
+		this.flask = flask;
+		this.overrides = overrides;
+	}
+
+	// ----------------------------------------------------------------------- //
+	// run (fresh / reuse main) — app.py:1636 api_ai_run + 1941 _start_main_worker
+	// ----------------------------------------------------------------------- //
+	/**
+	 * Start (or resume) the main session for a slide.
+	 *
+	 * - `fresh=true`: archive any existing main, create a new session, emit
+	 *   `slide_opened` with the overview viewport, then run the loop from the
+	 *   initial user task message.
+	 * - `fresh=false` with an existing main: resume (continue) it.
+	 * - `fresh=false` with no main: behave as fresh.
+	 *
+	 * Returns `{sessionId}` immediately; the loop runs in the background.
+	 * Throws {@link SessionConflict} (409) if the main is already running.
+	 */
+	async runMain(args: RunArgs & { task?: string; fresh?: boolean }): Promise<{ sessionId: string }> {
+		const { slide, config } = args;
+		const fresh = args.fresh ?? false;
+
+		// Resolve which session to run.
+		let sessionId: string;
+		let isContinue: boolean;
+		if (fresh) {
+			// Archive the old main slot (app.py:1655 fresh path).
+			await this.archiveMainSlot(slide);
+			const data = await this.store.acquire({ slide, kind: "main" });
+			sessionId = data.id;
+			isContinue = false;
+		} else {
+			const idx = await this.store.listBySlide(slide);
+			const existing = idx.main;
+			if (existing) {
+				const data = await this.store.acquire({ sessionId: existing, slide, kind: "main" });
+				sessionId = data.id;
+				isContinue = true;
+			} else {
+				const data = await this.store.acquire({ slide, kind: "main" });
+				sessionId = data.id;
+				isContinue = false;
+			}
+		}
+
+		// Kick off the loop without awaiting completion.
+		void this.driveMain(sessionId, slide, config, args.task ?? "", isContinue).catch(async (e) => {
+			await this.handleFatal(sessionId, e);
+		});
+		return { sessionId };
+	}
+
+	/** continue = runMain with fresh=false (app.py:1668). */
+	async continueMain(args: RunArgs): Promise<{ sessionId: string }> {
+		const idx = await this.store.listBySlide(args.slide);
+		const sid = idx.main;
+		if (!sid) {
+			throw new SessionConflict("没有可继续的主会话");
+		}
+		return this.runMain({ ...args, fresh: false });
+	}
+
+	// ----------------------------------------------------------------------- //
+	// ask (fork create/resume) — app.py:1687 api_ai_ask + 2012 _start_fork_worker
+	// ----------------------------------------------------------------------- //
+	/**
+	 * Start or resume a fork for an annotation.
+	 *
+	 * - Root annotation gone → throws {@link RootAnnotationGone} (→ 410).
+	 * - Existing fork for this annotation → resume it (append the question,
+	 *   emit `fork_resumed`).
+	 * - Otherwise: enforce the fork-active limit (archive oldest non-running),
+	 *   create a new fork, emit `fork_created`, then run the loop.
+	 *
+	 * Returns `{sessionId}` immediately.
+	 */
+	async askFork(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string }> {
+		const { slide, config, annotationId } = args;
+
+		// Locate the root annotation via the spot change log (tombstone-aware).
+		const roi = await this.findSpot(slide, annotationId);
+		if (!roi || roi.deleted) {
+			throw new RootAnnotationGone();
+		}
+
+		const idx = await this.store.listBySlide(slide);
+		const existing = idx.forks[annotationId];
+
+		if (existing) {
+			// Resume: acquire, append the question, emit fork_resumed, run.
+			const data = await this.store.acquire({ sessionId: existing, slide, kind: "fork", annotationId });
+			const qText = args.question || "请谈谈这个区域";
+			// Append the user question to the transcript (app.py:1720).
+			const updated = await this.store.withLock(data.id, async (d) => {
+				if (!d) return null;
+				const msg: PersistedAgentMessage = {
+					role: "user",
+					content: qText,
+					display_text: qText,
+					timestamp: Date.now(),
+				} as PersistedAgentMessage;
+				d.messages = [...(d.messages || []), msg];
+				d.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(data.id, d);
+				return d;
+			});
+			void updated;
+			await this.bus.emit(data.id, "fork_resumed", { session_id: data.id, annotation_id: annotationId });
+			void this.driveFork(data.id, slide, config, annotationId).catch(async (e) => {
+				await this.handleFatal(data.id, e);
+			});
+			return { sessionId: data.id };
+		}
+
+		// New fork: enforce the active limit (app.py:1726).
+		const limit = Math.max(0, Math.floor(config.fork_active_limit ?? 20));
+		await this.enforceForkLimit(slide, limit);
+
+		const title = "批注@" + (roi.label || "");
+		const data = await this.store.acquire({ slide, kind: "fork", annotationId, title });
+		// seed spot_cursor (app.py:1739).
+		await this.store.withLock(data.id, async (d) => {
+			if (!d) return null;
+			const spots = await this.flask.spots(slide, 0).catch(() => ({ changes: [], current_seq: 0 }));
+			d.spot_cursor = spots.current_seq || 0;
+			d.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(data.id, d);
+			return d;
+		});
+
+		await this.bus.emit(data.id, "fork_created", { annotation_id: annotationId, title });
+		void this.driveFork(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
+			await this.handleFatal(data.id, e);
+		});
+		return { sessionId: data.id };
+	}
+
+	// ----------------------------------------------------------------------- //
+	// cancel — app.py:1750 api_ai_cancel
+	// ----------------------------------------------------------------------- //
+	/**
+	 * Cancel a running session. Aborts the pi Agent (which signals the streamFn
+	 * → "aborted" stop reason) and transitions status to paused once the run
+	 * settles. Accepts a sessionId or a slide (resolves the slide's main).
+	 */
+	async cancel(args: { sessionId?: string; slide?: string }): Promise<{ ok: true }> {
+		let sessionId = args.sessionId;
+		if (!sessionId) {
+			if (!args.slide) throw new SessionConflict("会话不存在");
+			const idx = await this.store.listBySlide(args.slide);
+			sessionId = idx.main || undefined;
+			if (!sessionId) throw new SessionConflict("会话不存在");
+		}
+		const data = await this.store.readSession(sessionId);
+		if (!data) throw new SessionConflict("会话不存在");
+
+		const agent = this.activeAgents.get(sessionId);
+		if (agent) {
+			agent.abort();
+			// The loop's settle path transitions status. If there is no active
+			// agent (e.g. crash residue), flip to paused directly.
+		} else if (data.status === "running") {
+			await this.store.setStatus(sessionId, "paused");
+		}
+		return { ok: true };
+	}
+
+	// =========================================================================== //
+	// Main loop driver
+	// =========================================================================== //
+	/**
+	 * Drive a main session: emit setup event, build initial context, run the
+	 * agent, then settle status. Mirrors app.py:1957 `worker`.
+	 */
+	private async driveMain(sessionId: string, slide: string, config: RunConfig, task: string, resumed: boolean): Promise<void> {
+		const slideInfo = await this.fetchSlideInfo(slide);
+		const data = await this.store.readSession(sessionId);
+		if (!data) return;
+
+		let initialMessages: PersistedAgentMessage[];
+
+		if (!resumed) {
+			// Fresh: build the user task message, persist it, emit slide_opened
+			// with the overview viewport (app.py:1960-1980).
+			const vp = 1024;
+			const lvl = AgentState.pickOverviewLevel(slideInfo.width, slideInfo.height, slideInfo.levelDownsamples, vp);
+			const st = new AgentState(slideInfo.width / 2.0, slideInfo.height / 2.0, vp, lvl, slideInfo.mpp);
+			const userMsg = makeMainMessages({ slideName: slide, task, info: slideInfo }) as unknown as PersistedAgentMessage;
+			// Inject spot changes since cursor 0 (app.py:1969). injectSpotChanges
+			// appends + persists the spot messages itself; we prepend the task
+			// user message and persist the full initial transcript.
+			const spotMsgs = await this.injectSpotChanges(sessionId, slide);
+			initialMessages = [userMsg, ...spotMsgs];
+
+			// Persist the initial transcript + agent_state.
+			await this.store.withLock(sessionId, async (d) => {
+				if (!d) return null;
+				// injectSpotChanges already appended spotMsgs to d.messages;
+				// rebuild as [userMsg, ...spotMsgs] (drop any prior residue).
+				d.messages = [...initialMessages];
+				d.agent_state = st.toDict();
+				d.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(sessionId, d);
+				return d;
+			});
+
+			const bbox = st.viewportBbox(slideInfo.levelDownsamples);
+			await this.bus.emit(sessionId, "slide_opened", {
+				slide,
+				width: slideInfo.width,
+				height: slideInfo.height,
+				overview_level: lvl,
+				level_count: slideInfo.levelDownsamples.length,
+				mpp: slideInfo.mpp,
+				viewport: bbox,
+				session_id: sessionId,
+			});
+		} else {
+			// Continue: refresh system prompt (no-op: pi keeps it on state),
+			// inject spot changes (appends + persists internally), emit
+			// session_resumed (app.py:1981-1994).
+			await this.injectSpotChanges(sessionId, slide);
+			const after = await this.store.readSession(sessionId);
+			initialMessages = (after?.messages || []) as PersistedAgentMessage[];
+			await this.bus.emit(sessionId, "session_resumed", {
+				session_id: sessionId,
+				status: after?.status ?? "running",
+			});
+		}
+
+		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, resumed);
+	}
+
+	/**
+	 * Drive a fork session: emit fork_resumed (already emitted by askFork for
+	 * new forks via fork_created), build/continue the context, run the loop.
+	 * Mirrors app.py:2017 `worker`.
+	 */
+	private async driveFork(
+		sessionId: string,
+		slide: string,
+		config: RunConfig,
+		annotationId: string,
+		roi?: RoiDict,
+		question?: string,
+	): Promise<void> {
+		const slideInfo = await this.fetchSlideInfo(slide);
+		const data = await this.store.readSession(sessionId);
+		if (!data) return;
+
+		let initialMessages: PersistedAgentMessage[];
+
+		if (data.messages.length === 0) {
+			// Brand-new fork: build the spot card + image (app.py:1731-1741).
+			if (!roi) {
+				roi = (await this.findSpot(slide, annotationId)) || undefined;
+			}
+			const spot: SpotDict = roi || { annotation_id: annotationId };
+			const { imageRef, imageB64 } = await this.forkSpotImageRef(slide, slideInfo, spot);
+			const userMsg = makeForkMessages({
+				slideName: slide,
+				info: slideInfo,
+				spot,
+				question: question || "",
+				imageRef,
+				imageB64,
+			}) as unknown as PersistedAgentMessage;
+			initialMessages = [userMsg];
+			await this.store.withLock(sessionId, async (d) => {
+				if (!d) return null;
+				d.messages = [...initialMessages];
+				d.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(sessionId, d);
+				return d;
+			});
+		} else {
+			// Resumed fork: inject spot changes (app.py:2021). injectSpotChanges
+			// appends + persists internally; re-read the session for the full
+			// transcript (avoid double-appending the spot messages).
+			await this.injectSpotChanges(sessionId, slide);
+			const after = await this.store.readSession(sessionId);
+			initialMessages = (after?.messages || []) as PersistedAgentMessage[];
+			// fork_resumed was already emitted by askFork; nothing to do here.
+		}
+
+		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false);
+	}
+
+	// =========================================================================== //
+	// The pi Agent loop + event mapping
+	// =========================================================================== //
+	/**
+	 * Build a pi Agent, wire event mapping + run-level guards, and run to
+	 * completion. Settles status (finished/error/paused) at the end so the SSE
+	 * layer emits session_ended.
+	 */
+	private async runAgentLoop(
+		sessionId: string,
+		slide: string,
+		config: RunConfig,
+		slideInfo: SlideInfo,
+		initialMessages: PersistedAgentMessage[],
+		_continued: boolean,
+	): Promise<void> {
+		const { model } = buildModel(config);
+		const maxSteps = Math.max(1, Math.floor(config.max_steps ?? 50));
+
+		// Tools + tool context (tools.ts). emit routes domain events to the bus.
+		const toolCtx: ToolContext = {
+			sessionStore: this.store,
+			sessionId,
+			kind: (await this.store.readSession(sessionId))?.kind === "fork" ? "fork" : "main",
+			slide,
+			slideInfo,
+			flask: this.flask,
+			emit: (type, payload) => {
+				// Fire-and-forget; emit is async but tools need not await each.
+				void this.bus.emit(sessionId, type, payload);
+			},
+			cfg: config as unknown as Record<string, unknown>,
+		};
+		const tools = createTools(toolCtx);
+
+		// StreamFn with transient-error retry (ai_agent.py:597-608).
+		const stepRef = { current: -1 };
+		const streamFn = this.makeRetryingStreamFn(sessionId, config, stepRef);
+
+		// Run-state machine for event mapping.
+		const runState: RunState = {
+			turnCount: 0,
+			finished: false,
+			paused: false,
+			errored: false,
+			lastAssistant: null,
+			hitMaxSteps: false,
+			abortRequested: false,
+		};
+
+		// max_steps: when reached, emit agent_paused (ai_agent.py:696-698) and
+		// stop. The flag ensures agent_end below does not also emit
+		// agent_finished.
+		const emitMaxStepsPause = async (): Promise<void> => {
+			runState.hitMaxSteps = true;
+			runState.paused = true;
+			await this.bus.emit(sessionId, "agent_paused", {
+				summary: "已达步数上限",
+				can_continue: true,
+			});
+		};
+
+		const agent = new Agent({
+			streamFn: streamFn as Agent["streamFunction"],
+			getApiKey: () => config.api_key,
+			initialState: {
+				model: model as never,
+				systemPrompt: SYSTEM_PROMPT,
+				tools,
+				messages: initialMessages as never[],
+			},
+			// shouldStopAfterTurn: enforce max_steps (ai_agent.py:696-698).
+			shouldStopAfterTurn: async () => {
+				if (runState.turnCount >= maxSteps) {
+					await emitMaxStepsPause();
+					return true;
+				}
+				return false;
+			},
+		});
+
+		this.activeAgents.set(sessionId, agent);
+
+		// Pending-snapshot plain-text guard (ai_agent.py:650-655):
+		// when a plain-text turn ends with a pending snapshot, push a nudge
+		// onto the agent's followUp queue. pi's loop drains follow-ups after
+		// the agent would otherwise stop (agent-loop.js:162-168), continuing
+		// the loop with the nudge as a new user turn — exactly mirroring
+		// Python's `append user msg + continue`.
+
+		const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
+			await this.handleAgentEvent(sessionId, event, runState, stepRef, agent);
+		});
+
+		try {
+			// Fresh run: prompt with the initial user message (already on state
+			// via initialState.messages, so use continue() to avoid re-adding).
+			// pi requires prompt() to add a new message; since we seeded
+			// initialState.messages, we use continue() for the first turn too.
+			await agent.continue();
+			await agent.waitForIdle();
+		} catch (e) {
+			runState.errored = true;
+			await this.bus.emit(sessionId, "agent_error", {
+				error: `读片助手异常：${(e as Error)?.message || String(e)}`,
+			});
+		} finally {
+			unsubscribe();
+			this.activeAgents.delete(sessionId);
+		}
+
+		// Persist the final transcript + settle status.
+		await this.settleRun(sessionId, runState, agent);
+	}
+
+	// =========================================================================== //
+	// Agent event → SSE event mapping
+	// =========================================================================== //
+	/**
+	 * Subscribe callback: map one pi AgentEvent to SSE events + run-state
+	 * updates. Async to coexist with the agent's await-settling contract.
+	 */
+	private async handleAgentEvent(
+		sessionId: string,
+		event: AgentEvent,
+		runState: RunState,
+		stepRef: { current: number },
+		agent: Agent,
+	): Promise<void> {
+		switch (event.type) {
+			case "turn_start": {
+				runState.turnCount += 1;
+				stepRef.current = runState.turnCount - 1; // 0-based like Python
+				await this.bus.emit(sessionId, "agent_thinking", { step: stepRef.current });
+				break;
+			}
+			case "message_update": {
+				if (event.assistantMessageEvent.type === "text_delta") {
+					await this.bus.emit(sessionId, "text_delta", { text: event.assistantMessageEvent.delta });
+				}
+				break;
+			}
+			case "message_end": {
+				if (event.message.role === "assistant") {
+					const msg = event.message as AssistantMessage;
+					runState.lastAssistant = msg;
+					// length → paused (ai_agent.py:637-646). pi already fails the
+					// (possibly truncated) tool calls; we just pause.
+					if (msg.stopReason === "length") {
+						const tip =
+							"模型输出被截断（达到 max_tokens）" +
+							(msg.content.some((c) => c.type === "toolCall") ? "，工具调用可能不完整" : "") +
+							"，可继续生成或提高 max_tokens";
+						await this.bus.emit(sessionId, "agent_paused", {
+							summary: tip,
+							can_continue: true,
+							reason: "max_tokens",
+						});
+						runState.paused = true;
+					}
+					// Record usage (ai_agent.py:619-623).
+					await this.recordUsage(sessionId, msg.usage);
+				}
+				break;
+			}
+			case "turn_end": {
+				// Plain-text end with a pending snapshot → enqueue the nudge
+				// (ai_agent.py:650-655). pi drains the followUp queue after the
+				// agent would otherwise stop, continuing the loop with the
+				// nudge — exactly mirroring Python's `append user msg + continue`.
+				const msg = event.message as AssistantMessage;
+				const hasToolCalls = msg.content.some((c) => c.type === "toolCall");
+				if (!hasToolCalls && !runState.paused && !runState.finished && !runState.hitMaxSteps) {
+					const pending = await this.isSnapshotPending(sessionId);
+					if (pending) {
+						const nudge: PersistedAgentMessage = {
+							role: "user",
+							content:
+								"当前还有未消化的快照，请先调用 complete_snapshot_review 关闭后再继续。",
+							timestamp: Date.now(),
+						} as PersistedAgentMessage;
+						agent.followUp(nudge as never);
+					}
+				}
+				// finish tool: the tool sets terminate:true → loop exits. We
+				// detect it here so agent_end does not also emit agent_finished.
+				if (hasToolCalls) {
+					for (const tc of msg.content) {
+						if (tc.type === "toolCall" && tc.name === "finish") {
+							runState.finished = true;
+							const summary = (tc.arguments as { summary?: string })?.summary || "(无总结)";
+							await this.bus.emit(sessionId, "agent_finished", { summary });
+							break;
+						}
+					}
+				}
+				break;
+			}
+			case "agent_end": {
+				// User abort → paused (ai_agent.py:471-477 _pause_cancelled).
+				// Detected: the last assistant message has stopReason "aborted".
+				if (
+					!runState.finished &&
+					!runState.paused &&
+					!runState.errored &&
+					runState.lastAssistant?.stopReason === "aborted"
+				) {
+					await this.bus.emit(sessionId, "agent_paused", {
+						summary: "已停止",
+						can_continue: true,
+					});
+					runState.paused = true;
+					break;
+				}
+				// Plain-text stop → agent_finished (ai_agent.py:656-657).
+				// max_steps pauses and length pauses were already emitted.
+				if (!runState.finished && !runState.paused && !runState.errored && !runState.hitMaxSteps) {
+					const text = runState.lastAssistant
+						? runState.lastAssistant.content
+								.filter((c): c is { type: "text"; text: string } => c.type === "text")
+								.map((c) => c.text)
+								.join("")
+						: "";
+					await this.bus.emit(sessionId, "agent_finished", { summary: text || "(无总结)" });
+					runState.finished = true;
+				}
+				break;
+			}
+		}
+	}
+
+	// =========================================================================== //
+	// Settle: persist transcript + transition status
+	// =========================================================================== //
+	private async settleRun(sessionId: string, runState: RunState, agent: Agent): Promise<void> {
+		// Persist the agent's transcript, dehydrating image blocks.
+		const msgs = agent.state.messages as unknown as PersistedAgentMessage[];
+		const imageMeta = this.collectImageMeta(msgs);
+		const dehydrated = dehydrateMessages(msgs, imageMeta);
+
+		let nextStatus: "finished" | "error" | "paused";
+		if (runState.errored) {
+			nextStatus = "error";
+		} else if (runState.paused) {
+			nextStatus = "paused";
+		} else if (runState.finished) {
+			nextStatus = "finished";
+		} else {
+			// Defensive fallback: loop exited without an explicit terminal
+			// event. Pause so the user can continue.
+			nextStatus = "paused";
+		}
+
+		await this.store.withLock(sessionId, async (d) => {
+			if (!d) return null;
+			d.messages = dehydrated;
+			d.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(sessionId, d);
+			return d;
+		});
+		await this.store.setStatus(sessionId, nextStatus);
+	}
+
+	/** Record last_usage on the session for Step 4 compaction triggers. */
+	private async recordUsage(sessionId: string, usage: Usage | undefined): Promise<void> {
+		if (!usage) return;
+		await this.store.withLock(sessionId, async (d) => {
+			if (!d) return null;
+			(d as SessionData & { last_usage?: Usage }).last_usage = usage;
+			await this.store.writeSession(sessionId, d);
+			return d;
+		});
+	}
+
+	/** True if the session currently has a pending_snapshot_review. */
+	private async isSnapshotPending(sessionId: string): Promise<boolean> {
+		const d = await this.store.readSession(sessionId);
+		return !!d?.pending_snapshot_review;
+	}
+
+	/**
+	 * Build a dehydrate imageMeta map keyed by toolCallId so settleRun can
+	 * replace image blocks with image_ref placeholders. For tool results we
+	 * read the snapshot details the snapshot tool stored in result.details.
+	 */
+	private collectImageMeta(msgs: PersistedAgentMessage[]): Record<string, ImageMeta> {
+		const out: Record<string, ImageMeta> = {};
+		for (const m of msgs) {
+			if ((m as { role?: string }).role !== "toolResult") continue;
+			const tr = m as { toolCallId: string; details?: { src?: { x: number; y: number; w: number; h: number }; magnification?: string; slide_fingerprint?: string } };
+			if (tr.details && tr.details.src) {
+				out[tr.toolCallId] = {
+					toolCallId: tr.toolCallId,
+					slide_fingerprint: tr.details.slide_fingerprint || "",
+					src: tr.details.src,
+					magnification: tr.details.magnification || "",
+					summary: "(本次会话内抓取的快照)",
+				};
+			}
+		}
+		return out;
+	}
+
+	// =========================================================================== //
+	// Retrying streamFn wrapper (ai_agent.py:597-608)
+	// =========================================================================== //
+	/**
+	 * Wrap a real streamFn so transient errors (SSL/timeout/429/5xx) retry up
+	 * to 3 times with 2/4/8s backoff, emitting `agent_retrying` each attempt.
+	 * Context-window errors are NOT retried (Step 4 adds compaction); other
+	 * errors pass through unchanged.
+	 *
+	 * The wrapper consumes each underlying stream to completion; on a transient
+	 * error it starts a fresh stream. The wrapper itself returns a single
+	 * combined AssistantMessageEventStream.
+	 */
+	private makeRetryingStreamFn(
+		sessionId: string,
+		config: RunConfig,
+		stepRef: { current: number },
+	): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
+		const realStreamFn = (this.overrides.streamFn ??
+			// Default: bind the openai-completions streamSimple for the built
+			// model. Imported lazily so tests that pass a fake streamFn never
+			// touch the real provider module.
+			this.defaultStreamFnForConfig(config)) as (
+			model: unknown,
+			context: unknown,
+			options?: unknown,
+		) => AssistantMessageEventStream;
+
+		const self = this;
+		return function (model, context, options) {
+			const out = createAssistantMessageEventStream();
+			void (async () => {
+				const maxTransient = 3;
+				for (let attempt = 0; ; attempt++) {
+					let stream: AssistantMessageEventStream;
+					try {
+						stream = realStreamFn(model, context, options);
+					} catch (e) {
+						// streamFn contract says it must not throw, but be defensive.
+						out.push({
+							type: "error",
+							reason: "error",
+							error: makeErrorAssistant(String((e as Error)?.message || e)),
+						});
+						out.end(makeErrorAssistant(String((e as Error)?.message || e)));
+						return;
+					}
+					let finalMessage: AssistantMessage | null = null;
+					let eventType: "done" | "error" | null = null;
+					try {
+						for await (const ev of stream) {
+							if (ev.type === "done") {
+								finalMessage = ev.message;
+								eventType = "done";
+							} else if (ev.type === "error") {
+								finalMessage = ev.error;
+								eventType = "error";
+							}
+							out.push(ev);
+							// On done/error we stop forwarding further events
+							// from this underlying stream; the for-await will
+							// end naturally.
+						}
+					} catch (e) {
+						finalMessage = makeErrorAssistant(String((e as Error)?.message || e));
+						eventType = "error";
+					}
+
+					if (eventType === "done") {
+						out.end(finalMessage!);
+						return;
+					}
+					if (eventType === "error" && finalMessage) {
+						const errMsg = finalMessage.errorMessage || "";
+						if (isContextExceeded(errMsg)) {
+							// Not retried here (Step 4 compaction). Forward as-is.
+							out.end(finalMessage);
+							return;
+						}
+						if (isTransientError(errMsg) && attempt < maxTransient) {
+							const delay = 2 ** (attempt + 1); // 2/4/8s
+							await self.bus.emit(sessionId, "agent_retrying", {
+								step: stepRef.current,
+								attempt: attempt + 1,
+								max: maxTransient,
+								delay,
+								reason: `reconnection ${attempt + 1}/${maxTransient} (${delay}s)`,
+							});
+							await sleep(delay * 1000);
+							continue; // retry the model call
+						}
+						out.end(finalMessage);
+						return;
+					}
+					// Stream ended without a terminal event (shouldn't happen).
+					out.end(makeErrorAssistant("Stream ended without a terminal event"));
+					return;
+				}
+			})().catch(() => {
+				// Last-resort: ensure the output stream terminates.
+				out.end(makeErrorAssistant("retry wrapper failed"));
+			});
+			return out;
+		};
+	}
+
+	/** Lazy-import the openai-completions streamSimple bound to the config. */
+	private defaultStreamFnForConfig(_config: RunConfig): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
+		// Dynamic import keeps the provider module out of the test graph when a
+		// fake streamFn is supplied. The returned fn dispatches by model.api.
+		const mod = this.loadOpenAiStream();
+		return (model, context, options) => {
+			const m = model as { api?: string };
+			if (m?.api === "anthropic-messages") {
+				throw new Error("anthropic protocol not yet wired in sidecar streamFn");
+			}
+			return mod.streamSimple(model as never, context as never, options as never);
+		};
+	}
+
+	private openAiStreamCache: { streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple } | null = null;
+	private loadOpenAiStream(): { streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple } {
+		if (!this.openAiStreamCache) {
+			// createRequire lets us synchronously load an ESM subpath export
+			// without a top-level await, keeping the streamFn factory sync.
+			const req = createRequire(import.meta.url);
+			this.openAiStreamCache = req("@earendil-works/pi-ai/api/openai-completions") as {
+				streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple;
+			};
+		}
+		return this.openAiStreamCache!;
+	}
+
+	// =========================================================================== //
+	// Fatal error handler (uncaught exception in the driver)
+	// =========================================================================== //
+	private async handleFatal(sessionId: string, e: unknown): Promise<void> {
+		const msg = (e as Error)?.message || String(e);
+		try {
+			await this.bus.emit(sessionId, "agent_error", { error: `读片助手异常：${msg}` });
+		} catch {
+			// ignore
+		}
+		await this.store.setStatus(sessionId, "error");
+	}
+
+	// =========================================================================== //
+	// Spot injection (ai_session.py:985-1024 inject_spot_changes)
+	// =========================================================================== //
+	/**
+	 * Append user messages for spot changes since spot_cursor, updating the
+	 * cursor. Returns the appended messages (for fresh-run initial assembly).
+	 *
+	 * Text format is byte-for-byte aligned with ai_session.py:999-1016.
+	 */
+	async injectSpotChanges(sessionId: string, slide: string): Promise<PersistedAgentMessage[]> {
+		const data = await this.store.readSession(sessionId);
+		if (!data) return [];
+		const cursor = Math.floor(data.spot_cursor || 0);
+		let result: { changes: Record<string, unknown>[]; current_seq: number };
+		try {
+			result = await this.flask.spots(slide, cursor);
+		} catch {
+			return [];
+		}
+		const changes = result.changes || [];
+		if (!changes.length) return [];
+
+		const msgs: PersistedAgentMessage[] = [];
+		for (const r of changes) {
+			const annotationId = String(r.annotation_id || "");
+			if (r.deleted) {
+				msgs.push({
+					role: "user",
+					content: `spot_deleted：标注 (${annotationId}) 已被删除。`,
+					spot_deleted: annotationId,
+					timestamp: Date.now(),
+				} as PersistedAgentMessage);
+			} else {
+				const s = Math.trunc(Number(r.side_px) || 0);
+				const x0 = Number(r.x) || 0;
+				const y0 = Number(r.y) || 0;
+				const note = String(r.note || "");
+				msgs.push({
+					role: "user",
+					content:
+						`spot_updated：已有标注线索（待复核，非诊断事实）——` +
+						`位置 level-0 左上角 (${fmt0(x0)},${fmt0(y0)})，边长 ${s}px` +
+						`（中心 (${fmt0(x0 + s / 2.0)},${fmt0(y0 + s / 2.0)})；goto 看这里请把视野中心对准中心坐标），` +
+						`原标注文案：「${note}」。` +
+						`请独立观察后决定采纳、修正或忽略。`,
+					spot_updated: annotationId,
+					timestamp: Date.now(),
+				} as PersistedAgentMessage);
+			}
+		}
+
+		await this.store.withLock(sessionId, async (d) => {
+			if (!d) return null;
+			d.messages = [...(d.messages || []), ...msgs];
+			d.spot_cursor = result.current_seq || cursor;
+			d.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(sessionId, d);
+			return d;
+		});
+		return msgs;
+	}
+
+	// =========================================================================== //
+	// Helpers: slide info, spot lookup, fork image, archive, fork limit
+	// =========================================================================== //
+
+	/** Cached slide info fetcher. */
+	private slideInfoCache = new Map<string, SlideInfo>();
+	private async fetchSlideInfo(slide: string): Promise<SlideInfo> {
+		const cached = this.slideInfoCache.get(slide);
+		if (cached) return cached;
+		const r = await this.flask.slideInfo(slide);
+		const info: SlideInfo = {
+			width: r.width,
+			height: r.height,
+			levelDownsamples: [...(r.level_downsamples || [1.0])],
+			mpp: r.mpp == null ? null : r.mpp,
+			fingerprint: r.fingerprint || "",
+		};
+		this.slideInfoCache.set(slide, info);
+		return info;
+	}
+
+	/**
+	 * Find a spot by annotation_id from the full change log (tombstone-aware).
+	 * Returns the latest record for the id (deleted or not) or null.
+	 * Equivalent to app.py:1704 share_store.get_roi_by_annotation_id.
+	 */
+	private async findSpot(slide: string, annotationId: string): Promise<(RoiDict & { deleted?: boolean }) | null> {
+		let result;
+		try {
+			result = await this.flask.spots(slide, 0);
+		} catch {
+			return null;
+		}
+		// The change log may carry multiple revisions; take the latest for id.
+		let latest: (RoiDict & { deleted?: boolean }) | null = null;
+		for (const c of result.changes || []) {
+			if (String(c.annotation_id || "") === annotationId) {
+				latest = c as RoiDict & { deleted?: boolean };
+			}
+		}
+		return latest;
+	}
+
+	/**
+	 * Build the fork's attached image_ref + inline base64 (app.py:1883
+	 * _fork_spot_image_ref). bbox expanded 15%, output 1024-1568px.
+	 */
+	private async forkSpotImageRef(
+		slide: string,
+		info: SlideInfo,
+		spot: SpotDict,
+	): Promise<{ imageRef: import("./session-store.js").ImageRefContent | null; imageB64: string | null }> {
+		const x = Math.trunc(Number(spot.x) || 0);
+		const y = Math.trunc(Number(spot.y) || 0);
+		const side = Math.trunc(Number(spot.side_px) || 0);
+		if (side <= 0) return { imageRef: null, imageB64: null };
+		const pad = Math.round(side * 0.15);
+		const width = info.width;
+		const height = info.height;
+		const ex = Math.max(0, x - pad);
+		const ey = Math.max(0, y - pad);
+		const ew = Math.min(side + pad * 2, Math.max(1, width - ex));
+		const eh = Math.min(side + pad * 2, Math.max(1, height - ey));
+		const src = { x: ex, y: ey, w: ew, h: eh };
+
+		let b64 = "";
+		let mag: string | null = null;
+		try {
+			const r: RegionResult = await this.flask.region({ slide, x: ex, y: ey, w: ew, h: eh, out_w: 1568, out_h: 1568 });
+			b64 = r.image_base64 || "";
+			mag = (r.magnification == null ? null : String(r.magnification)) || null;
+		} catch {
+			b64 = "";
+		}
+
+		const imageRef = {
+			type: "image_ref" as const,
+			ref_id: `ref_fork_${String(spot.annotation_id || "").slice(0, 12)}`,
+			slide_fingerprint: info.fingerprint || "",
+			src,
+			magnification: mag ?? "",
+			summary: "该 spot 当前快照（bbox 外扩 15%）",
+		};
+		return { imageRef, imageB64: b64 || null };
+	}
+
+	/** Archive the current main session for a slide (fresh path). */
+	private async archiveMainSlot(slide: string): Promise<void> {
+		const idx = await this.store.listBySlide(slide);
+		const mainId = idx.main;
+		if (!mainId) return;
+		const d = await this.store.readSession(mainId);
+		if (!d) return;
+		if (d.archived) return;
+		await this.store.withLock(mainId, async (data) => {
+			if (!data) return null;
+			data.archived = true;
+			data.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(mainId, data);
+			return data;
+		});
+		// Remove the main slot from the index (app.py fresh semantics).
+		await this.store.unregister(slide, mainId, "main");
+	}
+
+	/**
+	 * Archive the oldest non-running forks until under the active limit
+	 * (app.py:1917 _enforce_fork_limit). Running forks are never archived.
+	 */
+	private async enforceForkLimit(slide: string, limit: number): Promise<void> {
+		if (limit <= 0) return;
+		const idx = await this.store.listBySlide(slide);
+		const forks: SessionData[] = [];
+		for (const sid of Object.values(idx.forks)) {
+			const d = await this.store.readSession(sid);
+			if (d) forks.push(d);
+		}
+		const running = forks.filter((d) => d.status === "running");
+		const idle = forks
+			.filter((d) => d.status !== "running" && !d.archived)
+			.sort((a, b) => (a.updated_at || 0) - (b.updated_at || 0));
+		const allowed = Math.max(0, limit - running.length);
+		const toArchive = idle.slice(Math.max(0, allowed - idle.length));
+		for (const d of toArchive) {
+			await this.store.withLock(d.id, async (data) => {
+				if (!data) return null;
+				data.archived = true;
+				data.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(d.id, data);
+				return data;
+			});
+		}
+	}
+}
+
+// =========================================================================== //
+// Run-state machine
+// =========================================================================== //
+
+interface RunState {
+	turnCount: number;
+	finished: boolean;
+	paused: boolean;
+	errored: boolean;
+	lastAssistant: AssistantMessage | null;
+	/** True when the loop exited because max_steps was reached. */
+	hitMaxSteps: boolean;
+	abortRequested: boolean;
+}
+
+// =========================================================================== //
+// Transient / context-exceeded error classification (ai_agent.py:422-468)
+// =========================================================================== //
+
+/** ai_agent.py:422 _is_context_exceeded. */
+function isContextExceeded(msg: string): boolean {
+	const lower = (msg || "").toLowerCase();
+	const kws = ["context_length", "maximum context", "too many tokens", "context window"];
+	for (const kw of kws) {
+		if (lower.includes(kw)) return true;
+	}
+	return lower.includes("context_length_exceeded");
+}
+
+/** ai_agent.py:446 _is_transient_error (message-substring half). */
+function isTransientError(msg: string): boolean {
+	const lower = (msg || "").toLowerCase();
+	const kws = [
+		"sslerror",
+		"unexpected_eof",
+		"eof while",
+		"connection reset",
+		"connection aborted",
+		"broken pipe",
+		"timed out",
+		"max retries",
+	];
+	for (const kw of kws) {
+		if (lower.includes(kw)) return true;
+	}
+	// HTTP status code hints in error text (429/5xx).
+	if (/\b(408|409|425|429|500|502|503|504)\b/.test(lower)) return true;
+	return false;
+}
+
+// =========================================================================== //
+// Small helpers
+// =========================================================================== //
+
+function fmt0(v: number): string {
+	return String(Math.round(v));
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Build a minimal error AssistantMessage to terminate a stream. */
+function makeErrorAssistant(message: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: "openai-completions",
+		provider: "cpa-gateway",
+		model: "unknown",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "error",
+		errorMessage: message,
+		timestamp: Date.now(),
+	} as AssistantMessage;
+}
+
+/** Avoid an unused-import warning while keeping Message available for typing. */
+export type { Message };

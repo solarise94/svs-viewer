@@ -319,11 +319,16 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 		}
 	}
 	async function persistState(): Promise<void> {
-		const data = await ctx.sessionStore.readSession(ctx.sessionId);
-		if (!data) return;
-		data.agent_state = stateHolder.st.toDict();
-		data.updated_at = Math.floor(Date.now() / 1000);
-		await ctx.sessionStore.writeSession(ctx.sessionId, data);
+		// Serialize against SessionStore.appendEvent (which also does a
+		// read-modify-write) via withLock — otherwise an interleaved event
+		// append would clobber the agent_state we just wrote.
+		await ctx.sessionStore.withLock(ctx.sessionId, async (data) => {
+			if (!data) return null;
+			data.agent_state = stateHolder.st.toDict();
+			data.updated_at = Math.floor(Date.now() / 1000);
+			await ctx.sessionStore.writeSession(ctx.sessionId, data);
+			return data;
+		});
 	}
 
 	// Pending-snapshot helpers (read/write session.pending_snapshot_review).
@@ -332,19 +337,23 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 		return data ? data.pending_snapshot_review : null;
 	}
 	async function setPending(p: PendingSnapshotReview | null): Promise<void> {
-		const data = await ctx.sessionStore.readSession(ctx.sessionId);
-		if (!data) return;
-		data.pending_snapshot_review = p;
-		data.updated_at = Math.floor(Date.now() / 1000);
-		await ctx.sessionStore.writeSession(ctx.sessionId, data);
+		await ctx.sessionStore.withLock(ctx.sessionId, async (data) => {
+			if (!data) return null;
+			data.pending_snapshot_review = p;
+			data.updated_at = Math.floor(Date.now() / 1000);
+			await ctx.sessionStore.writeSession(ctx.sessionId, data);
+			return data;
+		});
 	}
 	async function addObservation(obs: Record<string, unknown>): Promise<void> {
-		const data = await ctx.sessionStore.readSession(ctx.sessionId);
-		if (!data) return;
-		data.observations = data.observations || [];
-		data.observations.push(obs);
-		data.updated_at = Math.floor(Date.now() / 1000);
-		await ctx.sessionStore.writeSession(ctx.sessionId, data);
+		await ctx.sessionStore.withLock(ctx.sessionId, async (data) => {
+			if (!data) return null;
+			data.observations = data.observations || [];
+			data.observations.push(obs);
+			data.updated_at = Math.floor(Date.now() / 1000);
+			await ctx.sessionStore.writeSession(ctx.sessionId, data);
+			return data;
+		});
 	}
 	async function readSession(): Promise<SessionData | null> {
 		return ctx.sessionStore.readSession(ctx.sessionId);
