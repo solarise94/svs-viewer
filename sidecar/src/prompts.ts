@@ -53,6 +53,26 @@ export const DEFAULT_TASK =
 	"客观扫读这张片：先低倍定位，再高倍确认；描述镜下所见，标出值得关注的区域并总结";
 
 // =========================================================================== //
+// FORK_LITE_SYSTEM_PROMPT — lite fork (批注小框纯解读对话).
+//
+// A fork (kind="fork") is now a lite Q&A session bound to an annotation: it
+// registers NO tools, so the model cannot navigate / snapshot / mark / annotate
+// / finish. It answers purely from the initial spot card + attached image and
+// the subsequent conversation. Legacy fork transcripts that contain historical
+// tool calls are preserved verbatim on resume; only NEW tool availability is
+// removed. A plain-text turn ends the回合 naturally (agent_finished).
+// =========================================================================== //
+
+export const FORK_LITE_SYSTEM_PROMPT = `你是病理切片的批注解读助手，基于给定标注区域的图像与上下文回答用户的问题。
+
+你的能力边界：
+- 你只能基于本次对话已经给出的标注卡（位置、边长、原标注文案）和附图，以及后续用户的追问，做文本问答。
+- 你不能导航、移动视野、抓快照、记录观察、落标注或结束读片——这些工具对你不可用。不要声称或暗示自己要去"看一下""放大确认"。
+- 回答简明、聚焦用户的问题；对肿瘤/炎症/退变/反应性改变等保持鉴别中立，不要优先归为肿瘤。
+- 缺少高倍细胞学证据或现有信息不足以判断时，直接说明"现有信息不足以判断"，不要臆测。
+- 原标注文案是待复核线索，不是诊断事实；引用时请保持这一口径。`;
+
+// =========================================================================== //
 // Slide info shape used by the builders (a subset of SlideInfo + raw dict).
 // =========================================================================== //
 

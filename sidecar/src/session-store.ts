@@ -14,7 +14,7 @@
  * default ~/svs-viewer/share-data/ai_sessions):
  *   - <id>.json            session metadata (atomic tmp+rename, 0600)
  *   - <id>.events.jsonl    one event per line, append + fsync
- *   - index.json           {slide: {main, forks:{annotation_id: sid}}}
+ *   - index.json           {slide: {main, forks:{annotation_id: sid}, branches:{annotation_id: sid}}}
  *
  * Cross-references:
  *   _empty_session   ai_session.py:135
@@ -44,8 +44,18 @@ import type {
 // Types
 // --------------------------------------------------------------------------- //
 
-/** Session kind (ai_session.py:140 "main" | "fork"). */
-export type SessionKind = "main" | "fork";
+/**
+ * Session kind.
+ *
+ * - "main": whole-slide reading session (full toolset).
+ * - "fork": lite annotation-bound Q&A session — no tools, pure text回合
+ *   (legacy forks in old transcripts keep their tool-call history; new forks
+ *   register zero tools).
+ * - "branch": a true fork — a full session starting from an annotation, with
+ *   the full toolset (including create_annotation), semantically equivalent
+ *   to a "main" session seeded from a spot card.
+ */
+export type SessionKind = "main" | "fork" | "branch";
 
 /** Status state machine (ai_session.py:9, 155). */
 export type SessionStatus = "idle" | "running" | "paused" | "finished" | "error";
@@ -195,10 +205,18 @@ export interface SessionEvent {
 	seq: number;
 }
 
-/** index.json entry shape (ai_session.py:255). */
+/**
+ * index.json entry shape (ai_session.py:255, extended with `branches`).
+ *
+ * `branches` was added alongside the lite/branch split: a branch is a true
+ * fork (full toolset) keyed by annotation_id, parallel to `forks` (now lite
+ * Q&A). Old index.json files written before this field existed have no
+ * `branches` key; readers tolerate its absence (see {@link normalizeEntry}).
+ */
 export interface SlideIndexEntry {
 	main: string | null;
 	forks: Record<string, string>;
+	branches: Record<string, string>;
 }
 
 export type SessionIndex = Record<string, SlideIndexEntry>;
@@ -377,7 +395,7 @@ export class SessionStore {
 			slide,
 			kind,
 			annotation_id: annotationId,
-			title: title || (kind === "fork" ? "批注对话" : "全片读片"),
+			title: title || (kind === "fork" ? "批注对话" : kind === "branch" ? "批注深读" : "全片读片"),
 			created_at: t,
 			updated_at: t,
 			last_accessed_at: t,
@@ -734,6 +752,7 @@ export class SessionStore {
 		for (const entry of Object.values(idx)) {
 			if (entry.main) allIds.add(entry.main);
 			for (const sid of Object.values(entry.forks)) allIds.add(sid);
+			for (const sid of Object.values(entry.branches)) allIds.add(sid);
 		}
 		const dead = new Set<string>();
 		for (const id of allIds) {
@@ -763,9 +782,18 @@ export class SessionStore {
 					nextForks[aid] = sid;
 				}
 			}
-			if (nextMain !== entry.main || forksChanged) {
+			let branchesChanged = false;
+			const nextBranches: Record<string, string> = {};
+			for (const [aid, sid] of Object.entries(entry.branches)) {
+				if (dead.has(sid)) {
+					branchesChanged = true;
+				} else {
+					nextBranches[aid] = sid;
+				}
+			}
+			if (nextMain !== entry.main || forksChanged || branchesChanged) {
 				changed = true;
-				idx[slide] = { main: nextMain, forks: nextForks };
+				idx[slide] = { main: nextMain, forks: nextForks, branches: nextBranches };
 			}
 		}
 		if (changed) {
@@ -785,7 +813,14 @@ export class SessionStore {
 		try {
 			const raw = await fs.readFile(p, "utf8");
 			const data = JSON.parse(raw);
-			return isSessionIndex(data) ? data : {};
+			if (!isSessionIndex(data)) return {};
+			// Normalize every entry so `branches` is always present (old index
+			// files written before the lite/branch split have no `branches` key).
+			const out: SessionIndex = {};
+			for (const [slide, entry] of Object.entries(data)) {
+				out[slide] = normalizeEntry(entry);
+			}
+			return out;
 		} catch {
 			return {};
 		}
@@ -823,9 +858,11 @@ export class SessionStore {
 	): Promise<void> {
 		await this.ensureDir();
 		const idx = await this.readIndex();
-		const entry: SlideIndexEntry = idx[slide] ?? { main: null, forks: {} };
+		const entry: SlideIndexEntry = idx[slide] ?? { main: null, forks: {}, branches: {} };
 		if (kind === "main") {
 			entry.main = sessionId;
+		} else if (kind === "branch" && annotationId) {
+			entry.branches[annotationId] = sessionId;
 		} else if (annotationId) {
 			entry.forks[annotationId] = sessionId;
 		}
@@ -845,24 +882,36 @@ export class SessionStore {
 		if (!entry) return;
 		if (kind === "main" && entry.main === sessionId) {
 			entry.main = null;
+		} else if (kind === "branch" && annotationId && entry.branches[annotationId] === sessionId) {
+			delete entry.branches[annotationId];
 		} else if (kind === "fork" && annotationId && entry.forks[annotationId] === sessionId) {
 			delete entry.forks[annotationId];
 		}
 		await this.writeIndex(idx);
 	}
 
-	/** List main + forks for a slide (ai_session.py:280). */
+	/** List main + forks + branches for a slide (ai_session.py:280, extended). */
 	async listBySlide(slide: string): Promise<SlideIndexEntry> {
 		const idx = await this.readIndex();
 		const entry = idx[slide];
-		if (!entry) return { main: null, forks: {} };
-		return { main: entry.main ?? null, forks: { ...entry.forks } };
+		if (!entry) return { main: null, forks: {}, branches: {} };
+		return {
+			main: entry.main ?? null,
+			forks: { ...entry.forks },
+			branches: { ...entry.branches },
+		};
 	}
 
 	/** Find a fork session id by annotation id (convenience over listBySlide). */
 	async findFork(slide: string, annotationId: string): Promise<string | null> {
 		const entry = await this.listBySlide(slide);
 		return entry.forks[annotationId] ?? null;
+	}
+
+	/** Find a branch session id by annotation id (parallel to findFork). */
+	async findBranch(slide: string, annotationId: string): Promise<string | null> {
+		const entry = await this.listBySlide(slide);
+		return entry.branches[annotationId] ?? null;
 	}
 }
 
@@ -881,7 +930,7 @@ function isSessionData(v: unknown): v is SessionData {
 	return (
 		typeof v.id === "string" &&
 		typeof v.slide === "string" &&
-		(v.kind === "main" || v.kind === "fork") &&
+		(v.kind === "main" || v.kind === "fork" || v.kind === "branch") &&
 		Array.isArray(v.messages) &&
 		Array.isArray(v.compaction_entries)
 	);
@@ -893,8 +942,32 @@ function isSessionIndex(v: unknown): v is SessionIndex {
 		if (!isRecord(val)) return false;
 		if (val.main !== null && typeof val.main !== "string") return false;
 		if (!isRecord(val.forks)) return false;
+		// `branches` may be absent on old index.json files; treat missing as {}.
+		if (val.branches !== undefined && !isRecord(val.branches)) return false;
 	}
 	return true;
+}
+
+/**
+ * Normalize a raw index entry read from disk: ensure `branches` exists (old
+ * index.json files predating the lite/branch split have no `branches` key).
+ * Returns a fresh object so callers can mutate without surprising the caller.
+ */
+function normalizeEntry(raw: unknown): SlideIndexEntry {
+	if (!isRecord(raw)) return { main: null, forks: {}, branches: {} };
+	const main = typeof raw.main === "string" ? raw.main : null;
+	const forks = isRecord(raw.forks) ? { ...raw.forks } : {};
+	const branches = isRecord(raw.branches) ? { ...raw.branches } : {};
+	// Coerce values to strings (defensive: a corrupt entry should not crash).
+	const cleanForks: Record<string, string> = {};
+	for (const [k, v] of Object.entries(forks)) {
+		if (typeof v === "string") cleanForks[k] = v;
+	}
+	const cleanBranches: Record<string, string> = {};
+	for (const [k, v] of Object.entries(branches)) {
+		if (typeof v === "string") cleanBranches[k] = v;
+	}
+	return { main, forks: cleanForks, branches: cleanBranches };
 }
 
 // --------------------------------------------------------------------------- //

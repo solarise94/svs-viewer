@@ -248,6 +248,71 @@ def test_continue_and_ask_proxy():
           json.loads(r2.data).get("error") == "该标注已删除")
 
 
+def test_branch_proxy():
+    print("== test_branch: 代理 /branch，body 注入 config + annotation_id 透传 + SSE 透传 + 410 ==")
+    fake = install_fake_requests()
+    client = make_client()
+    setup_ai_config()
+
+    # 1) branch SSE 透传 + config 注入 + annotation_id/question 透传
+    frames = [
+        b"id: 1\nevent: branch_created\ndata: {\"annotation_id\":\"br-1\"}\n\n",
+        b"id: 2\nevent: agent_finished\ndata: {\"summary\":\"ok\"}\n\n",
+    ]
+    sent_bytes = b"".join(frames)
+
+    def branch_handler(body, query, headers, kwargs):
+        check("branch 路径转发 /branch", True)
+        check("branch body.slide 透传", body.get("slide") == "s.svs",
+              "body=%r" % body)
+        check("branch body.annotation_id 透传",
+              body.get("annotation_id") == "br-1",
+              "body=%r" % body)
+        check("branch body.question 透传",
+              body.get("question") == "深读这里")
+        cfg = body.get("config") or {}
+        check("branch config.api_key 明文", cfg.get("api_key"),
+              "got %r" % cfg.get("api_key"))
+        check("branch config.base_url 注入",
+              cfg.get("base_url") == "http://llm.example/v1")
+        return FakeResponse(200, sse_frames=frames,
+                            headers={"X-AI-Session-ID": "sess-branch-1"})
+
+    fake.register("POST", "/branch", branch_handler)
+    r = client.post("/api/ai/branch",
+                    json={"slide": "s.svs", "annotation_id": "br-1", "question": "深读这里"})
+    check("branch 路径转发 /branch",
+          fake.calls[-1]["path"] == "/branch",
+          "got %r" % fake.calls[-1]["path"])
+    check("branch 状态码 200", r.status_code == 200, "got %d" % r.status_code)
+    check("branch X-AI-Session-ID 头透传",
+          r.headers.get("X-AI-Session-ID") == "sess-branch-1",
+          "got %r" % r.headers.get("X-AI-Session-ID"))
+    check("branch Content-Type 为 text/event-stream",
+          r.headers.get("Content-Type", "").startswith("text/event-stream"),
+          "got %r" % r.headers.get("Content-Type"))
+    check("branch SSE 字节完全一致", r.data == sent_bytes, "got %r" % r.data)
+
+    # 2) branch 410 根标注已删除（错误响应，非 SSE，JSON 透传）
+    fake.register("POST", "/branch",
+                  lambda b, q, h, k: FakeResponse(410,
+                   json.dumps({"error": "该标注已删除"}).encode(),
+                   headers={"Content-Type": "application/json"}))
+    r2 = client.post("/api/ai/branch",
+                     json={"slide": "s.svs", "annotation_id": "br-gone"})
+    check("branch 410 状态码透传", r2.status_code == 410, "got %d" % r2.status_code)
+    check("branch 410 JSON body 透传",
+          json.loads(r2.data).get("error") == "该标注已删除")
+
+    # 3) branch 缺 annotation_id → 400（不转发到 sidecar）
+    fake.calls.clear()
+    r3 = client.post("/api/ai/branch", json={"slide": "s.svs"})
+    check("branch 缺 annotation_id 400", r3.status_code == 400,
+          "got %d" % r3.status_code)
+    check("branch 缺 annotation_id 未转发", len(fake.calls) == 0,
+          "calls=%d" % len(fake.calls))
+
+
 def test_run_conflict_409_non_sse_passthrough():
     print("== test_run 409 冲突（非 SSE JSON 错误透传）==")
     fake = install_fake_requests()
@@ -419,6 +484,7 @@ def test_missing_slide_returns_400():
 if __name__ == "__main__":
     test_run_proxies_with_decrypted_config_and_sse()
     test_continue_and_ask_proxy()
+    test_branch_proxy()
     test_run_conflict_409_non_sse_passthrough()
     test_cancel_proxy()
     test_sessions_and_session_detail_proxy()

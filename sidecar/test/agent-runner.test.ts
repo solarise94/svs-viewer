@@ -247,6 +247,206 @@ describe("AgentRunner.askFork — fork flows", () => {
 	});
 });
 
+// =========================================================================== //
+// Branch (kind="branch"): true fork — full toolset from an annotation.
+// =========================================================================== //
+describe("AgentRunner.askBranch — branch flows", () => {
+	// Golden branch script: goto → snapshot → observation → annotation →
+	// snapshot_review → finish. Exercises that branch has the FULL toolset
+	// (incl. create_annotation) and emits branch_created.
+	const BRANCH_SCRIPT = [
+		{ toolCalls: [{ id: "tc-goto", name: "goto", arguments: { x: 1200, y: 2200, level: 1, reason: "看标注" } }] },
+		{ toolCalls: [{ id: "tc-snap", name: "snapshot", arguments: {} }] },
+		{ toolCalls: [{ id: "tc-obs", name: "mark_observation", arguments: { label: "灶", note: "紫染" } }] },
+		{ toolCalls: [{ id: "tc-ann", name: "create_annotation", arguments: { label: "AI 建议", x: 1100, y: 2100, side_px: 150 } }] },
+		{ toolCalls: [{ id: "tc-rev", name: "complete_snapshot_review", arguments: { disposition: "annotated", summary: "ok" } }] },
+		{ text: "完成。", toolCalls: [{ id: "tc-fin", name: "finish", arguments: { summary: "已深读该标注。" } }] },
+	];
+
+	it("creates a branch for a live annotation, emits branch_created, and the branch toolset includes create_annotation", async () => {
+		const { fn } = makeFakeStreamFn(BRANCH_SCRIPT);
+		const h: Harness = await newHarness(fn);
+		h.mock.spotChanges.push({ annotation_id: "br-root-1", x: 1000, y: 2000, side_px: 400, note: "原标注", label: "可疑", change_seq: ++h.mock.currentSeq, deleted: false, size_mm: 0.02 });
+
+		const { sessionId } = await h.runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-root-1", question: "深读这里" });
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId);
+		expect(status).toBe("finished");
+
+		// branch_created was emitted with annotation_id + title.
+		const persisted = await h.store.replayEvents(sessionId, 0);
+		const branchCreated = persisted.find((e) => e.type === "branch_created");
+		expect(branchCreated).toBeDefined();
+		expect((branchCreated!.payload as { annotation_id: string; title: string })).toMatchObject({ annotation_id: "br-root-1" });
+		expect((branchCreated!.payload as { title: string }).title).toContain("可疑");
+
+		const data = await h.store.readSession(sessionId);
+		expect(data!.kind).toBe("branch");
+		expect(data!.annotation_id).toBe("br-root-1");
+		// The session is registered under branches (not forks).
+		const idx = await h.store.listBySlide("test.svs");
+		expect(idx.branches["br-root-1"]).toBe(sessionId);
+		expect(idx.forks["br-root-1"]).toBeUndefined();
+
+		// create_annotation fired annotation_created → proves branch has the tool.
+		const ann = persisted.find((e) => e.type === "annotation_created");
+		expect(ann).toBeDefined();
+		expect((ann!.payload as { label: string }).label).toBe("AI 建议");
+		// finish → agent_finished.
+		const finished = persisted.find((e) => e.type === "agent_finished");
+		expect(finished).toBeDefined();
+		expect((finished!.payload as { summary: string }).summary).toBe("已深读该标注。");
+	});
+
+	it("resumes an existing branch (branch_resumed) by appending the question", async () => {
+		const { fn: fn1 } = makeFakeStreamFn([{ text: "首次", stopReason: "stop" as const }]);
+		const h: Harness = await newHarness(fn1);
+		h.mock.spotChanges.push({ annotation_id: "br-root-2", x: 100, y: 100, side_px: 100, note: "n", label: "L", change_seq: ++h.mock.currentSeq, deleted: false, size_mm: 0 });
+		const first = await h.runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-root-2", question: "q1" });
+		await waitForSettle(h.store, first.sessionId);
+
+		// Second branch ask → resume.
+		const { fn: fn2 } = makeFakeStreamFn([{ text: "续聊", stopReason: "stop" as const }]);
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const runnerReuse = new AgentRunner(h.store, h.bus, h.mock as never, { streamFn: fn2 as never });
+		h.watch(first.sessionId);
+		const second = await runnerReuse.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-root-2", question: "再看" });
+		expect(second.sessionId).toBe(first.sessionId);
+		await waitForSettle(h.store, first.sessionId);
+
+		const persisted = await h.store.replayEvents(first.sessionId, 0);
+		const branchResumed = persisted.find((e) => e.type === "branch_resumed");
+		expect(branchResumed).toBeDefined();
+		expect((branchResumed!.payload as { session_id: string; annotation_id: string })).toMatchObject({ session_id: first.sessionId, annotation_id: "br-root-2" });
+
+		const data = await h.store.readSession(first.sessionId);
+		// The appended question is the last user message.
+		const lastUser = [...data!.messages].reverse().find((m) => (m as { role?: string }).role === "user") as { content?: string; display_text?: string };
+		expect(lastUser.content).toBe("再看");
+		expect(lastUser.display_text).toBe("再看");
+	});
+
+	it("throws RootAnnotationGone (→ 410) when the root annotation is deleted", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
+		const h: Harness = await newHarness(fn);
+		h.mock.spotChanges.push({ annotation_id: "br-gone", x: 1, y: 1, side_px: 1, note: "", change_seq: ++h.mock.currentSeq, deleted: true });
+		await expect(h.runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-gone" })).rejects.toThrow(/已删除/);
+	});
+
+	it("archives the oldest non-running branch when the branch limit is exceeded", async () => {
+		// Create 3 branches (all finish immediately), then create a 4th with a
+		// branch limit of 2: the oldest non-running branch should be archived.
+		const h: Harness = await newHarness(makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]).fn);
+		for (let i = 0; i < 3; i++) {
+			const aid = `br-limit-${i}`;
+			h.mock.spotChanges.push({ annotation_id: aid, x: 10 * i, y: 10 * i, side_px: 50, note: "n", label: `L${i}`, change_seq: ++h.mock.currentSeq, deleted: false });
+			// Each branch uses a fresh streamFn (script is single-turn).
+			const { fn } = makeFakeStreamFn([{ text: "ok", stopReason: "stop" as const }]);
+			const { AgentRunner } = await import("../src/agent-runner.js");
+			const runner = new AgentRunner(h.store, h.bus, h.mock as never, { streamFn: fn as never });
+			const { sessionId } = await runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: aid, question: "q" });
+			await waitForSettle(h.store, sessionId);
+		}
+
+		// Now create a 4th branch with limit=2 → oldest (br-limit-0) archived.
+		h.mock.spotChanges.push({ annotation_id: "br-limit-3", x: 30, y: 30, side_px: 50, note: "n", label: "L3", change_seq: ++h.mock.currentSeq, deleted: false });
+		const { fn: fn4 } = makeFakeStreamFn([{ text: "ok", stopReason: "stop" as const }]);
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const runner4 = new AgentRunner(h.store, h.bus, h.mock as never, { streamFn: fn4 as never });
+		const { sessionId: sid4 } = await runner4.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG, fork_active_limit: 2 }, annotationId: "br-limit-3", question: "q" });
+		await waitForSettle(h.store, sid4);
+
+		const idx = await h.store.listBySlide("test.svs");
+		const b0 = await h.store.readSession(idx.branches["br-limit-0"]!);
+		// The oldest branch was archived.
+		expect(b0!.archived).toBe(true);
+		// The newest branch is not archived.
+		const b3 = await h.store.readSession(idx.branches["br-limit-3"]!);
+		expect(b3!.archived).toBe(false);
+	});
+});
+
+// =========================================================================== //
+// Lite fork (kind="fork"): no tools — pure text Q&A.
+// =========================================================================== //
+describe("AgentRunner.askFork — lite fork (no tools)", () => {
+	it("a plain-text turn ends the回合 naturally (agent_finished) with no tool calls", async () => {
+		// The fork registers zero tools. A single plain-text turn should
+		// finish the run via the agent_end → agent_finished path (no finish
+		// tool, no domain events).
+		const { fn } = makeFakeStreamFn([{ text: "这是基于图像的解读。", stopReason: "stop" as const }]);
+		const h: Harness = await newHarness(fn);
+		h.mock.spotChanges.push({ annotation_id: "lite-1", x: 1000, y: 2000, side_px: 400, note: "原标注", label: "可疑", change_seq: ++h.mock.currentSeq, deleted: false, size_mm: 0.02 });
+
+		const { sessionId } = await h.runner.askFork({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "lite-1", question: "这是什么？" });
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId);
+		expect(status).toBe("finished");
+
+		// No domain tool events fired (no tools registered).
+		const types = h.events.map((e) => e.type);
+		const domainEvents = ["tool_started", "snapshot_captured", "observation", "annotation_created", "snapshot_reviewed"];
+		for (const dt of domainEvents) {
+			expect(types).not.toContain(dt);
+		}
+		// agent_finished was emitted with the plain-text summary.
+		const finished = h.events.find((e) => e.type === "agent_finished");
+		expect(finished).toBeDefined();
+		expect((finished!.payload as { summary: string }).summary).toBe("这是基于图像的解读。");
+	});
+
+	it("an old fork with tool-call history in its transcript resumes without crashing (tools absent going forward)", async () => {
+		// Simulate a legacy fork that has historical tool calls in messages
+		// (pre-lite-split). On resume, the fork must not crash and must NOT
+		// register new tools — the resumed turn is plain text.
+		const { fn: fn1 } = makeFakeStreamFn([{ text: "首次解读", stopReason: "stop" as const }]);
+		const h: Harness = await newHarness(fn1);
+		h.mock.spotChanges.push({ annotation_id: "legacy-fork", x: 100, y: 100, side_px: 100, note: "n", label: "L", change_seq: ++h.mock.currentSeq, deleted: false, size_mm: 0 });
+		const first = await h.runner.askFork({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "legacy-fork", question: "q1" });
+		await waitForSettle(h.store, first.sessionId);
+
+		// Inject a fake historical tool-call exchange into the persisted
+		// transcript (as if it were a pre-lite-split fork that used goto).
+		await h.store.withLock(first.sessionId, async (d) => {
+			if (!d) return null;
+			d.messages = [
+				...(d.messages || []),
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "legacy-tc-1", name: "goto", arguments: { x: 50, y: 50, level: 0 } }],
+					timestamp: Date.now(),
+				} as never,
+				{
+					role: "toolResult",
+					toolCallId: "legacy-tc-1",
+					content: [{ type: "text", text: "已移动" }],
+					timestamp: Date.now(),
+				} as never,
+			];
+			await h.store.writeSession(first.sessionId, d);
+			return d;
+		});
+
+		// Resume: plain-text turn, must not crash despite the legacy tool history.
+		const { fn: fn2 } = makeFakeStreamFn([{ text: "续聊解读", stopReason: "stop" as const }]);
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const runnerReuse = new AgentRunner(h.store, h.bus, h.mock as never, { streamFn: fn2 as never });
+		const second = await runnerReuse.askFork({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "legacy-fork", question: "再看一眼" });
+		expect(second.sessionId).toBe(first.sessionId);
+		const status = await waitForSettle(h.store, first.sessionId);
+		expect(status).toBe("finished");
+
+		// The legacy tool-call history is preserved in the transcript.
+		const data = await h.store.readSession(first.sessionId);
+		const hasLegacyToolCall = (data!.messages as Array<{ role?: string; content?: unknown[] }>).some(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((c) => (c as { type?: string; name?: string }).type === "toolCall" && (c as { name?: string }).name === "goto"),
+		);
+		expect(hasLegacyToolCall).toBe(true);
+		// No NEW domain events fired on resume (no tools).
+		// (fork_resumed is the only setup event; no tool_started etc.)
+	});
+});
+
 describe("AgentRunner.runMain — 409 conflict", () => {
 	it("throws SessionConflict when the main is already running", async () => {
 		// Long-running script so the first run is still active when we fire the second.

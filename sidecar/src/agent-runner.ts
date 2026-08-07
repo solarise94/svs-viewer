@@ -34,7 +34,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
-import { SYSTEM_PROMPT, DEFAULT_TASK, makeMainMessages, makeForkMessages, type SpotDict } from "./prompts.js";
+import { SYSTEM_PROMPT, DEFAULT_TASK, FORK_LITE_SYSTEM_PROMPT, makeMainMessages, makeForkMessages, type SpotDict } from "./prompts.js";
 import { buildModel, type AiEngineConfig } from "./pi-model.js";
 import {
 	AgentState,
@@ -208,7 +208,13 @@ export class AgentRunner {
 	// ask (fork create/resume) — app.py:1687 api_ai_ask + 2012 _start_fork_worker
 	// ----------------------------------------------------------------------- //
 	/**
-	 * Start or resume a fork for an annotation.
+	 * Start or resume a **lite** fork for an annotation (批注小框纯解读对话).
+	 *
+	 * A fork (kind="fork") registers NO tools: the model answers purely from
+	 * the spot card + attached image and the conversation. A plain-text turn
+	 * ends the回合 naturally (agent_finished). Legacy forks with historical
+	 * tool calls in their transcript are preserved on resume; only new tool
+	 * availability is removed.
 	 *
 	 * - Root annotation gone → throws {@link RootAnnotationGone} (→ 410).
 	 * - Existing fork for this annotation → resume it (append the question,
@@ -274,6 +280,87 @@ export class AgentRunner {
 
 		await this.bus.emit(data.id, "fork_created", { annotation_id: annotationId, title });
 		void this.driveFork(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
+			await this.handleFatal(data.id, e);
+		});
+		return { sessionId: data.id };
+	}
+
+	// ----------------------------------------------------------------------- //
+	// branch (true fork: full session from an annotation) — POST /branch
+	// ----------------------------------------------------------------------- //
+	/**
+	 * Start or resume a **branch** for an annotation (真 fork：从标注起步的完整会话).
+	 *
+	 * A branch (kind="branch") is a full session seeded from a spot card: it has
+	 * the SAME toolset as a main session (incl. create_annotation), so the model
+	 * can navigate / snapshot / annotate starting from the spot. The initial
+	 * message is identical to a fork (spot card + bbox-expanded 15% image).
+	 *
+	 * - Root annotation gone → throws {@link RootAnnotationGone} (→ 410).
+	 * - Existing branch for this annotation → resume it (append the question,
+	 *   emit `branch_resumed`).
+	 * - Otherwise: enforce the branch-active limit (reuses fork_active_limit but
+	 *   counts only kind="branch"; archives the oldest non-running branch),
+	 *   create a new branch, emit `branch_created`, then run the loop.
+	 *
+	 * Returns `{sessionId}` immediately.
+	 */
+	async askBranch(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string }> {
+		const { slide, config, annotationId } = args;
+
+		// Locate the root annotation via the spot change log (tombstone-aware).
+		const roi = await this.findSpot(slide, annotationId);
+		if (!roi || roi.deleted) {
+			throw new RootAnnotationGone();
+		}
+
+		const existing = await this.store.findBranch(slide, annotationId);
+
+		if (existing) {
+			// Resume: acquire, append the question, emit branch_resumed, run.
+			const data = await this.store.acquire({ sessionId: existing, slide, kind: "branch", annotationId });
+			const qText = args.question || "请谈谈这个区域";
+			// Append the user question to the transcript (mirrors fork resume).
+			const updated = await this.store.withLock(data.id, async (d) => {
+				if (!d) return null;
+				const msg: PersistedAgentMessage = {
+					role: "user",
+					content: qText,
+					display_text: qText,
+					timestamp: Date.now(),
+				} as PersistedAgentMessage;
+				d.messages = [...(d.messages || []), msg];
+				d.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(data.id, d);
+				return d;
+			});
+			void updated;
+			await this.bus.emit(data.id, "branch_resumed", { session_id: data.id, annotation_id: annotationId });
+			void this.driveBranch(data.id, slide, config, annotationId).catch(async (e) => {
+				await this.handleFatal(data.id, e);
+			});
+			return { sessionId: data.id };
+		}
+
+		// New branch: enforce the active limit (reuses fork_active_limit but
+		// counts only kind="branch").
+		const limit = Math.max(0, Math.floor(config.fork_active_limit ?? 20));
+		await this.enforceBranchLimit(slide, limit);
+
+		const title = "批注深读@" + (roi.label || "");
+		const data = await this.store.acquire({ slide, kind: "branch", annotationId, title });
+		// seed spot_cursor (same as fork).
+		await this.store.withLock(data.id, async (d) => {
+			if (!d) return null;
+			const spots = await this.flask.spots(slide, 0).catch(() => ({ changes: [], current_seq: 0 }));
+			d.spot_cursor = spots.current_seq || 0;
+			d.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(data.id, d);
+			return d;
+		});
+
+		await this.bus.emit(data.id, "branch_created", { annotation_id: annotationId, title });
+		void this.driveBranch(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
 			await this.handleFatal(data.id, e);
 		});
 		return { sessionId: data.id };
@@ -427,12 +514,72 @@ export class AgentRunner {
 			// fork_resumed was already emitted by askFork; nothing to do here.
 		}
 
-		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false);
+		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false, {
+			kind: "fork",
+			systemPrompt: FORK_LITE_SYSTEM_PROMPT,
+		});
 	}
 
-	// =========================================================================== //
-	// The pi Agent loop + event mapping
-	// =========================================================================== //
+	// ----------------------------------------------------------------------- //
+	// branch (true fork: full session from an annotation) — POST /branch
+	// ----------------------------------------------------------------------- //
+	/**
+	 * Drive a branch session: same initial context shape as a fork (spot card +
+	 * bbox-expanded image) but with the FULL toolset (incl. create_annotation),
+	 * so the model can navigate / snapshot / annotate starting from the spot.
+	 * Mirrors driveFork but passes kind="branch" (full tools + SYSTEM_PROMPT).
+	 */
+	private async driveBranch(
+		sessionId: string,
+		slide: string,
+		config: RunConfig,
+		annotationId: string,
+		roi?: RoiDict,
+		question?: string,
+	): Promise<void> {
+		const slideInfo = await this.fetchSlideInfo(slide);
+		const data = await this.store.readSession(sessionId);
+		if (!data) return;
+
+		let initialMessages: PersistedAgentMessage[];
+
+		if (data.messages.length === 0) {
+			// Brand-new branch: build the spot card + image (same shape as fork).
+			if (!roi) {
+				roi = (await this.findSpot(slide, annotationId)) || undefined;
+			}
+			const spot: SpotDict = roi || { annotation_id: annotationId };
+			const { imageRef, imageB64 } = await this.forkSpotImageRef(slide, slideInfo, spot);
+			const userMsg = makeForkMessages({
+				slideName: slide,
+				info: slideInfo,
+				spot,
+				question: question || "",
+				imageRef,
+				imageB64,
+			}) as unknown as PersistedAgentMessage;
+			initialMessages = [userMsg];
+			await this.store.withLock(sessionId, async (d) => {
+				if (!d) return null;
+				d.messages = [...initialMessages];
+				d.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(sessionId, d);
+				return d;
+			});
+		} else {
+			// Resumed branch: inject spot changes (same as fork/main resume).
+			await this.injectSpotChanges(sessionId, slide);
+			const after = await this.store.readSession(sessionId);
+			initialMessages = (after?.messages || []) as PersistedAgentMessage[];
+			// branch_resumed was already emitted by askBranch; nothing to do here.
+		}
+
+		// Full toolset + full SYSTEM_PROMPT (branch == main toolset, seeded from spot).
+		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false, {
+			kind: "branch",
+			systemPrompt: SYSTEM_PROMPT,
+		});
+	}
 	/**
 	 * Build a pi Agent, wire event mapping + run-level guards, and run to
 	 * completion. Settles status (finished/error/paused) at the end so the SSE
@@ -445,9 +592,19 @@ export class AgentRunner {
 		slideInfo: SlideInfo,
 		initialMessages: PersistedAgentMessage[],
 		_continued: boolean,
+		loopOptions: { systemPrompt?: string; kind?: "main" | "fork" | "branch" } = {},
 	): Promise<void> {
 		const { models, model } = buildModel(config);
 		const maxSteps = Math.max(1, Math.floor(config.max_steps ?? 50));
+
+		// Resolve the effective kind + system prompt for this run. Defaults
+		// mirror the legacy behavior (main / branch = full SYSTEM_PROMPT + full
+		// tools; fork = lite prompt + no tools). The caller (askFork) overrides
+		// for lite forks; main/branch drive this from the session's persisted kind.
+		const sessionForKind = await this.store.readSession(sessionId);
+		const kind: "main" | "fork" | "branch" =
+			loopOptions.kind ?? (sessionForKind?.kind === "fork" ? "fork" : sessionForKind?.kind === "branch" ? "branch" : "main");
+		const systemPrompt = loopOptions.systemPrompt ?? (kind === "fork" ? FORK_LITE_SYSTEM_PROMPT : SYSTEM_PROMPT);
 
 		// Compaction + transform settings, resolved once per run.
 		const compactionSettings = resolveCompactionSettings(config);
@@ -459,10 +616,14 @@ export class AgentRunner {
 		const firstSnapshotToolCallIdRef = { value: <string | null>null };
 
 		// Tools + tool context (tools.ts). emit routes domain events to the bus.
+		// fork (lite) registers NO tools — the model does pure text Q&A. main
+		// and branch get the full toolset (createTools returns [] for fork as a
+		// defensive fallback, but we skip building the tool context entirely
+		// for forks so no domain events can fire).
 		const toolCtx: ToolContext = {
 			sessionStore: this.store,
 			sessionId,
-			kind: (await this.store.readSession(sessionId))?.kind === "fork" ? "fork" : "main",
+			kind,
 			slide,
 			slideInfo,
 			flask: this.flask,
@@ -477,7 +638,7 @@ export class AgentRunner {
 			},
 			cfg: config as unknown as Record<string, unknown>,
 		};
-		const tools = createTools(toolCtx);
+		const tools = kind === "fork" ? [] : createTools(toolCtx);
 
 		// transformContext hook: materialize image_ref + evict old images. Bound
 		// to this run's flask/slide/settings/first-snapshot id.
@@ -577,7 +738,7 @@ export class AgentRunner {
 			getApiKey: () => config.api_key,
 			initialState: {
 				model: model as never,
-				systemPrompt: SYSTEM_PROMPT,
+				systemPrompt,
 				tools,
 				messages: initialMessages as never[],
 			},
@@ -1241,6 +1402,37 @@ export class AgentRunner {
 		}
 		const running = forks.filter((d) => d.status === "running");
 		const idle = forks
+			.filter((d) => d.status !== "running" && !d.archived)
+			.sort((a, b) => (a.updated_at || 0) - (b.updated_at || 0));
+		const allowed = Math.max(0, limit - running.length);
+		const toArchive = idle.slice(Math.max(0, allowed - idle.length));
+		for (const d of toArchive) {
+			await this.store.withLock(d.id, async (data) => {
+				if (!data) return null;
+				data.archived = true;
+				data.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(d.id, data);
+				return data;
+			});
+		}
+	}
+
+	/**
+	 * Archive the oldest non-running branches until under the active limit.
+	 * Reuses `fork_active_limit` as the cap but counts ONLY kind="branch"
+	 * sessions (forks and branches are rate-limited independently). Running
+	 * branches are never archived.
+	 */
+	private async enforceBranchLimit(slide: string, limit: number): Promise<void> {
+		if (limit <= 0) return;
+		const idx = await this.store.listBySlide(slide);
+		const branches: SessionData[] = [];
+		for (const sid of Object.values(idx.branches)) {
+			const d = await this.store.readSession(sid);
+			if (d) branches.push(d);
+		}
+		const running = branches.filter((d) => d.status === "running");
+		const idle = branches
 			.filter((d) => d.status !== "running" && !d.archived)
 			.sort((a, b) => (a.updated_at || 0) - (b.updated_at || 0));
 		const allowed = Math.max(0, limit - running.length);

@@ -214,8 +214,17 @@ export type EmitFn = (type: string, payload: Record<string, unknown>) => void | 
 export interface ToolContext {
 	sessionStore: SessionStore;
 	sessionId: string;
-	/** "main" | "fork" (fork disallows create_annotation). */
-	kind: "main" | "fork";
+	/**
+	 * Session kind, drives the toolset:
+	 *   - "main": full toolset (incl. create_annotation).
+	 *   - "branch": full toolset (incl. create_annotation) — a true fork that
+	 *     starts from an annotation but is otherwise a complete session.
+	 *   - "fork": lite Q&A — createTools returns an EMPTY array for this kind
+	 *     (handled by the caller in agent-runner.ts, which skips createTools
+	 *     entirely for forks). This field is kept for the create_annotation
+	 *     guard below, which defends against a fork somehow reaching the tool.
+	 */
+	kind: "main" | "fork" | "branch";
 	slide: string;
 	slideInfo: SlideInfo;
 	flask: FlaskClient;
@@ -291,13 +300,27 @@ function fmt0(v: number): string {
 
 /**
  * Build the pi AgentTool array for one session. The set depends on kind:
- * fork sessions omit create_annotation (ai_agent.py:307 tools_for_kind).
+ *   - "main" / "branch": full toolset (goto / snapshot / mark_observation /
+ *     create_annotation / complete_snapshot_review / finish).
+ *   - "fork": lite Q&A — returns an EMPTY array (no tools). The caller in
+ *     agent-runner.ts (askFork) does not call createTools at all for forks;
+ *     this branch is a defensive fallback so any code path that does call
+ *     createTools with kind="fork" produces no tools rather than a stale set.
+ *
+ * Legacy note (ai_agent.py:307 tools_for_kind): historically a fork omitted
+ * only create_annotation. With the lite/branch split the fork is now a pure
+ * text Q&A session (zero tools), and the full-toolset-from-annotation case
+ * moved to the new "branch" kind.
  *
  * Tool schemas (Chinese descriptions) are copied verbatim from ai_agent.py
  * L180-304. Guards (pending-snapshot gating, no-op goto, fork no-annotate) are
  * preserved byte-for-byte in their return strings.
  */
 export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
+	// fork (lite): no tools at all. The model does pure text Q&A.
+	if (ctx.kind === "fork") {
+		return [];
+	}
 	const { slideInfo } = ctx;
 	const downsamples = slideInfo.levelDownsamples;
 
@@ -761,13 +784,17 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 		},
 	};
 
-	// Assemble the tool set: fork omits create_annotation (ai_agent.py:307).
-	const tools: AgentTool<any, any>[] = [gotoTool, snapshotTool, markObservationTool];
-	if (ctx.kind !== "fork") {
-		tools.push(createAnnotationTool);
-	}
-	tools.push(completeSnapshotReviewTool);
-	tools.push(finishTool);
+	// Assemble the full toolset. We only reach here for "main" / "branch"
+	// (fork returned the empty array above), so create_annotation is always
+	// included — branch is a true fork with the same toolset as main.
+	const tools: AgentTool<any, any>[] = [
+		gotoTool,
+		snapshotTool,
+		markObservationTool,
+		createAnnotationTool,
+		completeSnapshotReviewTool,
+		finishTool,
+	];
 	return tools;
 }
 

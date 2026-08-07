@@ -7,7 +7,8 @@
  *
  *   POST /run                  body {slide, task?, fresh?, config}   → SSE ; 409 conflict
  *   POST /continue             body {slide, config}                 → SSE ; 404 no main
- *   POST /ask                  body {slide, annotation_id, question?, config} → SSE ; 410 root gone
+ *   POST /ask                  body {slide, annotation_id, question?, config} → SSE ; 410 root gone (lite fork)
+ *   POST /branch               body {slide, annotation_id, question?, config} → SSE ; 410 root gone (true fork, full tools)
  *   POST /cancel               body {session_id?} | {slide}         → {ok:true} ; 404
  *   GET  /sessions?slide=                                          → {sessions:[...]}
  *   GET  /session/:id                                              → {session, transcript}
@@ -122,6 +123,7 @@ export class SidecarServer {
 		if (method === "POST" && path === "/run") return this.handleRun(req, res);
 		if (method === "POST" && path === "/continue") return this.handleContinue(req, res);
 		if (method === "POST" && path === "/ask") return this.handleAsk(req, res);
+		if (method === "POST" && path === "/branch") return this.handleBranch(req, res);
 		if (method === "POST" && path === "/cancel") return this.handleCancel(req, res);
 
 		if (method === "GET" && path === "/sessions") return this.handleSessions(url, res);
@@ -208,6 +210,28 @@ export class SidecarServer {
 	}
 
 	// =========================================================================== //
+	// POST /branch (true fork: full session from an annotation, full toolset)
+	// =========================================================================== //
+	private async handleBranch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+		const body = await readJson(req);
+		const slide = str(body.slide);
+		const annotationId = str(body.annotation_id);
+		const question = str(body.question) || undefined;
+		const config = body.config as RunConfig | undefined;
+		if (!slide) return this.sendJson(res, 400, { error: "缺少 slide" });
+		if (!annotationId) return this.sendJson(res, 400, { error: "缺少 annotation_id" });
+		if (!config) return this.sendJson(res, 400, { error: "缺少 config" });
+		try {
+			const { sessionId } = await this.runner.askBranch({ slide, config, annotationId, question });
+			return this.startSseForNewSession(sessionId, res);
+		} catch (e) {
+			if (e instanceof RootAnnotationGone) return this.sendJson(res, 410, { error: e.message });
+			if (e instanceof SessionConflict || e instanceof StoreConflict) return this.sendJson(res, 409, { error: e.message });
+			return this.sendJson(res, 500, { error: (e as Error)?.message || String(e) });
+		}
+	}
+
+	// =========================================================================== //
 	// POST /cancel
 	// =========================================================================== //
 	private async handleCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -237,6 +261,10 @@ export class SidecarServer {
 			if (d) out.push(sessionListItem(d));
 		}
 		for (const sid of Object.values(idx.forks)) {
+			const d = await this.store.readSession(sid);
+			if (d && !d.archived) out.push(sessionListItem(d));
+		}
+		for (const sid of Object.values(idx.branches)) {
 			const d = await this.store.readSession(sid);
 			if (d && !d.archived) out.push(sessionListItem(d));
 		}

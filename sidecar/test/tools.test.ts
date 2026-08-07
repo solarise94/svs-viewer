@@ -478,7 +478,7 @@ describe("finish (ai_agent.py L750-751)", () => {
 	});
 });
 
-describe("tool set composition (ai_agent.py:307 tools_for_kind)", () => {
+describe("tool set composition (three-kind: main / branch / fork)", () => {
 	it("main sessions include create_annotation", () => {
 		const tools = createTools({
 			sessionStore: {} as SessionStore,
@@ -501,7 +501,29 @@ describe("tool set composition (ai_agent.py:307 tools_for_kind)", () => {
 		]);
 	});
 
-	it("fork sessions omit create_annotation", () => {
+	it("branch sessions include the full toolset (same as main, incl create_annotation)", () => {
+		const tools = createTools({
+			sessionStore: {} as SessionStore,
+			sessionId: "x",
+			kind: "branch",
+			slide: SLIDE,
+			slideInfo,
+			flask: {} as FlaskClient,
+			emit: () => undefined,
+			cfg: {},
+		});
+		const names = tools.map((t) => t.name);
+		expect(names).toEqual([
+			"goto",
+			"snapshot",
+			"mark_observation",
+			"create_annotation",
+			"complete_snapshot_review",
+			"finish",
+		]);
+	});
+
+	it("fork sessions register NO tools (lite Q&A)", () => {
 		const tools = createTools({
 			sessionStore: {} as SessionStore,
 			sessionId: "x",
@@ -512,7 +534,6 @@ describe("tool set composition (ai_agent.py:307 tools_for_kind)", () => {
 			emit: () => undefined,
 			cfg: {},
 		});
-		const names = tools.map((t) => t.name);
-		expect(names).toEqual(["goto", "snapshot", "mark_observation", "complete_snapshot_review", "finish"]);
+		expect(tools).toEqual([]);
 	});
 });

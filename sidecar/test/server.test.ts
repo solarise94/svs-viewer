@@ -398,6 +398,73 @@ describe("SidecarServer — POST /ask 410", () => {
 	});
 });
 
+describe("SidecarServer — POST /branch", () => {
+	it("starts a branch session (SSE) with branch_created + X-AI-Session-ID, settling finished", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "深读完成。", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			h.mock.spotChanges.push({ annotation_id: "br-srv-1", x: 1000, y: 2000, side_px: 400, note: "原标注", label: "可疑", change_seq: ++h.mock.currentSeq, deleted: false, size_mm: 0.02 });
+			const res = await fetch(h.baseUrl + "/branch", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "br-srv-1", question: "深读", config: { ...BASE_CONFIG } }),
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("text/event-stream");
+			const sessionId = res.headers.get("x-ai-session-id");
+			expect(sessionId).toBeTruthy();
+
+			const frames = await readSseUntil(res, (f) => f.includes("event: session_ended"));
+			const events = frames.map(parseFrame).filter((e) => e.event);
+			const types = events.map((e) => e.event);
+			expect(types).toContain("branch_created");
+			expect(types).toContain("agent_finished");
+			expect(types[types.length - 1]).toBe("session_ended");
+			// branch_created payload carries annotation_id + title.
+			const created = events.find((e) => e.event === "branch_created")!;
+			expect((created.data as { annotation_id: string }).annotation_id).toBe("br-srv-1");
+			expect(typeof (created.data as { title: string }).title).toBe("string");
+		} finally {
+			await h.server.stop();
+		}
+	});
+
+	it("returns 410 when the root annotation is deleted", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			h.mock.spotChanges.push({ annotation_id: "br-gone", x: 1, y: 1, side_px: 1, note: "", change_seq: ++h.mock.currentSeq, deleted: true });
+			const r = await post(h.baseUrl, "/branch", { slide: SLIDE, annotation_id: "br-gone", config: { ...BASE_CONFIG } });
+			expect(r.status).toBe(410);
+		} finally {
+			await h.server.stop();
+		}
+	});
+
+	it("lists the branch under /sessions with kind='branch'", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			h.mock.spotChanges.push({ annotation_id: "br-srv-2", x: 100, y: 100, side_px: 100, note: "n", label: "L", change_seq: ++h.mock.currentSeq, deleted: false });
+			const res = await fetch(h.baseUrl + "/branch", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "br-srv-2", config: { ...BASE_CONFIG } }),
+			});
+			await readSseUntil(res, (f) => f.includes("event: session_ended"));
+
+			const r = await getJson(h.baseUrl, `/sessions?slide=${encodeURIComponent(SLIDE)}`);
+			expect(r.status).toBe(200);
+			const sessions = (r.body as { sessions: Array<{ kind: string; annotation_id: string }> }).sessions;
+			const branch = sessions.find((s) => s.annotation_id === "br-srv-2");
+			expect(branch).toBeDefined();
+			expect(branch!.kind).toBe("branch");
+		} finally {
+			await h.server.stop();
+		}
+	});
+});
+
 describe("SidecarServer — archive/unarchive", () => {
 	it("toggles archived and forbids archiving a running session", async () => {
 		const { fn } = makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]);

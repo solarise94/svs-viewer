@@ -190,6 +190,84 @@ describe("SessionStore: index.json register/unregister/list/findFork", () => {
 	});
 });
 
+describe("SessionStore: index.json branches slot (CRUD + old-format compat)", () => {
+	let store: SessionStore;
+	let dir: string;
+
+	beforeAll(async () => {
+		dir = await newStoreDir();
+		store = new SessionStore({ sessionsDir: dir });
+	});
+
+	it("registers a branch under branches[annotation_id] and lists it back", async () => {
+		const b = await store.createSession({ slide: SLIDE, kind: "branch", annotationId: "br-a1" });
+		const listed = await store.listBySlide(SLIDE);
+		expect(listed.branches).toEqual({ "br-a1": b.id });
+		// branches slot is always present even on a fresh store.
+		expect(listed.branches).toBeDefined();
+	});
+
+	it("findBranch resolves by annotation id", async () => {
+		const f = await store.findBranch(SLIDE, "br-a1");
+		expect(f).not.toBeNull();
+		const listed = await store.listBySlide(SLIDE);
+		expect(f).toBe(listed.branches["br-a1"]);
+	});
+
+	it("a second branch for a different annotation coexists", async () => {
+		const b2 = await store.createSession({ slide: SLIDE, kind: "branch", annotationId: "br-a2" });
+		const listed = await store.listBySlide(SLIDE);
+		expect(listed.branches).toEqual({ "br-a1": listed.branches["br-a1"]!, "br-a2": b2.id });
+	});
+
+	it("unregister branch removes only the matching branch mapping", async () => {
+		const listed = await store.listBySlide(SLIDE);
+		const branchId = listed.branches["br-a1"]!;
+		await store.unregister(SLIDE, branchId, "branch", "br-a1");
+		const after = await store.listBySlide(SLIDE);
+		expect(after.branches["br-a1"]).toBeUndefined();
+		expect(after.branches["br-a2"]).toBeDefined();
+	});
+
+	it("tolerates an old index.json with no branches field (back-compat)", async () => {
+		// Simulate a pre-branch-split index.json: {slide: {main, forks}} with
+		// no `branches` key. The store must read it without crashing and report
+		// an empty branches map.
+		const oldDir = await newStoreDir();
+		const oldStore = new SessionStore({ sessionsDir: oldDir });
+		await oldStore.ensureDir();
+		// Seed a main + fork entry the old way (no branches field).
+		await fs.writeFile(
+			join(oldDir, "index.json"),
+			JSON.stringify({ "old.svs": { main: "sess_old_main", forks: { fa: "sess_old_fork" } } }) + "\n",
+		);
+		const listed = await oldStore.listBySlide("old.svs");
+		expect(listed.main).toBe("sess_old_main");
+		expect(listed.forks).toEqual({ fa: "sess_old_fork" });
+		// branches defaults to {} for old-format files.
+		expect(listed.branches).toEqual({});
+		// findBranch on an old-format index returns null (not a crash).
+		expect(await oldStore.findBranch("old.svs", "fa")).toBeNull();
+	});
+
+	it("writing a new branch onto an old-format index preserves the existing main/forks", async () => {
+		const oldDir = await newStoreDir();
+		const oldStore = new SessionStore({ sessionsDir: oldDir });
+		await oldStore.ensureDir();
+		await fs.writeFile(
+			join(oldDir, "index.json"),
+			JSON.stringify({ "old2.svs": { main: "sess_m", forks: { fx: "sess_f" } } }) + "\n",
+		);
+		// Register a branch on top of the old-format index.
+		await oldStore.register("old2.svs", "sess_b", "branch", "bx");
+		const raw = JSON.parse(await fs.readFile(join(oldDir, "index.json"), "utf8"));
+		// The new index now has a branches field, and main/forks are intact.
+		expect(raw["old2.svs"].main).toBe("sess_m");
+		expect(raw["old2.svs"].forks).toEqual({ fx: "sess_f" });
+		expect(raw["old2.svs"].branches).toEqual({ bx: "sess_b" });
+	});
+});
+
 describe("SessionStore: acquire 409 conflict", () => {
 	let store: SessionStore;
 	let sid: string;

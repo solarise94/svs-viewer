@@ -94,17 +94,18 @@ Flask 把这些端点**字节级透传**到 sidecar（普通端点 `_proxy_json`
 |---|---|---|---|---|
 | `/api/ai/run` | POST | `/run` | `{slide, task?, fresh?, config}` | 主 session 起跑；SSE；冲突 409 |
 | `/api/ai/continue` | POST | `/continue` | `{slide, config}` | 主 session 续跑；SSE；无 main 404 |
-| `/api/ai/ask` | POST | `/ask` | `{slide, annotation_id, question?, config}` | fork 起跑/续聊；SSE；根标注已删 410 |
+| `/api/ai/ask` | POST | `/ask` | `{slide, annotation_id, question?, config}` | **lite fork** 起跑/续聊（批注小框纯解读，无工具）；SSE；根标注已删 410 |
+| `/api/ai/branch` | POST | `/branch` | `{slide, annotation_id, question?, config}` | **branch**（真 fork）起跑/续聊：从标注起步的完整会话，全量工具含 create_annotation；SSE；根标注已删 410 |
 | `/api/ai/cancel` | POST | `/cancel` | `{session_id?} \| {slide}` | 显式取消；原样转发 |
-| `/api/ai/sessions` | GET | `/sessions` | `?slide=` | 列 main + 活跃 forks |
+| `/api/ai/sessions` | GET | `/sessions` | `?slide=` | 列 main + 活跃 forks + branches |
 | `/api/ai/session/<id>` | GET | `/session/<id>` | — | session detail + 脱敏 transcript |
-| `/api/ai/session/<id>/archive` `/unarchive` | POST | `/session/<id>/archive` `/unarchive` | `{}` | fork 归档/恢复；running 409 |
+| `/api/ai/session/<id>/archive` `/unarchive` | POST | `/session/<id>/archive` `/unarchive` | `{}` | fork/branch 归档/恢复；running 409 |
 | `/api/ai/session/<id>/stream` | GET | `/session/<id>/stream` | `?after_seq=N`，`Last-Event-ID` | SSE 重挂/断线重连 |
 | `/api/ai/config` | GET/PUT | —（Flask 自处理） | — | 读写 `ai_config.json`（不转发 sidecar） |
 
 ### 3.3 sidecar 原生端点（仅供 Flask 代理与探活）
 
-`POST /run`、`POST /continue`、`POST /ask`、`POST /cancel`、`GET /sessions`、`GET /session/:id`、`POST /session/:id/archive|unarchive`、`GET /session/:id/stream`、`GET /healthz`（→ `{ok:true}`）。SSE 帧格式见 §6。
+`POST /run`、`POST /continue`、`POST /ask`、`POST /branch`、`POST /cancel`、`GET /sessions`、`GET /session/:id`、`POST /session/:id/archive|unarchive`、`GET /session/:id/stream`、`GET /healthz`（→ `{ok:true}`）。SSE 帧格式见 §7。
 
 ---
 
@@ -114,17 +115,19 @@ Flask 把这些端点**字节级透传**到 sidecar（普通端点 `_proxy_json`
 
 ```
 <SHARE_DATA_DIR>/ai_sessions/          （目录 0700）
-├── index.json                          # {slide: {main: <id>, forks: {annotation_id: <id>}}}
+├── index.json                          # {slide: {main, forks:{annotation_id: sid}, branches:{annotation_id: sid}}}
 ├── <session_id>.json                   # 会话元数据（原子 tmp+rename，0600）
 └── <session_id>.events.jsonl           # SSE 事件流（append + fsync，一行一事件，含单调 seq）
 ```
 
-`index.json` 被 `pruneIndex()` 在 boot 恢复时裁剪：指向已删/legacy 文件的条目会被清掉，避免 `listBySlide`/`findFork` 拿到死 id。
+`index.json` 新增 `branches` 槽（与 `forks` 平行，按 `annotation_id` 索引 `kind="branch"` 会话）。**向后兼容**：旧 `index.json` 无 `branches` 字段时，读取方容忍缺失（`listBySlide` / `findBranch` 返回空 map），写入时自动补上 `branches: {}`。
+
+`index.json` 被 `pruneIndex()` 在 boot 恢复时裁剪：指向已删/legacy 文件的条目（main / forks / branches 三个槽）都会被清掉，避免 `listBySlide`/`findFork`/`findBranch` 拿到死 id。
 
 ### 4.2 `<session_id>.json` 字段（新格式，`SessionData`）
 
 ```
-id, slide, kind: "main" | "fork", annotation_id, title,
+id, slide, kind: "main" | "fork" | "branch", annotation_id, title,
 created_at, updated_at, last_accessed_at, archived: bool,
 agent_state: {center_x, center_y, pyramid_level, viewport_px},
 observations: [...],                      # 结构化观察（mark_observation 写入）
@@ -283,8 +286,10 @@ event: session_ended\ndata: {status}\n\n      session 离开 running（无 id �
 |---|---|---|
 | `slide_opened` | 主 session 首跑（run）setup | `{slide, width, height, overview_level, level_count, mpp, viewport:{x,y,w,h}, session_id}` |
 | `session_resumed` | 主 session 续跑（continue） | `{session_id, status}` |
-| `fork_created` | fork 首次起跑（ask 新 fork） | `{annotation_id, title}` |
-| `fork_resumed` | fork 续聊（ask 已有 fork） | `{session_id, annotation_id}` |
+| `fork_created` | **lite fork** 首次起跑（ask 新 fork，无工具） | `{annotation_id, title}` |
+| `fork_resumed` | lite fork 续聊（ask 已有 fork） | `{session_id, annotation_id}` |
+| `branch_created` | **branch**（真 fork）首次起跑（branch 新 branch，全量工具） | `{annotation_id, title}` |
+| `branch_resumed` | branch 续聊（branch 已有 branch） | `{session_id, annotation_id}` |
 | `tool_started` | `goto` 工具执行后 | `{tool:"goto", x, y, level, magnification, reason, requested_level}` |
 | `snapshot_captured` | `snapshot` 工具执行后（**不含 base64**，省带宽） | `{bboxLevel0:{x,y,w,h}, magnification, out_w, out_h}` |
 | `observation` | `mark_observation` 工具 | `{label, note, no_annotation_reason, bbox:{x,y,w,h}}` |
@@ -341,14 +346,27 @@ SSE 断开（页面刷新/网络断）**不暂停 run**：run 在 sidecar 后台
 - pending review 期间拒绝：`goto`、新 `snapshot`、`finish`、纯文本结束。
 - `create_annotation` / `mark_observation` 的 schema 强制引用当前 pending 的 `snapshot_id`。
 - **关闭 pending 的明确动作**：独立的 `complete_snapshot_review(disposition, summary, no_annotation_reason?)`。一个 snapshot 允许多个 `create_annotation`（一处快照发现多个目标），`create_annotation` 不关闭 pending；只有 `complete_snapshot_review` 关闭。
-- 守卫**只约束 main**（fork 没有 `create_annotation`，仅问答 + 看图，不进 pending）。
+- 守卫**只约束 main / branch**（有 `snapshot` 工具的会话）。**lite fork（kind="fork"）不注册任何工具**，模型无法 snapshot，永远不会进 pending。
 - `pending_snapshot_review` 持久化到 session JSON（崩溃恢复后仍 pending，模型下一步仍须先消化）。
 
-### 9.4 标注幂等与变更追踪
+### 9.4 会话类型三态（批注对话分级）
+读片助手有**三种会话**，工具集与初始上下文不同：
+
+| kind | 端点 | 工具集 | 初始消息 | 事件 | 语义 |
+|---|---|---|---|---|---|
+| `main` | `/run` `/continue` | **全量**（goto / snapshot / mark_observation / create_annotation / complete_snapshot_review / finish） | 全片概览 task（slide_opened 视口） | `slide_opened` / `session_resumed` | 全片读片，从概览起步逐级放大确认并标注 |
+| `fork` | `/ask` | **空**（无工具，纯文本问答） | spot 卡 + bbox 外扩 15% 附图 | `fork_created` / `fork_resumed` | **lite 批注小框**：基于给定标注区域的图像与上下文做文本问答，不能导航/移动视野/落标注；纯文本回合自然结束（`agent_finished`） |
+| `branch` | `/branch` | **全量**（与 main 相同，含 create_annotation） | spot 卡 + bbox 外扩 15% 附图（同 fork） | `branch_created` / `branch_resumed` | **真 fork**：从标注起步的**完整会话**，可导航/抓快照/落标注/总结 |
+
+**lite fork 兼容**：历史 fork 会话（pre-lite-split，transcript 里带工具调用历史）续聊时，旧工具调用历史保留在 transcript 里原样不动，仅不再提供新工具（`createTools` 对 `kind="fork"` 返回 `[]`）。
+
+**限流**：fork 与 branch 各自独立计数，但**共用 `fork_active_limit`** 作为上限值（默认 20）。超出时归档最旧的非 running 会话（不硬删）；fork 限流只统计 `kind="fork"`，branch 限流只统计 `kind="branch"`。
+
+### 9.5 标注幂等与变更追踪
 - ROI 稳定主键 `annotation_id`（UUID），`change_seq` 切片级全局单调序号（新建/编辑/删除都 +1，重复删除不递增）。
 - 删除 = tombstone（`deleted=true` + `change_seq++`），物理保留。
 - sidecar 落标注走 `/internal/ai/annotate`，传 `effect_key`（`session_id:toolCallId`）给 `share_store.add_roi` 做幂等（已落则复用，防 sidecar 重试重复落标）。
-- fork 的变更消费范围：只追加根 `annotation_id` 的 `spot_updated`/`spot_deleted` 进自己对话；`spot_cursor` 仍推进到全局最新水位。根标注在 fork 运行中被删 → 410。
+- fork / branch 的变更消费范围：只追加根 `annotation_id` 的 `spot_updated`/`spot_deleted` 进自己对话；`spot_cursor` 仍推进到全局最新水位。根标注在 fork / branch 运行中被删 → 410。
 
 ---
 
@@ -362,7 +380,7 @@ SSE 断开（页面刷新/网络断）**不暂停 run**：run 在 sidecar 后台
 | `safety_margin` | 8192 | 防估算误差顶爆（legacy 字段，当前 compaction 未直接用） |
 | `keep_recent_tokens` | 20000 | compact 后保留原文 token |
 | `keep_recent_images` | 6 | 每次请求物化后保留的最近图数（正整数） |
-| `fork_active_limit` | 20 | 活跃 fork 上限（超出归档，不硬删；running 不归档） |
+| `fork_active_limit` | 20 | 活跃 fork / branch 各自上限（共用此值，分别只统计 kind="fork" / kind="branch"；超出归档最旧非 running，不硬删） |
 | `lease_ttl` | 150.0 | （legacy 字段，保留兼容旧配置；新架构无租约） |
 | `event_buffer` | 200 | SSE 事件滚动窗口（`.events.jsonl` 重放用） |
 | `max_tokens` | 2048 | 单次模型输出 token 上限 |

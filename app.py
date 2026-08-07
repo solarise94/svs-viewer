@@ -1766,6 +1766,31 @@ def api_ai_ask():
     return _proxy_sse("/ask", payload)
 
 
+@app.route("/api/ai/branch", methods=["POST"])
+def api_ai_branch():
+    """branch 起跑/续聊（从标注起步的完整会话，全量工具，SSE）。
+
+    body: {slide, annotation_id, question?}。代理到 sidecar POST /branch：注入
+    config。根标注已删除 → 410（sidecar 返回）。契约同 /api/ai/ask。
+    """
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    annotation_id = body.get("annotation_id")
+    if not isinstance(slide, str) or not slide:
+        return jsonify(error="缺少 slide"), 400
+    if not isinstance(annotation_id, str) or not annotation_id:
+        return jsonify(error="缺少 annotation_id"), 400
+    payload = {
+        "slide": slide,
+        "annotation_id": annotation_id,
+        "config": _build_sidecar_config(),
+    }
+    question = body.get("question")
+    if isinstance(question, str):
+        payload["question"] = question
+    return _proxy_sse("/branch", payload)
+
+
 @app.route("/api/ai/cancel", methods=["POST"])
 def api_ai_cancel():
     """显式取消。body: {session_id?, slide?}。原样转发到 sidecar POST /cancel。"""
