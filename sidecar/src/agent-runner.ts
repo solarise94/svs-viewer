@@ -224,7 +224,7 @@ export class AgentRunner {
 	 *
 	 * Returns `{sessionId}` immediately.
 	 */
-	async askFork(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string }> {
+	async askFork(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string; streamFromSeq: number }> {
 		const { slide, config, annotationId } = args;
 
 		// Locate the root annotation via the spot change log (tombstone-aware).
@@ -239,6 +239,10 @@ export class AgentRunner {
 		if (existing) {
 			// Resume: acquire, append the question, emit fork_resumed, run.
 			const data = await this.store.acquire({ sessionId: existing, slide, kind: "fork", annotationId });
+			// SSE 起点水位：续聊时流只带本轮新事件（fork_resumed 起），
+			// 不从 0 重放历史——前端小框对话是增量渲染（不会清空重排），
+			// 重放会把旧工具轨迹重复渲染一遍。（create 路径从 0 起流。）
+			const streamFromSeq = data.last_event_seq || 0;
 			const qText = args.question || "请谈谈这个区域";
 			// Append the user question to the transcript (app.py:1720).
 			const updated = await this.store.withLock(data.id, async (d) => {
@@ -259,7 +263,7 @@ export class AgentRunner {
 			void this.driveFork(data.id, slide, config, annotationId).catch(async (e) => {
 				await this.handleFatal(data.id, e);
 			});
-			return { sessionId: data.id };
+			return { sessionId: data.id, streamFromSeq };
 		}
 
 		// New fork: enforce the active limit (app.py:1726).
@@ -282,7 +286,7 @@ export class AgentRunner {
 		void this.driveFork(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
 			await this.handleFatal(data.id, e);
 		});
-		return { sessionId: data.id };
+		return { sessionId: data.id, streamFromSeq: 0 };
 	}
 
 	// ----------------------------------------------------------------------- //
@@ -305,7 +309,7 @@ export class AgentRunner {
 	 *
 	 * Returns `{sessionId}` immediately.
 	 */
-	async askBranch(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string }> {
+	async askBranch(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string; streamFromSeq: number }> {
 		const { slide, config, annotationId } = args;
 
 		// Locate the root annotation via the spot change log (tombstone-aware).
@@ -319,6 +323,8 @@ export class AgentRunner {
 		if (existing) {
 			// Resume: acquire, append the question, emit branch_resumed, run.
 			const data = await this.store.acquire({ sessionId: existing, slide, kind: "branch", annotationId });
+			// SSE 起点水位（同 fork 续聊）：只流本轮新事件，不重放历史。
+			const streamFromSeq = data.last_event_seq || 0;
 			const qText = args.question || "请谈谈这个区域";
 			// Append the user question to the transcript (mirrors fork resume).
 			const updated = await this.store.withLock(data.id, async (d) => {
@@ -339,7 +345,7 @@ export class AgentRunner {
 			void this.driveBranch(data.id, slide, config, annotationId).catch(async (e) => {
 				await this.handleFatal(data.id, e);
 			});
-			return { sessionId: data.id };
+			return { sessionId: data.id, streamFromSeq };
 		}
 
 		// New branch: enforce the active limit (reuses fork_active_limit but
@@ -363,7 +369,7 @@ export class AgentRunner {
 		void this.driveBranch(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
 			await this.handleFatal(data.id, e);
 		});
-		return { sessionId: data.id };
+		return { sessionId: data.id, streamFromSeq: 0 };
 	}
 
 	// ----------------------------------------------------------------------- //

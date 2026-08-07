@@ -200,8 +200,8 @@ export class SidecarServer {
 		if (!annotationId) return this.sendJson(res, 400, { error: "缺少 annotation_id" });
 		if (!config) return this.sendJson(res, 400, { error: "缺少 config" });
 		try {
-			const { sessionId } = await this.runner.askFork({ slide, config, annotationId, question });
-			return this.startSseForNewSession(sessionId, res);
+			const { sessionId, streamFromSeq } = await this.runner.askFork({ slide, config, annotationId, question });
+			return this.startSseForNewSession(sessionId, res, streamFromSeq);
 		} catch (e) {
 			if (e instanceof RootAnnotationGone) return this.sendJson(res, 410, { error: e.message });
 			if (e instanceof SessionConflict || e instanceof StoreConflict) return this.sendJson(res, 409, { error: e.message });
@@ -222,8 +222,8 @@ export class SidecarServer {
 		if (!annotationId) return this.sendJson(res, 400, { error: "缺少 annotation_id" });
 		if (!config) return this.sendJson(res, 400, { error: "缺少 config" });
 		try {
-			const { sessionId } = await this.runner.askBranch({ slide, config, annotationId, question });
-			return this.startSseForNewSession(sessionId, res);
+			const { sessionId, streamFromSeq } = await this.runner.askBranch({ slide, config, annotationId, question });
+			return this.startSseForNewSession(sessionId, res, streamFromSeq);
 		} catch (e) {
 			if (e instanceof RootAnnotationGone) return this.sendJson(res, 410, { error: e.message });
 			if (e instanceof SessionConflict || e instanceof StoreConflict) return this.sendJson(res, 409, { error: e.message });
@@ -342,8 +342,8 @@ export class SidecarServer {
 	 * replays everything emitted so far (including the setup event), then tails
 	 * live. The X-AI-Session-ID header carries the new id to the client.
 	 */
-	private startSseForNewSession(sessionId: string, res: ServerResponse): void {
-		void this.runSseStream(sessionId, 0, res);
+	private startSseForNewSession(sessionId: string, res: ServerResponse, afterSeq = 0): void {
+		void this.runSseStream(sessionId, afterSeq, res);
 	}
 
 	/**

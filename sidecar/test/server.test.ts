@@ -490,3 +490,67 @@ describe("SidecarServer — archive/unarchive", () => {
 		}
 	});
 });
+
+describe("SidecarServer — fork/branch 续聊 SSE 不重放历史", () => {
+	it("fork resume stream starts at fork_resumed (no fork_created / old frames)", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "第一次回答。", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			h.mock.spotChanges.push({ annotation_id: "fk-re-1", x: 100, y: 200, side_px: 400, note: "", label: "灶", change_seq: ++h.mock.currentSeq, deleted: false });
+			// 第一轮：创建并跑完。
+			const res1 = await fetch(h.baseUrl + "/ask", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "fk-re-1", question: "第一问", config: { ...BASE_CONFIG } }),
+			});
+			expect(res1.status).toBe(200);
+			const frames1 = await readSseUntil(res1, (f) => f.includes("event: session_ended"));
+			expect(frames1.some((f) => f.includes("fork_created"))).toBe(true);
+
+			// 第二轮：续聊——流必须从 fork_resumed 起，不带任何第一轮的事件。
+			const res2 = await fetch(h.baseUrl + "/ask", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "fk-re-1", question: "第二问", config: { ...BASE_CONFIG } }),
+			});
+			expect(res2.status).toBe(200);
+			const frames2 = await readSseUntil(res2, (f) => f.includes("event: session_ended"));
+			const joined = frames2.join("");
+			expect(frames2[0]).toContain("fork_resumed");
+			expect(joined).not.toContain("fork_created");
+			expect(joined).not.toContain("第一次回答。");
+		} finally {
+			await h.server.stop();
+		}
+	});
+
+	it("branch resume stream starts at branch_resumed (no branch_created / old frames)", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "首轮深读。", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			h.mock.spotChanges.push({ annotation_id: "br-re-1", x: 100, y: 200, side_px: 400, note: "", label: "灶", change_seq: ++h.mock.currentSeq, deleted: false });
+			const res1 = await fetch(h.baseUrl + "/branch", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "br-re-1", question: "首轮", config: { ...BASE_CONFIG } }),
+			});
+			expect(res1.status).toBe(200);
+			const frames1 = await readSseUntil(res1, (f) => f.includes("event: session_ended"));
+			expect(frames1.some((f) => f.includes("branch_created"))).toBe(true);
+
+			const res2 = await fetch(h.baseUrl + "/branch", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "br-re-1", question: "续问", config: { ...BASE_CONFIG } }),
+			});
+			expect(res2.status).toBe(200);
+			const frames2 = await readSseUntil(res2, (f) => f.includes("event: session_ended"));
+			const joined = frames2.join("");
+			expect(frames2[0]).toContain("branch_resumed");
+			expect(joined).not.toContain("branch_created");
+			expect(joined).not.toContain("首轮深读。");
+		} finally {
+			await h.server.stop();
+		}
+	});
+});
