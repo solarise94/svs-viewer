@@ -75,6 +75,12 @@
   var aiSlideEpoch = 0;      // 切片切换世代：过期异步响应一律丢弃
   // 主会话轨迹渲染上下文（显式传入；lastSeq 仅服务 main，禁止被 fork 污染）
   var mainAiCtx = { container: null, bubbleEl: null, thinkingEl: null, isFork: false, lastSeq: 0 };
+  // 会话切换器：当前活跃会话（main 走 run/continue/cancel；branch 走 resume/追问/stop）。
+  // {id, kind:"main"|"branch", annotation_id?}。null/默认 main —— startAiRun/restoreAiSession 现状保留。
+  var activeAiSession = null;
+  // 切换器下拉的会话元数据缓存（main+branch；fork 不进）。供 onAiSessionChange 直接查 meta，
+  // 避免每次切换都额外 GET /sessions（状态在切换瞬间就近取缓存，切换后按需刷新）。
+  var aiSessionListCache = [];
 
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
@@ -201,6 +207,8 @@
     aiFreshBtn: $("ai-fresh-btn"),
     aiStopBtn: $("ai-stop-btn"),
     aiTrace: $("ai-trace"),
+    aiSessionBar: $("ai-session-bar"),
+    aiSessionSelect: $("ai-session-select"),
   };
 
   var roiBox = null;
@@ -1729,7 +1737,16 @@
         if (state.focusAnno && it !== state.focusAnno) return; // focus 模式只显示该条气泡
         if (dragging && it !== editItem) return; // 拖动中只画选中项气泡
         var note = String(it.note || "");
-        if (!note) return;
+        // §任务3：focus 项即使 note 为空也画气泡 —— 文本 fallback 用 label+尺寸。
+        // 非 focus 项保持原状（note 为空不画）。
+        var isFocused = (state.focusAnno === it);
+        if (!note) {
+          if (!isFocused) return;
+          var sizeStr = (it.size_mm != null && it.size_mm !== "")
+            ? (it.size_mm + "mm")
+            : ((it.type === "arrow" || it.type === "freehand") ? "标注" : "");
+          note = (it.label || "标注") + (sizeStr ? ("（" + sizeStr + "）") : "");
+        }
         var selected = (editItem === it);
         drawNoteBubble(it, note, selected);
       });
@@ -2515,6 +2532,23 @@
           row.appendChild(forkBtn);
         }
 
+        // 任何带 annotation_id 的标注：挂 ⑂ → 在 AI 面板开/续分支会话（§任务2）。
+        // branch 是全量工具完整会话（与 fork 纯文本小框互补）。点击复用既有 branch，
+        // 无则 POST /api/ai/branch 新建并流式渲染进 AI 面板主对话区。
+        if (it.annotation_id) {
+          var branchBtn = document.createElement("button");
+          branchBtn.className = "ai-op ai-branch";
+          branchBtn.textContent = "⑂";
+          branchBtn.title = "在 AI 面板开分支会话（全量工具深读）";
+          // 闭包捕获 annotation_id（it 是分组副本，annotation_id 稳定）。
+          var branchAid = it.annotation_id;
+          branchBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            openBranchFromAnno(branchAid);
+          });
+          row.appendChild(branchBtn);
+        }
+
         // 编辑钮：跳转到该标注并进入选中编辑态
         var editBtn = document.createElement("button");
         editBtn.className = "ai-op ai-edit";
@@ -2539,8 +2573,21 @@
 
         row.style.cursor = "pointer";
         row.addEventListener("click", function (ev) {
-          if (ev.target === sharedBtn || ev.target === editBtn || ev.target === delBtn) return;
-          jumpToAnno(it);
+          if (ev.target === sharedBtn || ev.target === editBtn || ev.target === delBtn ||
+              ev.target === forkBtn || ev.target === branchBtn) return;
+          // §任务3：点击=聚焦切换。若该行已是 focusAnno → 再点一次取消 focus（恢复全量）。
+          // 注意：it 是面板分组副本，state.focusAnno 是 flatItems 中的另一副本，
+          // 引用不等，需按 token+ts+type 判定"是否同一标注"。
+          if (state.focusAnno &&
+              state.focusAnno.token === it.token &&
+              Number(state.focusAnno.ts) === Number(it.ts) &&
+              (state.focusAnno.type || "rect") === (it.type || "rect")) {
+            state.focusAnno = null;
+            editItem = null;
+            redrawAnnoCanvas();
+          } else {
+            jumpToAnno(it);
+          }
         });
         els.annoPanelList.appendChild(row);
       });
@@ -3150,14 +3197,28 @@
       autoGrowAiTask();
     });
     // iMessage 输入手感：回车直接发送（Shift+回车换行），输入框随内容长高
+    // 活跃=branch 时回车 → startBranchRun（resume 语义）；活跃=main → startAiRun。
     els.aiTask.addEventListener("keydown", function (e) {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        if (!aiRunning) startAiRun();
+        if (aiRunning) return;
+        if (activeAiSession && activeAiSession.kind === "branch" && activeAiSession.annotation_id) {
+          var q = (els.aiTask.value || "").trim();
+          if (!q) { toast("请输入追问内容", "info"); return; }
+          els.aiTask.value = "";
+          autoGrowAiTask();
+          startBranchRun(activeAiSession.annotation_id, q);
+        } else {
+          startAiRun();
+        }
       }
     });
     els.aiTask.addEventListener("input", autoGrowAiTask);
     autoGrowAiTask();
+    // 会话切换器 change：切换活跃会话（main/branch）。
+    if (els.aiSessionSelect) {
+      els.aiSessionSelect.addEventListener("change", onAiSessionChange);
+    }
   }
 
   // 输入框自适应高度（pill 内 1~5 行）
@@ -3314,6 +3375,9 @@
     setAiRunningUi(true);
     aiSessionId = null;
     mainAiCtx.lastSeq = 0;
+    // 开始新 main run：活跃会话=main（待首个事件带回 session_id 后正式落定）。
+    activeAiSession = { id: null, kind: "main", annotation_id: null };
+    applyActiveSessionUi();
     appendChatBubble(els.aiTrace, "user", task);
     var slideName = state.slide.name;
     var epoch = aiSlideEpoch;
@@ -3329,7 +3393,11 @@
     }).then(function (resp) {
       if (!isCurrentAiSlide(slideName, epoch)) return;
       var sid = resp.headers.get("X-AI-Session-ID");
-      if (sid) aiSessionId = sid;
+      if (sid) {
+        aiSessionId = sid;
+        if (activeAiSession && activeAiSession.kind === "main") activeAiSession.id = sid;
+        refreshAiSessionSwitcher(slideName, epoch);
+      }
       if (!resp.ok || !resp.body) {
         return aiResponseError(resp).then(function (msg) { throw new Error(msg); });
       }
@@ -3369,7 +3437,11 @@
     }).then(function (resp) {
       if (!isCurrentAiSlide(slideName, epoch)) return;
       var sid = resp.headers.get("X-AI-Session-ID");
-      if (sid) aiSessionId = sid;
+      if (sid) {
+        aiSessionId = sid;
+        if (activeAiSession && activeAiSession.kind === "main") activeAiSession.id = sid;
+        refreshAiSessionSwitcher(slideName, epoch);
+      }
       if (!resp.ok || !resp.body) {
         return aiResponseError(resp).then(function (msg) { throw new Error(msg); });
       }
@@ -3398,6 +3470,7 @@
 
   function stopAiRun() {
     // session_id 可能在首个 SSE 事件前尚未到达；slide 让后端解析当前 main。
+    // branch 活跃时 aiSessionId 已是该分支 id，cancel 同样按 session_id 终止。
     var slideName = state.slide && state.slide.name;
     apiFetch("/api/ai/cancel", {
       method: "POST",
@@ -3409,6 +3482,8 @@
     aiPaused = true;
     appendStatusRow(els.aiTrace, "paused", "已停止，可继续");
     finishAiRun();
+    // 状态变化（running→paused）→ 刷新切换器。
+    refreshAiSessionSwitcher();
   }
 
   function finishAiRun(expectedCtrl) {
@@ -3435,7 +3510,10 @@
   }
 
   // 运行中/暂停/空闲的按钮组状态
+  // branch 活跃时："继续"按钮（POST /api/ai/continue 是 main 专属）与"新会话"（仅 main 有意义）都隐藏；
+  // branch 的"追问/继续"走 #ai-task 回车 → startBranchRun（resume 语义）。
   function setAiRunningUi(running) {
+    var isBranch = !!(activeAiSession && activeAiSession.kind === "branch");
     if (running) {
       els.aiStartBtn.style.display = "none";
       els.aiContinueBtn.style.display = "none";
@@ -3444,8 +3522,10 @@
       els.aiComposerAux.style.display = "none";
     } else if (aiPaused) {
       els.aiStartBtn.style.display = "inline-flex";
-      els.aiContinueBtn.style.display = "inline-block";
-      els.aiFreshBtn.style.display = "inline-block";
+      // main: 显示"继续"（POST /continue）；branch: 隐藏（继续走 #ai-task 追问）。
+      els.aiContinueBtn.style.display = isBranch ? "none" : "inline-block";
+      // branch: "新会话"无意义（会另起 main，离开分支上下文）→ 隐藏。
+      els.aiFreshBtn.style.display = isBranch ? "none" : "inline-block";
       els.aiStopBtn.style.display = "none";
       els.aiComposerAux.style.display = "flex";
     } else {
@@ -3553,6 +3633,8 @@
     aiRunning = false;
     aiPaused = false;
     aiSessionId = null;
+    activeAiSession = null; // 切片隔离：清活跃会话，restoreAiSession 会重新落定 main。
+    aiSessionListCache = []; // 切片隔离：清切换器元数据缓存。
     mainAiCtx.lastSeq = 0;
     mainAiCtx.bubbleEl = null;
     mainAiCtx.thinkingEl = null;
@@ -3562,6 +3644,9 @@
       els.aiTrace.innerHTML =
         '<div class="ai-trace-empty">发条消息，AI 就开始读片。对话会显示在这里。</div>';
     }
+    // 切换器先清空（restoreAiSession 完成后重新填充）。
+    if (els.aiSessionBar) els.aiSessionBar.style.display = "none";
+    if (els.aiSessionSelect) els.aiSessionSelect.innerHTML = "";
     setAiRunningUi(false);
     redrawAnnoCanvas();
     return aiSlideEpoch;
@@ -3626,6 +3711,14 @@
         for (var i = 0; i < sessions.length; i++) {
           if (sessions[i].kind === "main") { main = sessions[i]; break; }
         }
+        // 切片打开/配置保存：默认活跃=main；同时填充切换器完整列表（main+branch）。
+        activeAiSession = main
+          ? { id: main.id, kind: "main", annotation_id: null }
+          : null;
+        applyActiveSessionUi();
+        renderAiSessionOptions(sessions.filter(function (s) {
+          return s && (s.kind === "main" || s.kind === "branch");
+        }), !!(aiConfig && aiConfig.base_url && aiConfig.api_key_set));
         if (!main) { setAiRunningUi(false); return; }
         if (!isCurrentAiSlide(slideName, epoch)) return;
         aiSessionId = main.id;
@@ -3683,6 +3776,276 @@
     });
   }
 
+  // =========================================================================
+  // 会话切换器（§任务1）：列出本切片 main + branch，切换活跃会话。
+  // 活跃=main：开始/继续/新会话/停止 走现有 run/continue/cancel。
+  // 活跃=branch：#ai-task 发送 → POST /api/ai/branch {slide,annotation_id,question}（resume 语义）；
+  //              停止 → /api/ai/cancel {session_id}；新会话按钮对 branch 无意义 → 隐藏。
+  // =========================================================================
+
+  // 中止当前活跃会话的 SSE（run 流 + 重挂流），但不清切片状态/游标。
+  // 切换会话/起 branch 前调用，避免两路事件流同时写同一个轨迹容器。
+  function abortActiveAiStream() {
+    if (aiAbortCtrl) { try { aiAbortCtrl.abort(); } catch (e) {} }
+    if (aiStreamCtrl) { try { aiStreamCtrl.abort(); } catch (e) {} }
+    aiAbortCtrl = null;
+    aiStreamCtrl = null;
+    aiRunning = false;
+  }
+
+  // 刷新切换器下拉：GET /api/ai/sessions?slide= → 只列 main+branch（fork 不进列表）。
+  // 选中项 = 当前活跃会话；列表变化（新 branch、状态翻转）后调用。
+  // slideName/epoch 可选：固定目标切片，过期响应不写 DOM。
+  function refreshAiSessionSwitcher(slideName, epoch) {
+    if (!els.aiSessionBar || !els.aiSessionSelect) return;
+    if (!state.slide) {
+      els.aiSessionBar.style.display = "none";
+      els.aiSessionSelect.innerHTML = "";
+      return;
+    }
+    if (slideName == null) slideName = state.slide.name;
+    if (epoch == null) epoch = aiSlideEpoch;
+    // 仅已配置时显示
+    var configured = !!(aiConfig && aiConfig.base_url && aiConfig.api_key_set);
+    apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(slideName))
+      .then(function (r) {
+        if (!isCurrentAiSlide(slideName, epoch)) return null;
+        return r.json();
+      })
+      .then(function (data) {
+        if (!data || !isCurrentAiSlide(slideName, epoch)) return;
+        var sessions = (data && data.sessions) || [];
+        var list = [];
+        for (var i = 0; i < sessions.length; i++) {
+          var s = sessions[i];
+          if (!s || (s.kind !== "main" && s.kind !== "branch")) continue; // fork 不进列表
+          list.push(s);
+        }
+        renderAiSessionOptions(list, configured);
+      })
+      .catch(function () { /* 静默：刷新失败不影响切片 */ });
+  }
+
+  // 把会话列表渲染成 <option>；缓存元数据供 onAiSessionChange 直接查（免额外 GET）。
+  // 同步切换器显隐与选中态。
+  function renderAiSessionOptions(list, configured) {
+    aiSessionListCache = (list || []).slice();
+    var sel = els.aiSessionSelect;
+    sel.innerHTML = "";
+    if (!configured || aiSessionListCache.length === 0) {
+      // 未配置 或 无 main/branch：隐藏切换器（restoreAiSession 仍会兜底）
+      els.aiSessionBar.style.display = "none";
+      return;
+    }
+    els.aiSessionBar.style.display = "flex";
+    // 决定选中：优先 activeAiSession；否则默认 main。
+    var activeId = activeAiSession && activeAiSession.id;
+    var mainId = null;
+    for (var i = 0; i < aiSessionListCache.length; i++) {
+      if (aiSessionListCache[i].kind === "main") { mainId = aiSessionListCache[i].id; break; }
+    }
+    var selectedId = activeId || mainId;
+    for (var k = 0; k < aiSessionListCache.length; k++) {
+      var s = aiSessionListCache[k];
+      var opt = document.createElement("option");
+      opt.value = s.id;
+      var title = s.title || (s.kind === "main" ? "主会话" : "批注分支");
+      var badge = s.kind === "main" ? "main" : "branch";
+      var status = s.status || "";
+      opt.textContent = title + " · " + badge + (status ? " · " + status : "");
+      sel.appendChild(opt);
+    }
+    sel.value = selectedId || aiSessionListCache[0].id;
+  }
+
+  // <select> change：切换活跃会话。
+  // 直接从 aiSessionListCache 查 meta（renderAiSessionOptions 时缓存），免额外 GET；
+  // switchAiSession 会按 meta.status 决定 transcript 渲染 + running 挂流/paused。
+  function onAiSessionChange() {
+    if (!state.slide) return;
+    var sel = els.aiSessionSelect;
+    var sid = sel.value;
+    if (!sid) return;
+    var meta = null;
+    for (var i = 0; i < aiSessionListCache.length; i++) {
+      if (aiSessionListCache[i].id === sid) { meta = aiSessionListCache[i]; break; }
+    }
+    if (!meta) return;
+    var slideName = state.slide.name;
+    var epoch = aiSlideEpoch;
+    switchAiSession(meta, slideName, epoch);
+  }
+
+  // 切换活跃会话：abort 当前 SSE → 设 activeAiSession → 渲染 transcript → running 挂流/paused 显示继续。
+  // meta: {id, kind, annotation_id?, status, title?}。slideName/epoch 固定目标，异步回调校验世代。
+  function switchAiSession(meta, slideName, epoch) {
+    if (!meta || !meta.id) return;
+    if (slideName == null) slideName = state.slide && state.slide.name;
+    if (epoch == null) epoch = aiSlideEpoch;
+    if (!isCurrentAiSlide(slideName, epoch)) return;
+    // 切换前：中止当前活跃会话的事件流（不清切片状态，仅断流）。
+    abortActiveAiStream();
+    activeAiSession = {
+      id: meta.id,
+      kind: meta.kind || "main",
+      annotation_id: meta.annotation_id || null,
+    };
+    // 同步 aiSessionId（main 需要它给 stop/restore 用；branch 也用它做 stop）。
+    aiSessionId = meta.id;
+    aiPaused = false;
+    mainAiCtx.lastSeq = 0;
+    resetAiTrace();
+    setAiRunningUi(false); // 先按 idle 态重置（activeAiSession 已落定 → 按 kind 区分按钮）
+    var txOpts = { emphasis: "main", slideName: slideName, epoch: epoch };
+    var status = meta.status || "";
+    if (status === "running") {
+      aiRunning = true;
+      setAiRunningUi(true);
+      appendStatusRow(els.aiTrace, "info",
+        (activeAiSession.kind === "branch" ? "分支会话进行中，恢复事件流…" : "检测到进行中的读片，恢复事件流…"));
+      loadAndRenderTranscript(meta.id, els.aiTrace, txOpts).then(function () {
+        if (isCurrentAiSlide(slideName, epoch)) attachAiStream(meta.id, slideName, epoch);
+      });
+    } else {
+      aiPaused = (status === "paused");
+      setAiRunningUi(false);
+      loadAndRenderTranscript(meta.id, els.aiTrace, txOpts).then(function () {
+        if (!isCurrentAiSlide(slideName, epoch)) return;
+        if (status === "paused") {
+          appendStatusRow(els.aiTrace, "paused", "(已暂停，可继续)");
+        } else if (status === "finished") {
+          appendStatusRow(els.aiTrace, "finished", "读片已完成");
+        } else if (status === "error") {
+          appendStatusRow(els.aiTrace, "error", "上次读片异常终止");
+        }
+      });
+    }
+    applyActiveSessionUi();
+  }
+
+  // 活跃会话 kind 变化后：重算按钮组（setAiRunningUi 已按 kind 区分 main/branch）。
+  // 直接复用 setAiRunningUi，确保 continue/fresh 按钮在 branch 时隐藏、main 时按 paused 态显示。
+  function applyActiveSessionUi() {
+    setAiRunningUi(aiRunning);
+  }
+
+  // =========================================================================
+  // branch 起跑/续聊（§任务1/2 共用）：POST /api/ai/branch {slide, annotation_id, question?}。
+  // SSE 事件契约与 main 完全一致（branch_created/branch_resumed + 其余复用 handleAiEvent）。
+  // X-AI-Session-ID 头捕获与 startAiRun 同（branch 同样走 _proxy_sse 注入该头）。
+  // =========================================================================
+  function startBranchRun(annotationId, question) {
+    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (!annotationId) { toast("缺少批注 id", "error"); return; }
+    if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
+      toast("请先配置 AI 服务", "error");
+      els.aiConfigWrap.style.display = "block";
+      els.aiConfigCollapsed.style.display = "none";
+      return;
+    }
+    // 切换前中止当前活跃会话事件流（不清切片），重置轨迹。
+    abortActiveAiStream();
+    setAiRunningUi(false);
+    activeAiSession = null; // 等 branch_created/resumed 落定后再置（事件带 session_id）
+    resetAiTrace();
+    mainAiCtx.lastSeq = 0;
+
+    var slideName = state.slide.name;
+    var epoch = aiSlideEpoch;
+    var body = { slide: slideName, annotation_id: annotationId };
+    var hasQuestion = typeof question === "string" && question.trim();
+    if (hasQuestion) {
+      body.question = question.trim();
+      appendMsgTs(els.aiTrace, new Date());
+      appendChatBubble(els.aiTrace, "user", question.trim());
+    }
+    appendStatusRow(els.aiTrace, "info", "正在开启分支会话…");
+    setThinkingRow(mainAiCtx);
+
+    aiRunning = true;
+    aiPaused = false;
+    setAiRunningUi(true);
+    aiAbortCtrl = new AbortController();
+    var runCtrl = aiAbortCtrl;
+
+    fetch("/api/ai/branch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: runCtrl.signal,
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
+      var sid = resp.headers.get("X-AI-Session-ID");
+      if (sid) aiSessionId = sid;
+      if (resp.status === 410) {
+        appendStatusRow(els.aiTrace, "error", "该批注已删除，无法开分支");
+        finishAiRun(runCtrl);
+        throw new Error("gone");
+      }
+      if (!resp.ok || !resp.body) {
+        return aiResponseError(resp).then(function (msg) { throw new Error(msg); });
+      }
+      return pumpAiSse(resp.body.getReader(), slideName, epoch, runCtrl);
+    }).catch(function (e) {
+      if (!isCurrentAiSlide(slideName, epoch)) return;
+      if (e && e.name === "AbortError") return;
+      if (e && e.message === "gone") return;
+      if (aiAbortCtrl !== runCtrl) return;
+      toast("分支会话失败: " + (e && e.message ? e.message : e), "error");
+      appendStatusRow(els.aiTrace, "error", "分支会话失败: " + (e && e.message ? e.message : e));
+      finishAiRun(runCtrl);
+    });
+  }
+
+  // 批注条 ⑂ 按钮入口（§任务2）：确保 AI 面板打开 → 若该标注已有 branch 则复用（切换活跃，
+  // 恢复 transcript；running 则挂流），否则 POST /api/ai/branch 新建并流式渲染进主对话区。
+  function openBranchFromAnno(annotationId) {
+    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (!annotationId) { toast("缺少批注 id", "error"); return; }
+    if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
+      toast("请先配置 AI 服务", "error");
+      openAiPanel();
+      els.aiConfigWrap.style.display = "block";
+      els.aiConfigCollapsed.style.display = "none";
+      return;
+    }
+    // 确保 AI 面板打开（branch 渲染进主对话区）。
+    if (!aiPanelOpen) openAiPanel();
+    var slideName = state.slide.name;
+    var epoch = aiSlideEpoch;
+    // 先查是否已有该标注的 branch（避免重复 POST）。
+    apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(slideName))
+      .then(function (r) {
+        if (!isCurrentAiSlide(slideName, epoch)) return null;
+        return r.json();
+      })
+      .then(function (data) {
+        if (!data || !isCurrentAiSlide(slideName, epoch)) return;
+        var sessions = (data && data.sessions) || [];
+        var existing = null;
+        for (var i = 0; i < sessions.length; i++) {
+          var s = sessions[i];
+          if (s.kind === "branch" && s.annotation_id === annotationId) { existing = s; break; }
+        }
+        if (existing) {
+          // 已是该 branch 活跃：不重复切换（避免 running 重连闪烁），仅确保面板打开。
+          if (activeAiSession && activeAiSession.id === existing.id) return;
+          // 复用既有 branch：切换活跃会话（恢复 transcript；running 则挂流）。
+          switchAiSession(existing, slideName, epoch);
+        } else {
+          // 新建 branch（无 question，后端默认初始消息）。
+          startBranchRun(annotationId, null);
+        }
+      })
+      .catch(function (e) {
+        if (!isCurrentAiSlide(slideName, epoch)) return;
+        toast("开分支失败: " + (e && e.message ? e.message : e), "error");
+      });
+  }
+
   // 按 SSE 事件类型渲染轨迹流 + canvas overlay。
   // ctx: {container, bubbleEl, thinkingEl, isFork} — 主/fork 必须显式传入，禁止全局目标。
   function ensureAiCtx(ctx) {
@@ -3709,6 +4072,26 @@
     if (type === "session_resumed" || type === "fork_resumed" || type === "fork_created") {
       appendStatusRow(container, "info",
         type === "fork_created" ? "批注对话已建立" : "会话已恢复");
+      return;
+    }
+    if (type === "branch_created" || type === "branch_resumed") {
+      // 分支会话建立/恢复：落定 activeAiSession（事件带 session_id/annotation_id），刷新切换器。
+      // 仅在主面板（!ctx.isFork）生效；fork 小框不会收到 branch 事件。
+      appendStatusRow(container, "info",
+        type === "branch_created" ? "分支会话已建立" : "分支会话已恢复");
+      if (!ctx.isFork) {
+        var bSid = (p && p.session_id) || aiSessionId;
+        if (bSid) {
+          aiSessionId = bSid;
+          activeAiSession = {
+            id: bSid,
+            kind: "branch",
+            annotation_id: (p && p.annotation_id) || (activeAiSession && activeAiSession.annotation_id) || null,
+          };
+          applyActiveSessionUi();
+          refreshAiSessionSwitcher();
+        }
+      }
       return;
     }
     if (type === "agent_thinking") {
@@ -3766,6 +4149,8 @@
       appendAnnotationCard(p, container, { showFork: !ctx.isFork });
       refreshCurrentAnnotations();
       loadAnnotationsIndex();
+      // 主/分支会话落新标注 → 刷新切换器（状态可能翻转）；fork 不进列表无需刷新。
+      if (!ctx.isFork) refreshAiSessionSwitcher();
       return;
     }
     if (type === "session_compacted") {
@@ -3783,6 +4168,7 @@
       if (!ctx.isFork) {
         aiPaused = true;
         finishAiRun();
+        refreshAiSessionSwitcher();
       }
       return;
     }
@@ -3792,6 +4178,7 @@
       if (!ctx.isFork) {
         redrawAnnoCanvas();
         finishAiRun();
+        refreshAiSessionSwitcher();
       }
       return;
     }
@@ -3802,7 +4189,10 @@
     if (type === "agent_error") {
       clearThinkingRow(ctx);
       appendStatusRow(container, "error", p.error || "出错");
-      if (!ctx.isFork) finishAiRun();
+      if (!ctx.isFork) {
+        finishAiRun();
+        refreshAiSessionSwitcher();
+      }
       return;
     }
   }

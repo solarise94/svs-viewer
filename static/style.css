@@ -1891,6 +1891,42 @@ button {
 }
 .link-btn:hover { opacity: 0.8; }
 
+/* 会话切换器：紧凑单行下拉，列出本切片 main+branch（fork 不进列表） */
+.ai-session-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 0.5px solid var(--separator);
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  color: var(--text-3);
+}
+.ai-session-bar-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ai-session-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-btn);
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ai-session-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-fill);
+}
+
 /* 2. 底部输入（iMessage 输入栏：+ 圆钮 / pill 输入 / 蓝色发送圆钮） */
 .ai-composer {
   padding: 8px 10px 10px;
@@ -2448,6 +2484,8 @@ button {
    ========================================================================= */
 /* 标注面板行的 💬 按钮（与 ai-op 同尺寸，hover 高亮） */
 .anno-item .ai-op.ai-fork:hover { color: #7b5cff; background: rgba(123, 92, 255, 0.12); }
+/* 标注面板行的 ⑂ 分支按钮（与 ai-fork 同尺寸风格，hover 用青绿区分"深读分支"） */
+.anno-item .ai-op.ai-branch:hover { color: #0a9396; background: rgba(10, 147, 150, 0.12); }
 /* AI 轨迹流里的 📌 行 💬 按钮 */
 .ai-trace-row.annotation { display: flex; align-items: center; gap: 6px; }
 .ai-fork-btn {

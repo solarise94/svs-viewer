@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260804overlay" />
+  <link rel="stylesheet" href="/static/style.css?v=20260807branch" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -293,6 +293,13 @@
           <button id="ai-reconfig-btn" class="link-btn">重新配置</button>
         </div>
 
+        <!-- 会话切换器：列出本切片 main + branch 会话（fork 不进列表） -->
+        <!-- 仅已配置时显示；切换活跃会话（main 走 run/continue/cancel，branch 走 resume/追问） -->
+        <div id="ai-session-bar" class="ai-session-bar" style="display:none;">
+          <span class="ai-session-bar-label">会话</span>
+          <select id="ai-session-select" class="ai-session-select" title="切换本切片的主/分支会话"></select>
+        </div>
+
         <!-- 对话区（实时 / 历史恢复 / fork 共用同一套气泡渲染） -->
         <div id="ai-trace" class="ai-trace">
           <div class="ai-trace-empty">发条消息，AI 就开始读片。对话会显示在这里。</div>
@@ -328,6 +335,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260804overlay"></script>
+  <script src="/static/app.js?v=20260807branch"></script>
 </body>
 </html>
