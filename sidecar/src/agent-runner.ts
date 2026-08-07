@@ -33,7 +33,6 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { createRequire } from "node:module";
 
 import { SYSTEM_PROMPT, DEFAULT_TASK, makeMainMessages, makeForkMessages, type SpotDict } from "./prompts.js";
 import { buildModel, type AiEngineConfig } from "./pi-model.js";
@@ -887,10 +886,10 @@ export class AgentRunner {
 			// model. Imported lazily so tests that pass a fake streamFn never
 			// touch the real provider module.
 			this.defaultStreamFnForConfig(config)) as (
-			model: unknown,
-			context: unknown,
-			options?: unknown,
-		) => AssistantMessageEventStream;
+				model: unknown,
+				context: unknown,
+				options?: unknown,
+			) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 		const self = this;
 		return function (model, context, options) {
@@ -902,7 +901,9 @@ export class AgentRunner {
 				for (let attempt = 0; ; attempt++) {
 					let stream: AssistantMessageEventStream;
 					try {
-						stream = realStreamFn(model, currentContext, options);
+						// Await: the default streamFn is async (dynamic import of
+						// the ESM-only provider module), so this may be a Promise.
+						stream = await realStreamFn(model, currentContext, options);
 					} catch (e) {
 						// streamFn contract says it must not throw, but be defensive.
 						out.push({
@@ -1019,28 +1020,29 @@ export class AgentRunner {
 	}
 
 	/** Lazy-import the openai-completions streamSimple bound to the config. */
-	private defaultStreamFnForConfig(_config: RunConfig): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
+	private defaultStreamFnForConfig(_config: RunConfig): (model: unknown, context: unknown, options?: unknown) => Promise<AssistantMessageEventStream> {
 		// Dynamic import keeps the provider module out of the test graph when a
 		// fake streamFn is supplied. The returned fn dispatches by model.api.
-		const mod = this.loadOpenAiStream();
-		return (model, context, options) => {
+		// StreamFn allows returning a Promise (pi agent-loop awaits it).
+		return async (model, context, options) => {
 			const m = model as { api?: string };
 			if (m?.api === "anthropic-messages") {
 				throw new Error("anthropic protocol not yet wired in sidecar streamFn");
 			}
+			const mod = await this.loadOpenAiStream();
 			return mod.streamSimple(model as never, context as never, options as never);
 		};
 	}
 
-	private openAiStreamCache: { streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple } | null = null;
-	private loadOpenAiStream(): { streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple } {
+	private openAiStreamCache: Promise<{ streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple }> | null = null;
+	private loadOpenAiStream(): Promise<{ streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple }> {
 		if (!this.openAiStreamCache) {
-			// createRequire lets us synchronously load an ESM subpath export
-			// without a top-level await, keeping the streamFn factory sync.
-			const req = createRequire(import.meta.url);
-			this.openAiStreamCache = req("@earendil-works/pi-ai/api/openai-completions") as {
+			// The published pi-ai package marks ./api/* exports as ESM-only
+			// ("import" condition, no "require"), so createRequire() fails at
+			// runtime with "subpath not defined by exports". Use dynamic import.
+			this.openAiStreamCache = import("@earendil-works/pi-ai/api/openai-completions") as Promise<{
 				streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple;
-			};
+			}>;
 		}
 		return this.openAiStreamCache!;
 	}

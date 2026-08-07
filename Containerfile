@@ -24,7 +24,7 @@ COPY sidecar/package.json sidecar/package-lock.json ./
 RUN npm ci --registry="${NPM_REGISTRY}"
 
 # 再 COPY 源码并编译（tsc → dist/）。
-COPY sidecar/tsconfig.json ./
+COPY sidecar/tsconfig.json sidecar/tsconfig.build.json ./
 COPY sidecar/src/ src/
 COPY sidecar/scripts/ scripts/
 RUN npm run build
