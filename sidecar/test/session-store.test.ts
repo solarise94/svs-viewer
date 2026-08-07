@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -265,6 +265,139 @@ describe("SessionStore: boot recovery", () => {
 		const { paused, repaired } = await store.recoverOnBoot();
 		expect(paused).not.toContain(runningId); // already paused
 		expect(repaired).not.toContain(seqTestId); // seq already 99
+	});
+});
+
+describe("SessionStore: legacy session file compatibility", () => {
+	let store: SessionStore;
+	let dir: string;
+	const legacyId1 = "legacy-main-aaaaaaaa";
+	const legacyId2 = "legacy-fork-bbbbbbbb";
+	const goodId = "good-main-cccccccc";
+
+	beforeAll(async () => {
+		dir = await newStoreDir();
+		store = new SessionStore({ sessionsDir: dir });
+
+		// Legacy Python-agent format: has canonical_messages, no messages/
+		// compaction_entries. These must be skipped, not crash, not deleted.
+		await fs.writeFile(
+			join(dir, `${legacyId1}.json`),
+			JSON.stringify({
+				id: legacyId1,
+				slide: SLIDE,
+				kind: "main",
+				title: "old python main",
+				status: "idle",
+				archived: false,
+				canonical_messages: [{ role: "user", content: "hi" }],
+				agent_state: {},
+				created_at: 1,
+				updated_at: 2,
+				last_accessed_at: 2,
+				spot_cursor: 0,
+				last_event_seq: 5,
+				event_min_seq: 1,
+			}),
+		);
+		// A second legacy file that has neither messages nor canonical_messages
+		// (just the missing-messages case).
+		await fs.writeFile(
+			join(dir, `${legacyId2}.json`),
+			JSON.stringify({
+				id: legacyId2,
+				slide: SLIDE,
+				kind: "fork",
+				status: "finished",
+				archived: false,
+				observations: [],
+				// no messages, no canonical_messages
+			}),
+		);
+
+		// A good new-format session.
+		const g = await store.createSession({ slide: SLIDE, kind: "main" });
+		// Replace its id by writing a known-name file then reading it back via
+		// createSession is awkward; instead write a minimal valid new-format file.
+		await fs.writeFile(
+			join(dir, `${goodId}.json`),
+			JSON.stringify({
+				id: goodId,
+				slide: SLIDE,
+				kind: "main",
+				title: "good",
+				status: "idle",
+				archived: false,
+				agent_state: { center_x: 0, center_y: 0, pyramid_level: 0, viewport_px: 1024 },
+				observations: [],
+				pending_snapshot_review: null,
+				spot_cursor: 0,
+				created_at: 1,
+				updated_at: 1,
+				last_accessed_at: 1,
+				last_event_seq: 0,
+				event_min_seq: 0,
+				messages: [],
+				compaction_entries: [],
+			}),
+		);
+
+		// index.json references all three (including the legacy ones).
+		await fs.writeFile(
+			join(dir, "index.json"),
+			JSON.stringify({
+				[SLIDE]: { main: legacyId1, forks: { ax: legacyId2 } },
+			}),
+		);
+		// The createSession above also registered `g.id`; rebuild index by hand
+		// to a deterministic shape (main legacy, one fork legacy, plus the good
+		// one referenced from a second slide so it is not pruned).
+		await fs.writeFile(
+			join(dir, "index.json"),
+			JSON.stringify({
+				[SLIDE]: { main: legacyId1, forks: { ax: legacyId2 } },
+				"other.svs": { main: goodId, forks: {} },
+			}),
+		);
+		// Clean up the stray createSession file so it does not interfere.
+		await fs.rm(join(dir, `${g.id}.json`), { force: true });
+	});
+
+	it("readSession returns null for legacy files", async () => {
+		expect(await store.readSession(legacyId1)).toBeNull();
+		expect(await store.readSession(legacyId2)).toBeNull();
+	});
+
+	it("recoverOnBoot reports legacy files, does not crash or delete them", async () => {
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const { legacy, paused, repaired } = await store.recoverOnBoot();
+		expect(legacy).toContain(legacyId1);
+		expect(legacy).toContain(legacyId2);
+		// Good session is left alone (not paused/repaired — idle, seq 0).
+		expect(paused).not.toContain(goodId);
+		expect(repaired).not.toContain(goodId);
+		// A warning was logged mentioning at least one legacy id.
+		const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+		expect(warned).toContain(legacyId1);
+		warnSpy.mockRestore();
+
+		// Files are NOT deleted.
+		expect(await fs.readFile(join(dir, `${legacyId1}.json`), "utf8").catch(() => null)).not.toBeNull();
+		expect(await fs.readFile(join(dir, `${legacyId2}.json`), "utf8").catch(() => null)).not.toBeNull();
+	});
+
+	it("index.json prunes references to legacy/missing sessions", async () => {
+		// After recoverOnBoot pruned the index, listBySlide should reflect null.
+		const idx = JSON.parse(await fs.readFile(join(dir, "index.json"), "utf8"));
+		// The slide with only legacy refs: main null, forks empty.
+		expect(idx[SLIDE].main).toBeNull();
+		expect(Object.keys(idx[SLIDE].forks)).toHaveLength(0);
+		// The good session's slide keeps its reference.
+		expect(idx["other.svs"].main).toBe(goodId);
+		// listBySlide honors the pruned index.
+		const entry = await store.listBySlide(SLIDE);
+		expect(entry.main).toBeNull();
+		expect(Object.keys(entry.forks)).toHaveLength(0);
 	});
 });
 

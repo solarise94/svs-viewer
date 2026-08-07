@@ -639,7 +639,7 @@ export class SessionStore {
 	 * "paused" (its worker died with the process), and every session's
 	 * last_event_seq is reconciled against its events file tail.
 	 */
-	async recoverOnBoot(): Promise<{ repaired: string[]; paused: string[] }> {
+	async recoverOnBoot(): Promise<{ repaired: string[]; paused: string[]; legacy: string[] }> {
 		await this.ensureDir();
 		const entries = await fs.readdir(this.sessionsDir);
 		const sessionIds = entries
@@ -647,7 +647,21 @@ export class SessionStore {
 			.map((e) => e.slice(0, -".json".length));
 		const repaired: string[] = [];
 		const paused: string[] = [];
+		const legacy: string[] = [];
 		for (const id of sessionIds) {
+			// Detect legacy Python-agent session files (pre-pi-migration format
+			// with `canonical_messages` instead of `messages`/`compaction_entries`).
+			// These cannot be loaded by the new store; skip them with a warning
+			// rather than crashing or deleting the file (operator can clean up).
+			const legacyCheck = await this.isLegacySessionFile(id);
+			if (legacyCheck.legacy) {
+				legacy.push(id);
+				console.warn(
+					`[session-store] skipping legacy session file ${id}.json (${legacyCheck.reason}); ` +
+						`not loaded. Remove the file manually if it is no longer needed.`,
+				);
+				continue;
+			}
 			const data = await this.readSession(id);
 			if (data === null) continue;
 			const beforeSeq = data.last_event_seq;
@@ -665,7 +679,102 @@ export class SessionStore {
 				if (seqChanged) repaired.push(id);
 			}
 		}
-		return { repaired, paused };
+		// Prune index.json references to legacy/missing sessions so listBySlide
+		// and findFork never surface dead ids (server.ts handleSessions already
+		// tolerates readSession===null, but this keeps the index tidy).
+		await this.pruneIndex();
+		return { repaired, paused, legacy };
+	}
+
+	/**
+	 * Detect a legacy Python-agent session JSON: a record-shaped file that has
+	 * `canonical_messages` (or lacks the new `messages` array). Returns
+	 * `{legacy:false}` for new-format files, missing files, or unparseable
+	 * files (the latter are left for readSession/recoverOnBoot to ignore).
+	 */
+	private async isLegacySessionFile(
+		id: string,
+	): Promise<{ legacy: boolean; reason?: string }> {
+		const p = sessionFile(this.sessionsDir, id);
+		let raw: string;
+		try {
+			raw = await fs.readFile(p, "utf8");
+		} catch {
+			return { legacy: false }; // missing → not legacy, recoverOnBoot will skip
+		}
+		let data: unknown;
+		try {
+			data = JSON.parse(raw);
+		} catch {
+			return { legacy: false }; // corrupt → not legacy, readSession returns null
+		}
+		if (!isRecord(data)) return { legacy: false };
+		if (Array.isArray((data as Record<string, unknown>).canonical_messages)) {
+			return { legacy: true, reason: "uses canonical_messages (pre-pi format)" };
+		}
+		if (!Array.isArray((data as Record<string, unknown>).messages)) {
+			return { legacy: true, reason: "missing messages array" };
+		}
+		return { legacy: false };
+	}
+
+	/**
+	 * Rewrite index.json dropping any slide entry that references a session id
+	 * whose file is missing or legacy-format. Idempotent: a clean index is left
+	 * untouched. Errors are swallowed (index is best-effort, never fatal).
+	 */
+	private async pruneIndex(): Promise<void> {
+		let idx: SessionIndex;
+		try {
+			idx = await this.readIndex();
+		} catch {
+			return;
+		}
+		const allIds = new Set<string>();
+		for (const entry of Object.values(idx)) {
+			if (entry.main) allIds.add(entry.main);
+			for (const sid of Object.values(entry.forks)) allIds.add(sid);
+		}
+		const dead = new Set<string>();
+		for (const id of allIds) {
+			const legacy = await this.isLegacySessionFile(id);
+			if (legacy.legacy) {
+				dead.add(id);
+				continue;
+			}
+			// readSession===null means missing/corrupt → also drop the reference.
+			const d = await this.readSession(id);
+			if (d === null) dead.add(id);
+		}
+		if (dead.size === 0) return;
+		let changed = false;
+		for (const [slide, entry] of Object.entries(idx)) {
+			let nextMain = entry.main;
+			if (nextMain && dead.has(nextMain)) {
+				nextMain = null;
+				changed = true;
+			}
+			let forksChanged = false;
+			const nextForks: Record<string, string> = {};
+			for (const [aid, sid] of Object.entries(entry.forks)) {
+				if (dead.has(sid)) {
+					forksChanged = true;
+				} else {
+					nextForks[aid] = sid;
+				}
+			}
+			if (nextMain !== entry.main || forksChanged) {
+				changed = true;
+				idx[slide] = { main: nextMain, forks: nextForks };
+			}
+		}
+		if (changed) {
+			try {
+				await this.writeIndex(idx);
+			} catch {
+				// best-effort
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------ //

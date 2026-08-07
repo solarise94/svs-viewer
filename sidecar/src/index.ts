@@ -31,6 +31,11 @@ async function main(): Promise<void> {
 			`[sidecar] boot recovery: ${recovery.paused.length} session(s) paused, ${recovery.repaired.length} seq-repaired`,
 		);
 	}
+	if (recovery.legacy.length) {
+		console.warn(
+			`[sidecar] boot recovery: ${recovery.legacy.length} legacy session file(s) skipped (see warnings above)`,
+		);
+	}
 
 	const bus = new SessionEventBus(store);
 	const flask = await createFlaskClient();
