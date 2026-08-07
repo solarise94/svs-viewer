@@ -1,0 +1,25 @@
+{
+  "name": "svs-viewer-sidecar",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node sidecar: AI reading assistant powered by pi (earendil-works/pi).",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "spike": "tsx scripts/spike.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.0",
+    "@earendil-works/pi-ai": "0.84.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}
