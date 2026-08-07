@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>切片查看器 · 管理员登录</title>
+  <title>HistoPilot · Admin Login</title>
+  <script src="/static/i18n.js?v=20260807i18n2"></script>
   <style>
     :root {
       --accent: #007AFF;
@@ -119,12 +120,42 @@
       border-radius: 9px;
       margin-bottom: 16px;
     }
+
+    .lang-toggle {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      min-width: 40px;
+      height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--separator);
+      border-radius: 9px;
+      background: #fff;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .lang-toggle:hover { background: #f0f0f2; border-color: rgba(0, 0, 0, 0.16); }
+    .lang-toggle:active { background: #e8e8ea; }
+
+    .login-brand {
+      font-size: 12px;
+      color: var(--text-2);
+      text-align: center;
+      margin-top: 18px;
+      letter-spacing: 0.2px;
+    }
   </style>
 </head>
 <body>
+  <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
   <main class="card">
-    <h1 class="title">切片查看器 · 管理员登录</h1>
-    <p class="subtitle">请输入管理员账号以继续</p>
+    <h1 class="title" data-i18n="app.title">HistoPilot</h1>
+    <p class="subtitle" data-i18n="login.subtitle">请输入管理员账号以继续</p>
 
     {% if error %}
     <div class="error">{{ error }}</div>
@@ -133,15 +164,16 @@
     <form method="POST" action="/login">
       <input type="hidden" name="next" value="{{ next_url }}" />
       <div class="field">
-        <label for="username">用户名</label>
+        <label for="username" data-i18n="login.username">用户名</label>
         <input id="username" name="username" type="text" autocomplete="username" autofocus required />
       </div>
       <div class="field">
-        <label for="password">密码</label>
+        <label for="password" data-i18n="login.password">密码</label>
         <input id="password" name="password" type="password" autocomplete="current-password" required />
       </div>
-      <button class="submit" type="submit">登录</button>
+      <button class="submit" type="submit" data-i18n="login.submit">登录</button>
     </form>
+    <p class="login-brand" data-i18n="app.subtitle">病理切片智能导航</p>
   </main>
 </body>
 </html>

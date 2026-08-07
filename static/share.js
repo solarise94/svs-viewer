@@ -4,6 +4,11 @@
 (function () {
   "use strict";
 
+  // 中英双语：i18n.js 在本脚本之前加载，提供 window.HP_I18N.t
+  function t(key, vars) {
+    return window.HP_I18N ? window.HP_I18N.t(key, vars) : key;
+  }
+
   // ---------- token 与 API 前缀 ----------
   // token 从 location.pathname（/s/<token>）解析
   var TOKEN = window.__SHARE_TOKEN__ || "";
@@ -220,13 +225,13 @@
         state.slides = slides || [];
         renderChips();
         if (state.slides.length === 0) {
-          els.currentSlide.textContent = "无可用切片";
+          els.currentSlide.textContent = t("share.slide.unavailable");
           return;
         }
         openSlide(state.slides[0].name);
       })
       .catch(function (e) {
-        if (e.message !== "invalid") toast("加载切片失败: " + e, "error");
+        if (e.message !== "invalid") toast(t("share.load.fail", { e: e }), "error");
       });
   }
 
@@ -260,7 +265,7 @@
     function setBtn(btn, sizeKey) {
       var ok = !!allowed[sizeKey];
       btn.disabled = !ok;
-      btn.title = ok ? "" : "本次分享不允许该尺寸";
+      btn.title = ok ? "" : t("share.size.disallowed");
       btn.classList.toggle("disabled", !ok);
     }
     setBtn(els.roi6, 6);
@@ -285,7 +290,7 @@
       chip.className = "chip";
       var display = s.alias || s.name;
       chip.textContent = display;
-      chip.title = (s.alias ? s.alias + " (" + s.name + ")" : s.name) + (s.error ? "（读取失败）" : "");
+      chip.title = (s.alias ? s.alias + " (" + s.name + ")" : s.name) + (s.error ? t("share.chip.read.fail") : "");
       chip.dataset.name = s.name;
       if (state.slide && state.slide.name === s.name) {
         chip.classList.add("active");
@@ -337,9 +342,9 @@
     for (var i = 0; i < state.slides.length; i++) {
       if (state.slides[i].name === name) { info = state.slides[i]; break; }
     }
-    if (!info) { toast("切片不在分享中", "error"); return; }
+    if (!info) { toast(t("share.not.in.share"), "error"); return; }
     if (info.error || !info.width) {
-      toast("切片无法读取: " + (info.error || "未知错误"), "error");
+      toast(t("share.read.fail", { e: (info.error || t("share.unknown.error")) }), "error");
       return;
     }
 
@@ -434,34 +439,33 @@
   }
 
   function toggleRoi(sizeMm) {
-    if (!state.slide) { toast("请先打开一个切片", "error"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "error"); return; }
     // 本次分享不允许该尺寸 → 直接拒绝（按钮亦为禁用态）
     var allowed = {};
     state.roiSizes.forEach(function (s) { allowed[Number(s)] = true; });
     if (!allowed[Number(sizeMm)]) {
-      toast("本次分享不允许 " + sizeMm + "mm 标记", "info");
+      toast(t("share.size.disallowed.mm", { s: sizeMm }), "info");
       return;
     }
     if (!state.mppX || state.mppX <= 0) {
-      toast("缺少 mpp（µm/px），请先在工具栏设置 mpp", "error");
+      toast(t("roi.need.mpp"), "error");
       return;
     }
     if (state.slide.mppSource === "estimated") {
-      toast("提示：当前 mpp 为估算值，ROI 尺寸仅供参考", "info");
+      toast(t("roi.estimate.tip"), "info");
     }
     // 进入 ROI 模式时退出箭头/描图绘制模式（互斥）
     exitDrawMode();
     if (state.roiMode === sizeMm) { exitRoi(); return; }
 
     var newSide = roiSide(sizeMm);
-    if (newSide <= 0) { toast("ROI 尺寸计算失败", "error"); return; }
+    if (newSide <= 0) { toast(t("roi.calc.fail"), "error"); return; }
 
     var W0 = state.slide.width, H0 = state.slide.height;
     if (newSide > W0 || newSide > H0) {
       var physW = (W0 * state.mppX / 1000).toFixed(1);
       var physH = (H0 * state.mppX / 1000).toFixed(1);
-      toast("注意：整张图像仅约 " + physW + "×" + physH + " mm，" +
-            sizeMm + "mm 选区已超出图像范围", "info");
+      toast(t("roi.out.of.range", { w: physW, h: physH, s: sizeMm, mpp: state.mppX }), "info");
     }
 
     var W = state.slide.width, H = state.slide.height;
@@ -671,7 +675,7 @@
     // label 必填校验
     var label = (els.roiLabel.value || "").trim();
     if (!label) {
-      toast("请填写标记人或标签", "error");
+      toast(t("share.label.need"), "error");
       try { els.roiLabel.focus(); } catch (e) {}
       return;
     }
@@ -693,16 +697,16 @@
       .then(function (res) {
         if (!res.ok) {
           return res.json().then(function (j) {
-            throw new Error(j.error || ("保存失败 " + res.status));
+            throw new Error(j.error || (t("save.fail") + " " + res.status));
           });
         }
         return res.json();
       })
       .then(function () {
-        toast("选区已保存", "success");
+        toast(t("share.roi.saved"), "success");
         refreshRoisOnce();
       })
-      .catch(function (e) { toast("保存失败: " + e.message, "error"); });
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
   }
 
   // ---------- 导出图片（裁剪） ----------
@@ -715,14 +719,14 @@
       "&size=" + Math.round(r.side);
 
     var originalText = els.exportBtn.textContent;
-    els.exportBtn.textContent = "导出中...";
+    els.exportBtn.textContent = t("export.busy");
     els.exportBtn.disabled = true;
 
     fetch(url)
       .then(function (res) {
         if (!res.ok) {
           return res.json().then(function (j) {
-            throw new Error(j.error || ("导出失败 " + res.status));
+            throw new Error(j.error || (t("export.fail") + " " + res.status));
           });
         }
         return res.blob();
@@ -739,9 +743,9 @@
         a.click();
         document.body.removeChild(a);
         setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
-        toast("已导出: " + fname, "success");
+        toast(t("export.done", { name: fname }), "success");
       })
-      .catch(function (e) { toast("导出失败: " + e.message, "error"); })
+      .catch(function (e) { toast(t("export.fail2", { s: e.message }), "error"); })
       .finally(function () {
         els.exportBtn.textContent = originalText;
         els.exportBtn.disabled = state.roiMode == null;
@@ -751,7 +755,7 @@
   // ---------- 手动设置 mpp ----------
   function setMpp() {
     var v = parseFloat(els.mppInput.value);
-    if (!isFinite(v) || v <= 0) { toast("请输入有效的 mpp 数值", "error"); return; }
+    if (!isFinite(v) || v <= 0) { toast(t("mpp.invalid"), "error"); return; }
     state.mppX = v;
     if (state.slide) {
       state.slide.mppX = v;
@@ -770,7 +774,7 @@
       updateRoiOverlay();
     }
     updateMppSetterVisibility();
-    toast("mpp 已设为 " + v + " µm/px", "success");
+    toast(t("mpp.set.ok", { v: v }), "success");
   }
 
   // =========================================================================
@@ -826,10 +830,10 @@
     }
     // 绘制中预览
     if (state.drawMode === "arrow" && drawPreview && drawPreview.type === "arrow") {
-      drawArrow(drawPreview.x1, drawPreview.y1, drawPreview.x2, drawPreview.y2, "#FFD700", "预览");
+      drawArrow(drawPreview.x1, drawPreview.y1, drawPreview.x2, drawPreview.y2, "#FFD700", t("draw.preview"));
     }
     if (state.drawMode === "freehand" && drawPreview && drawPreview.type === "freehand" && drawPreview.points.length >= 2) {
-      drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, "预览");
+      drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, t("draw.preview"));
     }
     // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简；focus 过滤同步）
     if (state.showAnno && !animating) {
@@ -1281,7 +1285,7 @@
     }
     if (!els.panelEdit) return;
     var typ = it.type || "rect";
-    var titleText = typ === "arrow" ? "编辑箭头" : (typ === "freehand" ? "编辑描图" : "编辑选区");
+    var titleText = typ === "arrow" ? t("edit.title.arrow") : (typ === "freehand" ? t("edit.title.free") : t("edit.title.rect"));
     els.panelEdit.innerHTML = "";
     var card = document.createElement("div");
     card.className = "anno-edit-card";
@@ -1292,7 +1296,7 @@
     var ta = document.createElement("textarea");
     ta.className = "aec-note";
     ta.maxLength = 500;
-    ta.placeholder = "备注（可选，气泡显示）";
+    ta.placeholder = t("edit.note.ph");
     ta.value = it.note || "";
     ta.rows = 2;
     card.appendChild(ta);
@@ -1301,11 +1305,11 @@
     if (state.editing) {
       // 编辑态：保存 / 取消 / 删除
       var saveB = document.createElement("button");
-      saveB.className = "aec-btn primary"; saveB.textContent = "保存";
+      saveB.className = "aec-btn primary"; saveB.textContent = t("edit.save");
       var cancelB = document.createElement("button");
-      cancelB.className = "aec-btn"; cancelB.textContent = "取消";
+      cancelB.className = "aec-btn"; cancelB.textContent = t("edit.cancel");
       var delB = document.createElement("button");
-      delB.className = "aec-btn danger"; delB.textContent = "删除";
+      delB.className = "aec-btn danger"; delB.textContent = t("edit.del");
       ops.appendChild(delB); ops.appendChild(cancelB); ops.appendChild(saveB);
       card.appendChild(ops);
       els.panelEdit.appendChild(card);
@@ -1323,12 +1327,12 @@
     } else {
       // 非编辑态：✎ 编辑 / 保存 / 删除
       var editB = document.createElement("button");
-      editB.className = "aec-btn"; editB.textContent = "✎ 编辑";
-      editB.title = "进入可拖动编辑态";
+      editB.className = "aec-btn"; editB.textContent = t("edit.enter");
+      editB.title = t("edit.enter.title");
       var saveB2 = document.createElement("button");
-      saveB2.className = "aec-btn primary"; saveB2.textContent = "保存";
+      saveB2.className = "aec-btn primary"; saveB2.textContent = t("edit.save");
       var delB2 = document.createElement("button");
-      delB2.className = "aec-btn danger"; delB2.textContent = "删除";
+      delB2.className = "aec-btn danger"; delB2.textContent = t("edit.del");
       ops.appendChild(delB2); ops.appendChild(editB); ops.appendChild(saveB2);
       card.appendChild(ops);
       els.panelEdit.appendChild(card);
@@ -1391,17 +1395,17 @@
       body: JSON.stringify(body),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "保存失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
         return r.json();
       })
       .then(function () {
-        toast("已保存修改", "success");
+        toast(t("edit.saved"), "success");
         editItem = null;
         state.editing = false;
         closeEditCard();
         refreshRoisOnce();
       })
-      .catch(function (e) { toast("保存失败: " + e.message, "error"); });
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
   }
 
   // 取消编辑：恢复原几何，清除选中
@@ -1418,7 +1422,7 @@
   var drawPointer = null;
 
   function enterDrawMode(mode) {
-    if (!state.slide) { toast("请先打开一个切片", "error"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "error"); return; }
     exitRoi();
     state.drawMode = mode;
     els.annoArrowBtn.classList.toggle("active", mode === "arrow");
@@ -1429,7 +1433,7 @@
     syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();
-    toast(mode === "arrow" ? "箭头模式：拖动绘制" : "描图模式：沿边缘描绘", "info");
+    toast(mode === "arrow" ? t("draw.arrow.tip") : t("draw.free.tip"), "info");
   }
 
   function exitDrawMode() {
@@ -1676,16 +1680,16 @@
     if (!dp) { exitDrawMode(); return; }
     if (dp.type === "arrow") {
       var dist = Math.hypot(dp.x2 - dp.x1, dp.y2 - dp.y1);
-      if (dist < 10) { toast("距离过短，已取消", "info"); exitDrawMode(); return; }
+      if (dist < 10) { toast(t("draw.short.cancel"), "info"); exitDrawMode(); return; }
       saveAnnotation({ type: "arrow", x1: dp.x1, y1: dp.y1, x2: dp.x2, y2: dp.y2 });
     } else {
       var pts = dp.points;
-      if (pts.length < 3) { toast("描图点太少，已取消", "info"); exitDrawMode(); return; }
+      if (pts.length < 3) { toast(t("draw.few.cancel"), "info"); exitDrawMode(); return; }
       var xs = pts.map(function (p) { return p[0]; });
       var ys = pts.map(function (p) { return p[1]; });
       var bb = Math.max(Math.max.apply(null, xs) - Math.min.apply(null, xs),
                         Math.max.apply(null, ys) - Math.min.apply(null, ys));
-      if (bb < 10) { toast("描图范围太小，已取消", "info"); exitDrawMode(); return; }
+      if (bb < 10) { toast(t("draw.small.cancel"), "info"); exitDrawMode(); return; }
       saveAnnotation({ type: "freehand", points: pts });
     }
   }
@@ -1706,7 +1710,7 @@
     if (!state.slide) return;
     var label = (els.roiLabel.value || "").trim();
     if (!label) {
-      toast("请填写标记人或标签", "error");
+      toast(t("share.label.need"), "error");
       try { els.roiLabel.focus(); } catch (e) {}
       exitDrawMode();
       return;
@@ -1720,15 +1724,15 @@
       body: JSON.stringify(body),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "保存失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
         return r.json();
       })
       .then(function () {
-        toast("标注已保存", "success");
+        toast(t("anno.saved"), "success");
         exitDrawMode();
         refreshRoisOnce();
       })
-      .catch(function (e) { toast("保存失败: " + e.message, "error"); exitDrawMode(); });
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); exitDrawMode(); });
   }
 
   // 加载当前切片的标注（本 token + 管理员）供画布层绘制
@@ -1750,7 +1754,7 @@
   function loadRoiPanel() {
     fetch(API + "/api/rois")
       .then(function (r) {
-        if (!r.ok) throw new Error("加载选区失败");
+        if (!r.ok) throw new Error(t("share.load.roi.fail"));
         return r.json();
       })
       .then(function (rois) {
@@ -1765,7 +1769,7 @@
   function refreshRoisOnce() {
     return fetch(API + "/api/rois")
       .then(function (r) {
-        if (!r.ok) throw new Error("加载选区失败");
+        if (!r.ok) throw new Error(t("share.load.roi.fail"));
         return r.json();
       })
       .then(function (rois) {
@@ -1787,9 +1791,9 @@
   }
 
   function renderRoiPanel(rois) {
-    els.panelToggle.textContent = "选区(" + rois.length + ")";
+    els.panelToggle.textContent = t("share.roi.count.toggle", { n: rois.length });
     if (rois.length === 0) {
-      els.panelList.innerHTML = '<div class="roi-panel-empty">暂无选区</div>';
+      els.panelList.innerHTML = '<div class="roi-panel-empty">' + esc(t("share.roi.panel.empty")) + "</div>";
       return;
     }
     els.panelList.innerHTML = "";
@@ -1797,7 +1801,7 @@
       var item = document.createElement("div");
       item.className = "roi-panel-item";
 
-      var label = (r.label && String(r.label).trim()) || "未署名";
+      var label = (r.label && String(r.label).trim()) || t("share.unnamed");
       var typ = r.type || "rect";
       var isAdmin = (r.source === "admin");
       var isShared = (r.source === "shared");
@@ -1823,17 +1827,17 @@
       szEl.className = "rpi-size";
       if (typ === "rect") szEl.textContent = " · " + r.size_mm + "mm";
       else if (typ === "arrow") szEl.textContent = " · (" + r.x1 + "," + r.y1 + ")";
-      else szEl.textContent = " · " + (r.points ? r.points.length : 0) + "点";
+      else szEl.textContent = " · " + t("anno.free.points", { n: (r.points ? r.points.length : 0) });
       title.appendChild(szEl);
       if (isAdmin) {
         var badge = document.createElement("span");
         badge.className = "rpi-badge";
-        badge.textContent = "管理员";
+        badge.textContent = t("anno.default.user");
         title.appendChild(badge);
       } else if (isShared) {
         var sBadge = document.createElement("span");
         sBadge.className = "rpi-badge shared";
-        sBadge.textContent = "公开";
+        sBadge.textContent = t("share.public");
         title.appendChild(sBadge);
       }
       var sub = document.createElement("div");
@@ -1854,7 +1858,7 @@
         var editBtn = document.createElement("button");
         editBtn.className = "ri-edit";
         editBtn.textContent = "✎";
-        editBtn.title = "编辑";
+        editBtn.title = t("share.edit.title.short");
         editBtn.addEventListener("click", function (ev) {
           ev.stopPropagation();
           jumpAndEdit(r);
@@ -1864,7 +1868,7 @@
         var del = document.createElement("button");
         del.className = "ri-del";
         del.textContent = "×";
-        del.title = "删除";
+        del.title = t("edit.del");
         del.addEventListener("click", function (ev) {
           ev.stopPropagation();
           deleteRoi(r.index);
@@ -1881,7 +1885,7 @@
       .then(function (r) {
         if (!r.ok) {
           return r.json().then(function (j) {
-            throw new Error(j.error || "删除失败");
+            throw new Error(j.error || t("del.fail"));
           });
         }
         return r.json();
@@ -1900,7 +1904,7 @@
         }
         closeEditCard();
         redrawAnnoCanvas();
-        toast("已删除选区", "success");
+        toast(t("share.del.done"), "success");
         // ---- 后台异步同步真实状态（一次拉取，面板与画布同时刷新）----
         refreshRoisOnce();
       })
@@ -2099,4 +2103,11 @@
   } else {
     init();
   }
+
+  // 语言切换：重渲染选区面板（动态文本走 t()，重渲染即换语言）
+  document.addEventListener("hp-lang-change", function () {
+    try {
+      if (currentRois && currentRois.length >= 0) renderRoiPanel(currentRois);
+    } catch (e) {}
+  });
 })();

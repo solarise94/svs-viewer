@@ -148,6 +148,28 @@ button {
 .icon-btn:hover { background: var(--hover-strong); }
 .icon-btn:active { background: var(--separator-strong); }
 
+/* 语言切换钮（页头右上角，三页面共用视觉：macOS 圆角药丸） */
+.lang-toggle {
+  min-width: 34px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--separator-strong);
+  border-radius: var(--r-btn);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.lang-toggle:hover { background: var(--hover-strong); }
+.lang-toggle:active { background: var(--separator-strong); }
+
 /* 分段控件（NSSegmentedControl） */
 .seg-control {
   display: inline-flex;

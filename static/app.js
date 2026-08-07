@@ -4,6 +4,11 @@
 (function () {
   "use strict";
 
+  // 中英双语：i18n.js 在本脚本之前加载，提供 window.HP_I18N.t
+  function t(key, vars) {
+    return window.HP_I18N ? window.HP_I18N.t(key, vars) : key;
+  }
+
   // ---------- 全局状态 ----------
   var state = {
     slide: null,          // 当前切片 {name,width,height,mppX,mppY,mppSource}
@@ -43,7 +48,7 @@
     if (!els.logoutBtn) return;
     apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
       if (info && info.auth_enabled) {
-        var label = "退出登录";
+        var label = t("toast.logout");
         if (info.username) { label += " (" + info.username + ")"; }
         els.logoutBtn.textContent = label;
         els.logoutBtn.hidden = false;
@@ -57,6 +62,7 @@
   var currentAnnotations = null; // 当前切片的标注 {slide, annotations:[{label,count,items}]}
   var annoOverlays = [];   // 兼容旧引用，已不再新增（标注改画到 canvas）
   var annoPanelOpen = false;
+  var allSharesCache = null; // 缓存分享列表，供语言切换时重渲
 
   // ---------- AI 读片助手状态 ----------
   var aiPanelOpen = false;
@@ -258,7 +264,7 @@
     var total = 0;
     var people = 0;
     grps.forEach(function (g) { total += g.count || 0; people += 1; });
-    return "标记 " + total + "·" + people + " 人";
+    return t("badge.marks", { n: total, m: people });
   }
 
   // 文件名中间截断：保留首尾，中间用 … 连接
@@ -494,7 +500,7 @@
     apiFetch(url)
       .then(function (r) { return r.json(); })
       .then(function (info) {
-        if (info.error) { toast("打开失败: " + info.error, "error"); return; }
+        if (info.error) { toast(t("open.fail", { e: info.error }), "error"); return; }
         state.slide = {
           name: info.name,
           width: info.width,
@@ -529,7 +535,7 @@
           redrawAnnoCanvas();
         }
       })
-      .catch(function (e) { toast("获取切片信息失败: " + e, "error"); });
+      .catch(function (e) { toast(t("open.info.fail", { e: e }), "error"); });
   }
 
   // ---------- mpp 设置区显示控制 ----------
@@ -590,27 +596,26 @@
   }
 
   function toggleRoi(sizeMm) {
-    if (!state.slide) { toast("请先打开一个切片", "error"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "error"); return; }
     if (!state.mppX || state.mppX <= 0) {
-      toast("缺少 mpp（µm/px），请先在工具栏设置 mpp", "error");
+      toast(t("roi.need.mpp"), "error");
       return;
     }
     // 进入 ROI 模式时退出箭头/描图绘制模式（互斥）
     exitDrawMode();
     if (state.slide.mppSource === "estimated") {
-      toast("提示：当前 mpp 为估算值，ROI 尺寸仅供参考", "info");
+      toast(t("roi.estimate.tip"), "info");
     }
     if (state.roiMode === sizeMm) { exitRoi(); return; }
 
     var newSide = roiSide(sizeMm);
-    if (newSide <= 0) { toast("ROI 尺寸计算失败", "error"); return; }
+    if (newSide <= 0) { toast(t("roi.calc.fail"), "error"); return; }
 
     var W0 = state.slide.width, H0 = state.slide.height;
     if (newSide > W0 || newSide > H0) {
       var physW = (W0 * state.mppX / 1000).toFixed(1);
       var physH = (H0 * state.mppX / 1000).toFixed(1);
-      toast("注意：整张图像仅约 " + physW + "×" + physH + " mm，" +
-            sizeMm + "mm 选区已超出图像范围（mpp=" + state.mppX + "）", "info");
+      toast(t("roi.out.of.range", { w: physW, h: physH, s: sizeMm, mpp: state.mppX }), "info");
     }
 
     var W = state.slide.width, H = state.slide.height;
@@ -784,13 +789,13 @@
       "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
       "&size=" + Math.round(r.side);
     var originalText = els.saveBtn.textContent;
-    els.saveBtn.textContent = "导出中...";
+    els.saveBtn.textContent = t("export.busy");
     els.saveBtn.disabled = true;
     apiFetch(url)
       .then(function (res) {
         if (!res.ok) {
           return res.json().then(function (j) {
-            throw new Error(j.error || ("导出失败 " + res.status));
+            throw new Error(j.error || (t("export.fail") + " " + res.status));
           });
         }
         return res.blob();
@@ -805,9 +810,9 @@
         document.body.appendChild(a); a.click();
         document.body.removeChild(a);
         setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
-        toast("已导出: " + fname, "success");
+        toast(t("export.done", { name: fname }), "success");
       })
-      .catch(function (e) { toast("导出失败: " + e.message, "error"); })
+      .catch(function (e) { toast(t("export.fail2", { s: e.message }), "error"); })
       .finally(function () {
         els.saveBtn.textContent = originalText;
         els.saveBtn.disabled = state.roiMode == null;
@@ -818,7 +823,7 @@
   function saveAnno() {
     if (!state.slide || state.roiMode == null) return;
     var r = state.roi;
-    var label = (els.annoLabelInput.value || "").trim() || "管理员";
+    var label = (els.annoLabelInput.value || "").trim() || t("anno.default.user");
     var body = {
       slide: state.slide.name,
       type: "rect",
@@ -838,19 +843,19 @@
     })
       .then(function (res) {
         if (!res.ok) return res.json().then(function (j) {
-          throw new Error(j.error || ("保存失败 " + res.status));
+          throw new Error(j.error || (t("save.fail") + " " + res.status));
         });
         return res.json();
       })
       .then(function () {
-        toast("标注已保存（可在标注面板设为公开）", "success");
+        toast(t("anno.saved.tip"), "success");
         refreshCurrentAnnotations();
         loadAnnotationsIndex().then(function () {
           renderProjects(allProjects);
           renderUnfiled();
         });
       })
-      .catch(function (e) { toast("保存失败: " + e.message, "error"); })
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); })
       .finally(function () {
         els.saveAnnoBtn.disabled = state.roiMode == null;
       });
@@ -859,7 +864,7 @@
   // ---------- 手动设置 mpp ----------
   function setMpp() {
     var v = parseFloat(els.mppInput.value);
-    if (!isFinite(v) || v <= 0) { toast("请输入有效的 mpp 数值", "error"); return; }
+    if (!isFinite(v) || v <= 0) { toast(t("mpp.invalid"), "error"); return; }
     state.mppX = v;
     if (state.slide) { state.slide.mppX = v; state.slide.mppSource = "manual"; }
     if (state.roiMode != null) {
@@ -874,7 +879,7 @@
       updateRoiOverlay();
     }
     updateMppSetterVisibility();
-    toast("mpp 已设为 " + v + " µm/px", "success");
+    toast(t("mpp.set.ok", { v: v }), "success");
   }
 
   // =========================================================================
@@ -895,7 +900,7 @@
       renderUnfiled();
       renderShareList((results[2] && results[2].shares) || []);
     }).catch(function (e) {
-      toast("加载数据失败: " + e, "error");
+      toast(t("load.fail", { e: e }), "error");
     });
   }
 
@@ -930,7 +935,7 @@
       var mpp = Math.round(s.mpp_x * 1000) / 1000;
       parts.push("mpp " + mpp + (s.mpp_source === "estimated" ? "*" : ""));
     } else {
-      parts.push("mpp 缺失");
+      parts.push(t("slide.mpp.missing"));
     }
     return parts.join(" · ");
   }
@@ -940,7 +945,7 @@
     if (!projects || projects.length === 0) {
       var empty = document.createElement("div");
       empty.className = "proj-empty";
-      empty.textContent = "暂无项目，点击「＋ 新建项目」";
+      empty.textContent = t("proj.empty");
       els.projectList.appendChild(empty);
       return;
     }
@@ -959,7 +964,7 @@
       var chevron = document.createElement("span");
       chevron.className = "chevron";
       chevron.textContent = "▸";
-      chevron.title = "展开/收起";
+      chevron.title = t("proj.chevron");
       head.appendChild(chevron);
 
       var icon = document.createElement("span");
@@ -971,10 +976,10 @@
       main.className = "ph-main";
       var nameEl = document.createElement("div");
       nameEl.className = "proj-name";
-      nameEl.textContent = p.name || "未命名项目";
+      nameEl.textContent = p.name || t("proj.unnamed");
       var meta = document.createElement("div");
       meta.className = "proj-meta";
-      meta.textContent = slideCount + " 切片 · " + roiCount + " 标注" +
+      meta.textContent = t("proj.meta", { s: slideCount, r: roiCount }) +
         (p.note ? " · " + p.note : "");
       main.appendChild(nameEl);
       main.appendChild(meta);
@@ -994,10 +999,10 @@
         b.textContent = glyph; b.title = title || "";
         return b;
       }
-      var shareBtn = opBtn("po-share", "↗", "分享本项目");
-      var editBtn = opBtn("po-edit", "✎", "重命名/编辑");
-      var addBtn = opBtn("po-add", "＋", "添加切片");
-      var delBtn = opBtn("po-del", "🗑", "删除项目");
+      var shareBtn = opBtn("po-share", "↗", t("proj.op.share"));
+      var editBtn = opBtn("po-edit", "✎", t("proj.op.edit"));
+      var addBtn = opBtn("po-add", "＋", t("proj.op.add"));
+      var delBtn = opBtn("po-del", "🗑", t("proj.op.del"));
       ops.appendChild(shareBtn);
       ops.appendChild(editBtn);
       ops.appendChild(addBtn);
@@ -1043,7 +1048,7 @@
     var cb = document.createElement("input");
     cb.type = "checkbox";
     cb.className = "slide-check";
-    cb.title = "勾选（用于分享/新建项目）";
+    cb.title = t("proj.cb.title");
     if (slideChecked[sname]) cb.checked = true;
     cb.addEventListener("click", function (ev) { ev.stopPropagation(); });
     cb.addEventListener("change", function () { slideChecked[sname] = cb.checked; });
@@ -1063,9 +1068,9 @@
       nameEl.classList.add("alias-first");
       nameEl.innerHTML = esc(alias) +
         '<span class="alias-filename">' + esc(truncateMiddle(sname, 20)) + "</span>";
-      nameEl.title = sname + (failed ? "（读取失败）" : "");
+      nameEl.title = sname + (failed ? t("slide.read.fail") : "");
     } else {
-      nameEl.textContent = truncateMiddle(sname, 24) + (failed ? " (读取失败)" : "");
+      nameEl.textContent = truncateMiddle(sname, 24) + (failed ? t("slide.read.fail.short") : "");
     }
     top.appendChild(nameEl);
 
@@ -1075,7 +1080,7 @@
       var badge = document.createElement("button");
       badge.className = "anno-pill";
       badge.textContent = badgeText;
-      badge.title = "查看该切片标注";
+      badge.title = t("slide.anno.badge.title");
       badge.addEventListener("click", function (e) {
         e.stopPropagation();
         openSlide(sname);
@@ -1094,7 +1099,7 @@
       if (unfiled && sinfo.size_bytes) metaParts.push(fmtSize(sinfo.size_bytes));
       if (sinfo.note) metaParts.push('<span class="sm-note">' + esc(sinfo.note) + "</span>");
     } else {
-      metaParts.push("未找到");
+      metaParts.push(t("slide.not.found"));
     }
     meta.innerHTML = metaParts.join(" · ");
     mid.appendChild(meta);
@@ -1104,7 +1109,7 @@
     var editBtn = document.createElement("button");
     editBtn.className = "slide-edit";
     editBtn.textContent = "✎";
-    editBtn.title = "编辑别名/备注";
+    editBtn.title = t("slide.op.alias");
     editBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
       enterSlideMetaEdit(row, sname, sinfo);
@@ -1115,7 +1120,7 @@
     var shareBtn = document.createElement("button");
     shareBtn.className = "slide-share";
     shareBtn.textContent = "↗";
-    shareBtn.title = "单独分享此切片";
+    shareBtn.title = t("slide.op.share");
     shareBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
       doCreateShare([sname]);
@@ -1126,7 +1131,7 @@
     var delBtn = document.createElement("button");
     delBtn.className = "slide-del";
     delBtn.textContent = "×";
-    delBtn.title = "删除切片";
+    delBtn.title = t("slide.op.del");
     delBtn.addEventListener("click", function (ev) { ev.stopPropagation(); deleteSlide(sname); });
     row.appendChild(delBtn);
 
@@ -1146,17 +1151,17 @@
     var form = document.createElement("div");
     form.className = "slide-edit-form";
     var aInput = document.createElement("input");
-    aInput.type = "text"; aInput.maxLength = 60; aInput.placeholder = "别名";
+    aInput.type = "text"; aInput.maxLength = 60; aInput.placeholder = t("edit.alias.ph");
     aInput.value = alias0;
     var nInput = document.createElement("input");
-    nInput.type = "text"; nInput.maxLength = 200; nInput.placeholder = "备注";
+    nInput.type = "text"; nInput.maxLength = 200; nInput.placeholder = t("edit.note.ph");
     nInput.value = note0;
     var actions = document.createElement("div");
     actions.className = "sef-actions";
     var okBtn = document.createElement("button");
-    okBtn.className = "btn primary small"; okBtn.textContent = "确认";
+    okBtn.className = "btn primary small"; okBtn.textContent = t("edit.confirm");
     var cancelBtn = document.createElement("button");
-    cancelBtn.className = "btn secondary small"; cancelBtn.textContent = "取消";
+    cancelBtn.className = "btn secondary small"; cancelBtn.textContent = t("edit.cancel");
     actions.appendChild(okBtn); actions.appendChild(cancelBtn);
     form.appendChild(aInput); form.appendChild(nInput); form.appendChild(actions);
     row.appendChild(form);
@@ -1171,14 +1176,14 @@
         body: JSON.stringify({ alias: alias, note: note }),
       })
         .then(function (r) {
-          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "保存失败"); });
+          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
           return r.json();
         })
         .then(function () {
-          toast("已更新", "success");
+          toast(t("common.updated"), "success");
           reloadProjectsAndUnfiled();
         })
-        .catch(function (e) { toast("保存失败: " + e.message, "error"); });
+        .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
     }
     okBtn.addEventListener("click", function (e) { e.stopPropagation(); commit(); });
     cancelBtn.addEventListener("click", function (e) {
@@ -1207,7 +1212,7 @@
     if (unfiled.length === 0) {
       var empty = document.createElement("div");
       empty.className = "unfiled-empty";
-      empty.textContent = "无未归类切片";
+      empty.textContent = t("unfiled.empty");
       els.unfiledList.appendChild(empty);
       return;
     }
@@ -1230,7 +1235,7 @@
   function createProjectFromForm(slidesArg) {
     var slides = (slidesArg && slidesArg.length) ? slidesArg : (pendingNewProjectSlides || []);
     var name = (els.npName.value || "").trim();
-    if (!name) { toast("请输入项目名称", "error"); els.npName.focus(); return; }
+    if (!name) { toast(t("newproj.need.name"), "error"); els.npName.focus(); return; }
     var note = els.npNote.value || "";
     apiFetch("/api/project/create", {
       method: "POST",
@@ -1238,24 +1243,24 @@
       body: JSON.stringify({ name: name, note: note, slides: slides }),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "创建失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("newproj.create.fail")); });
         return r.json();
       })
       .then(function () {
-        toast("项目已创建", "success");
+        toast(t("newproj.created"), "success");
         toggleNewProjectForm(false);
         pendingNewProjectSlides = null;
         slideChecked = {};
         reloadProjectsAndUnfiled();
       })
-      .catch(function (e) { toast("创建失败: " + e.message, "error"); });
+      .catch(function (e) { toast(t("newproj.create.fail2", { e: e.message }), "error"); });
   }
 
   // ---------- 编辑项目 ----------
   function editProject(p) {
-    var name = prompt("项目名称", p.name || "");
+    var name = prompt(t("rename.name.prompt"), p.name || "");
     if (name == null) return;
-    var note = prompt("备注", p.note || "");
+    var note = prompt(t("rename.note.prompt"), p.note || "");
     if (note == null) return;
     apiFetch("/api/project/" + encodeURIComponent(p.pid), {
       method: "PATCH",
@@ -1263,23 +1268,23 @@
       body: JSON.stringify({ name: name.trim(), note: note }),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "更新失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("rename.update.fail")); });
         return r.json();
       })
-      .then(function () { toast("已更新", "success"); reloadProjectsAndUnfiled(); })
-      .catch(function (e) { toast("更新失败: " + e.message, "error"); });
+      .then(function () { toast(t("common.updated"), "success"); reloadProjectsAndUnfiled(); })
+      .catch(function (e) { toast(t("rename.update.fail2", { e: e.message }), "error"); });
   }
 
   // ---------- 删除项目 ----------
   function deleteProject(p) {
-    if (!confirm("确认删除项目「" + (p.name || "") + "」？（仅删除项目，不删除切片文件）")) return;
+    if (!confirm(t("delproj.confirm", { name: (p.name || "") }))) return;
     apiFetch("/api/project/" + encodeURIComponent(p.pid), { method: "DELETE" })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "删除失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("delproj.fail")); });
         return r.json();
       })
-      .then(function () { toast("项目已删除", "success"); reloadProjectsAndUnfiled(); })
-      .catch(function (e) { toast("删除失败: " + e.message, "error"); });
+      .then(function () { toast(t("delproj.deleted"), "success"); reloadProjectsAndUnfiled(); })
+      .catch(function (e) { toast(t("delproj.fail2", { e: e.message }), "error"); });
   }
 
   // =========================================================================
@@ -1288,7 +1293,9 @@
   function openSlidePicker(pid, pname) {
     pickerCtx.targetPid = pid;
     pickerCtx.selected = {};
-    els.pickerTitleText.textContent = "添加切片到项目" + (pname ? "：" + pname : "");
+    els.pickerTitleText.textContent = pname
+      ? t("picker.title.with", { name: pname })
+      : t("picker.title");
     els.pickerList.innerHTML = "";
     allSlides.forEach(function (s) {
       var row = document.createElement("label");
@@ -1319,7 +1326,7 @@
   function updatePickerCount() {
     var n = 0;
     Object.keys(pickerCtx.selected).forEach(function (k) { if (pickerCtx.selected[k]) n++; });
-    els.pickerSelectedCount.textContent = "已选 " + n;
+    els.pickerSelectedCount.textContent = t("picker.selected", { n: n });
   }
 
   function closeSlidePicker() {
@@ -1330,7 +1337,7 @@
 
   function confirmSlidePicker() {
     var slides = Object.keys(pickerCtx.selected).filter(function (k) { return pickerCtx.selected[k]; });
-    if (slides.length === 0) { toast("请至少选择一张切片", "error"); return; }
+    if (slides.length === 0) { toast(t("picker.need.slide"), "error"); return; }
     var pid = pickerCtx.targetPid;
     if (!pid) return;
     apiFetch("/api/project/" + encodeURIComponent(pid) + "/slides", {
@@ -1339,15 +1346,15 @@
       body: JSON.stringify({ slides: slides }),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "添加失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("picker.add.fail")); });
         return r.json();
       })
       .then(function () {
-        toast("已添加 " + slides.length + " 张切片", "success");
+        toast(t("picker.added", { n: slides.length }), "success");
         closeSlidePicker();
         reloadProjectsAndUnfiled();
       })
-      .catch(function (e) { toast("添加失败: " + e.message, "error"); });
+      .catch(function (e) { toast(t("picker.add.fail2", { e: e.message }), "error"); });
   }
 
   // =========================================================================
@@ -1377,55 +1384,55 @@
     var set = {};
     sizes.forEach(function (s) { set[Number(s)] = true; });
     if (set[6] && set[6.5]) return "6/6.5mm";
-    if (set[6.5]) return "仅 6.5mm";
-    if (set[6]) return "仅 6mm";
+    if (set[6.5]) return t("share.size.only.6.5");
+    if (set[6]) return t("share.size.only.6");
     return "6/6.5mm";
   }
 
   // 统一创建分享入口：slides 为要分享的切片名数组
   function doCreateShare(slides) {
-    if (!slides || slides.length === 0) { toast("请先选择要分享的切片", "error"); return; }
+    if (!slides || slides.length === 0) { toast(t("share.need.slide"), "error"); return; }
     var hours = getExpiresHours();
-    if (hours == null) { toast("请输入有效的小时数", "error"); return; }
+    if (hours == null) { toast(t("share.need.hours"), "error"); return; }
     var roiSizes = getShareRoiSizes();
     els.shareCreateBtn.disabled = true;
-    els.shareCreateBtn.textContent = "生成中...";
+    els.shareCreateBtn.textContent = t("share.creating");
     apiFetch("/api/share/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slides: slides, expires_hours: hours, roi_sizes: roiSizes }),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || ("创建失败 " + r.status)); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || (t("share.create.fail") + " " + r.status)); });
         return r.json();
       })
       .then(function (data) {
         els.shareResult.style.display = "flex";
         els.shareResultUrl.value = data.url;
         copyText(data.url);
-        toast("分享链接已生成并复制", "success");
+        toast(t("share.created"), "success");
         sharePendingSlides = null;
         slideChecked = {};
         renderUnfiled();
         reloadShares();
       })
-      .catch(function (e) { toast("创建失败: " + e.message, "error"); })
+      .catch(function (e) { toast(t("share.create.fail2", { s: e.message }), "error"); })
       .finally(function () {
         els.shareCreateBtn.disabled = false;
-        els.shareCreateBtn.textContent = "分享选中切片";
+        els.shareCreateBtn.textContent = t("sb.share.create");
       });
   }
 
   // 分享本项目
   function shareProject(p) {
     var slides = p.slides || [];
-    if (slides.length === 0) { toast("该项目暂无切片", "error"); return; }
+    if (slides.length === 0) { toast(t("share.project.empty"), "error"); return; }
     sharePendingSlides = slides.slice();
     // 展开分享管理区，预填提示
     var shareSec = els.shareMgrBody.closest(".section");
     if (shareSec) shareSec.classList.remove("collapsed");
-    els.shareCreateBtn.textContent = "分享项目「" + (p.name || "") + "」（" + slides.length + " 张）";
-    toast("已选中项目 " + slides.length + " 张切片，选择时效后点击下方按钮生成链接", "info");
+    els.shareCreateBtn.textContent = t("share.project.btn", { name: (p.name || ""), n: slides.length });
+    toast(t("share.project.selected.tip", { n: slides.length }), "info");
     els.shareResult.style.display = "none";
   }
 
@@ -1443,16 +1450,17 @@
   // 未归类"分享选中"
   function onUnfiledShare() {
     var slides = Object.keys(slideChecked).filter(function (k) { return slideChecked[k]; });
-    if (slides.length === 0) { toast("请先勾选切片", "error"); return; }
+    if (slides.length === 0) { toast(t("unfiled.need.check"), "error"); return; }
     doCreateShare(slides);
   }
 
   function renderShareList(shares) {
+    allSharesCache = shares || [];
     els.shareList.innerHTML = "";
     if (!shares || shares.length === 0) {
       var empty = document.createElement("div");
       empty.className = "share-empty";
-      empty.textContent = "暂无分享";
+      empty.textContent = t("share.empty");
       els.shareList.appendChild(empty);
       return;
     }
@@ -1463,8 +1471,8 @@
       // 状态彩色圆点
       var dot = document.createElement("span");
       dot.className = "sr-status-dot " + sh.status;
-      dot.title = sh.status === "active" ? "有效" :
-                  (sh.status === "expired" ? "已过期" : "已撤销");
+      dot.title = sh.status === "active" ? t("share.status.active") :
+                  (sh.status === "expired" ? t("share.status.expired") : t("share.status.revoked"));
       row.appendChild(dot);
 
       // 中部：token（等宽） + 副行 meta
@@ -1479,13 +1487,13 @@
 
       var meta = document.createElement("span");
       meta.className = "sr-meta";
-      var slidesTxt = sh.slides.length + " 张：" + sh.slides.join(", ");
+      var slidesTxt = t("share.slides.tip", { n: sh.slides.length, list: sh.slides.join(", ") });
       meta.innerHTML =
-        '<span title="' + esc(slidesTxt) + '">' + sh.slides.length + " 张</span>" +
+        '<span title="' + esc(slidesTxt) + '">' + sh.slides.length + " " + esc(t("share.slides.unit")) + "</span>" +
         '<span class="sr-sep">·</span>' +
-        "<span>到期 " + fmtExpire(sh.expires_at) + "</span>" +
+        "<span>" + esc(t("share.expires", { e: fmtExpire(sh.expires_at) })) + "</span>" +
         '<span class="sr-sep">·</span>' +
-        "<span>选区 " + (sh.roi_count || 0) + "</span>" +
+        "<span>" + esc(t("share.rois", { n: (sh.roi_count || 0) })) + "</span>" +
         '<span class="sr-sep">·</span>' +
         "<span>" + esc(roiSizesLabel(sh.roi_sizes)) + "</span>";
       mid.appendChild(meta);
@@ -1497,13 +1505,13 @@
       var copyBtn = document.createElement("button");
       copyBtn.className = "sr-btn sr-copy";
       copyBtn.textContent = "⧉";
-      copyBtn.title = "复制链接";
+      copyBtn.title = t("share.copy.title");
       copyBtn.addEventListener("click", function () { copyText(sh.url); });
       ops.appendChild(copyBtn);
       var revBtn = document.createElement("button");
       revBtn.className = "sr-btn sr-revoke";
       revBtn.textContent = "⊘";
-      revBtn.title = "撤销";
+      revBtn.title = t("share.revoke.title");
       revBtn.addEventListener("click", function () { revokeShare(sh.token); });
       if (sh.status !== "active") revBtn.disabled = true;
       ops.appendChild(revBtn);
@@ -1513,24 +1521,24 @@
   }
 
   function revokeShare(token) {
-    if (!confirm("确认撤销该分享？撤销后链接立即失效。")) return;
+    if (!confirm(t("share.revoke.confirm"))) return;
     apiFetch("/api/share/revoke", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: token }),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || ("撤销失败 " + r.status)); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || (t("share.revoke.fail") + " " + r.status)); });
         return r.json();
       })
-      .then(function () { toast("已撤销", "success"); reloadShares(); })
-      .catch(function (e) { toast("撤销失败: " + e.message, "error"); });
+      .then(function () { toast(t("share.revoked"), "success"); reloadShares(); })
+      .catch(function (e) { toast(t("share.revoke.fail2", { s: e.message }), "error"); });
   }
 
   function copyText(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text)
-        .then(function () { toast("已复制到剪贴板", "success"); })
+        .then(function () { toast(t("share.copied"), "success"); })
         .catch(function () { fallbackCopy(text); });
     } else { fallbackCopy(text); }
   }
@@ -1539,8 +1547,8 @@
     ta.value = text;
     ta.style.position = "fixed"; ta.style.opacity = "0";
     document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); toast("已复制到剪贴板", "success"); }
-    catch (e) { toast("复制失败，请手动复制", "error"); }
+    try { document.execCommand("copy"); toast(t("share.copied"), "success"); }
+    catch (e) { toast(t("share.copy.fail"), "error"); }
     document.body.removeChild(ta);
   }
   function fmtExpire(ts) {
@@ -1726,10 +1734,10 @@
     }
     // 绘制中的预览
     if (state.drawMode === "arrow" && drawPreview && drawPreview.type === "arrow") {
-      drawArrow(drawPreview.x1, drawPreview.y1, drawPreview.x2, drawPreview.y2, "#FFD700", "预览");
+      drawArrow(drawPreview.x1, drawPreview.y1, drawPreview.x2, drawPreview.y2, "#FFD700", t("draw.preview"));
     }
     if (state.drawMode === "freehand" && drawPreview && drawPreview.type === "freehand" && drawPreview.points.length >= 2) {
-      drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, "预览");
+      drawFreehand(drawPreview.points, { fill: "rgba(255,215,0,0.12)", stroke: "#FFD700" }, t("draw.preview"));
     }
     // 备注气泡（在标注与手柄之上；动画/拖动期间按需精简；focus 过滤同步）
     if (state.showAnno && !animating) {
@@ -1744,8 +1752,8 @@
           if (!isFocused) return;
           var sizeStr = (it.size_mm != null && it.size_mm !== "")
             ? (it.size_mm + "mm")
-            : ((it.type === "arrow" || it.type === "freehand") ? "标注" : "");
-          note = (it.label || "标注") + (sizeStr ? ("（" + sizeStr + "）") : "");
+            : ((it.type === "arrow" || it.type === "freehand") ? t("draw.kind.anno") : "");
+          note = (it.label || t("draw.kind.anno")) + (sizeStr ? ("（" + sizeStr + "）") : "");
         }
         var selected = (editItem === it);
         drawNoteBubble(it, note, selected);
@@ -2020,9 +2028,9 @@
     var dx = x2 - x1, dy = y2 - y1;
     var len2 = dx * dx + dy * dy;
     if (len2 <= 0) return Math.hypot(px - x1, py - y1);
-    var t = ((px - x1) * dx + (py - y1) * dy) / len2;
-    if (t < 0) t = 0; else if (t > 1) t = 1;
-    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    var projT = ((px - x1) * dx + (py - y1) * dy) / len2;
+    if (projT < 0) projT = 0; else if (projT > 1) projT = 1;
+    return Math.hypot(px - (x1 + projT * dx), py - (y1 + projT * dy));
   }
 
   function pointInPolygon(px, py, pts) {
@@ -2155,7 +2163,7 @@
   var drawPointer = null;     // 当前指针捕获信息
 
   function enterDrawMode(mode) {
-    if (!state.slide) { toast("请先打开一个切片", "error"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "error"); return; }
     exitRoi();
     state.drawMode = mode;
     els.annoArrowBtn.classList.toggle("active", mode === "arrow");
@@ -2167,7 +2175,7 @@
     syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();
-    toast(mode === "arrow" ? "箭头模式：拖动绘制" : "描图模式：沿边缘描绘", "info");
+    toast(mode === "arrow" ? t("draw.arrow.tip") : t("draw.free.tip"), "info");
   }
 
   function exitDrawMode() {
@@ -2379,17 +2387,17 @@
     if (!dp) { exitDrawMode(); return; }
     if (dp.type === "arrow") {
       var dist = Math.hypot(dp.x2 - dp.x1, dp.y2 - dp.y1);
-      if (dist < 10) { toast("距离过短，已取消", "info"); exitDrawMode(); return; }
+      if (dist < 10) { toast(t("draw.short.cancel"), "info"); exitDrawMode(); return; }
       saveAnnotation({ type: "arrow", x1: dp.x1, y1: dp.y1, x2: dp.x2, y2: dp.y2 });
     } else {
       var pts = dp.points;
-      if (pts.length < 3) { toast("描图点太少，已取消", "info"); exitDrawMode(); return; }
+      if (pts.length < 3) { toast(t("draw.few.cancel"), "info"); exitDrawMode(); return; }
       // 包围盒 > 10px
       var xs = pts.map(function (p) { return p[0]; });
       var ys = pts.map(function (p) { return p[1]; });
       var bb = Math.max(Math.max.apply(null, xs) - Math.min.apply(null, xs),
                         Math.max.apply(null, ys) - Math.min.apply(null, ys));
-      if (bb < 10) { toast("描图范围太小，已取消", "info"); exitDrawMode(); return; }
+      if (bb < 10) { toast(t("draw.small.cancel"), "info"); exitDrawMode(); return; }
       saveAnnotation({ type: "freehand", points: pts });
     }
   }
@@ -2410,7 +2418,7 @@
   function saveAnnotation(geom) {
     if (!state.slide) return;
     var label = (els.annoLabelInput.value || "").trim();
-    if (!label) label = "管理员";
+    if (!label) label = t("anno.default.user");
     var body = { slide: state.slide.name, type: geom.type, label: label };
     for (var k in geom) body[k] = geom[k];
     apiFetch("/api/annotation", {
@@ -2419,11 +2427,11 @@
       body: JSON.stringify(body),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "保存失败"); });
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
         return r.json();
       })
       .then(function () {
-        toast("标注已保存", "success");
+        toast(t("anno.saved"), "success");
         exitDrawMode();
         refreshCurrentAnnotations();
         loadAnnotationsIndex().then(function () {
@@ -2431,7 +2439,7 @@
           renderUnfiled();
         });
       })
-      .catch(function (e) { toast("保存失败: " + e.message, "error"); exitDrawMode(); });
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); exitDrawMode(); });
   }
 
   // 重新拉取当前切片标注并重绘
@@ -2458,11 +2466,11 @@
   // 标注面板 + 全部标记叠加（查看器）
   // =========================================================================
   function openAnnoPanel() {
-    if (!state.slide || !currentAnnotations) { toast("当前切片暂无标注", "info"); return; }
+    if (!state.slide || !currentAnnotations) { toast(t("anno.none.current"), "info"); return; }
     if (aiPanelOpen) closeAiPanel();
     annoPanelOpen = true;
     els.annoPanel.style.display = "flex";
-    els.annoPanelTitle.textContent = "标注：" + truncateMiddle(state.slide.name, 28);
+    els.annoPanelTitle.textContent = t("anno.panel.title.with", { name: truncateMiddle(state.slide.name, 28) });
     renderAnnoPanel(currentAnnotations.annotations || []);
   }
 
@@ -2476,7 +2484,7 @@
     if (!groups || groups.length === 0) {
       var empty = document.createElement("div");
       empty.className = "anno-panel-empty";
-      empty.textContent = "暂无标注";
+      empty.textContent = t("anno.panel.empty");
       els.annoPanelList.appendChild(empty);
       return;
     }
@@ -2485,7 +2493,7 @@
       var gh = document.createElement("div");
       gh.className = "anno-group-head";
       gh.innerHTML = '<span class="agh-label">' + esc(grp.label) + "</span>" +
-        '<span class="agh-count">' + grp.count + " 条</span>";
+        '<span class="agh-count">' + esc(t("anno.group.count", { n: grp.count })) + "</span>";
       els.annoPanelList.appendChild(gh);
 
       (grp.items || []).forEach(function (it) {
@@ -2498,21 +2506,21 @@
         var sizeStr = "";
         if ((it.type || "rect") === "rect" && it.size_mm != null) sizeStr = " · " + it.size_mm + "mm";
         else if (it.type === "arrow") sizeStr = " · (" + it.x1 + "," + it.y1 + ")→(" + it.x2 + "," + it.y2 + ")";
-        else if (it.type === "freehand") sizeStr = " · " + (it.points ? it.points.length : 0) + "点";
+        else if (it.type === "freehand") sizeStr = " · " + t("anno.free.points", { n: (it.points ? it.points.length : 0) });
         left.innerHTML =
           '<div class="ai-title"><span class="ai-type-icon">' + typIcon + "</span>" +
           '<span class="ai-label">' + esc(grp.label) + "</span>" + sizeStr + "</div>" +
           '<div class="ai-sub">' + fmtTime(it.ts) +
-          (it.token ? " · 来源 " + String(it.token).slice(0, 6) : "") +
-          (it.visitor ? " · 设备 " + esc(String(it.visitor).slice(0, 6)) : "") + "</div>";
+          (it.token ? esc(t("anno.sub.source", { s: String(it.token).slice(0, 6) })) : "") +
+          (it.visitor ? esc(t("anno.sub.visitor", { s: String(it.visitor).slice(0, 6) })) : "") + "</div>";
         row.appendChild(left);
 
         // 「公开」切换钮：管理员可策展任意来源标注
         var sharedBtn = document.createElement("button");
         sharedBtn.className = "ai-share" + (it.shared ? " on" : "");
         sharedBtn.textContent = it.shared ? "🌐" : "👁";
-        sharedBtn.title = it.shared ? "已公开展示给所有分享用户（点击取消公开）"
-                                    : "未公开（点击公开展示给所有分享用户）";
+        sharedBtn.title = it.shared ? t("anno.shared.on.title")
+                                    : t("anno.shared.off.title");
         sharedBtn.addEventListener("click", function (ev) {
           ev.stopPropagation();
           toggleAnnoShared(it, sharedBtn, row);
@@ -2524,7 +2532,7 @@
           var forkBtn = document.createElement("button");
           forkBtn.className = "ai-op ai-fork";
           forkBtn.textContent = "💬";
-          forkBtn.title = "就此标注提问（批注对话）";
+          forkBtn.title = t("anno.fork.title");
           forkBtn.addEventListener("click", function (ev) {
             ev.stopPropagation();
             openForkChat(it.annotation_id, row);
@@ -2539,7 +2547,7 @@
           var branchBtn = document.createElement("button");
           branchBtn.className = "ai-op ai-branch";
           branchBtn.textContent = "⑂";
-          branchBtn.title = "在 AI 面板开分支会话（全量工具深读）";
+          branchBtn.title = t("anno.branch.title");
           // 闭包捕获 annotation_id（it 是分组副本，annotation_id 稳定）。
           var branchAid = it.annotation_id;
           branchBtn.addEventListener("click", function (ev) {
@@ -2553,7 +2561,7 @@
         var editBtn = document.createElement("button");
         editBtn.className = "ai-op ai-edit";
         editBtn.textContent = "✎";
-        editBtn.title = "编辑（移动/缩放/备注）";
+        editBtn.title = t("anno.edit.title");
         editBtn.addEventListener("click", function (ev) {
           ev.stopPropagation();
           jumpAndEditAnno(it);
@@ -2564,7 +2572,7 @@
         var delBtn = document.createElement("button");
         delBtn.className = "ai-op ai-del";
         delBtn.textContent = "🗑";
-        delBtn.title = "删除标注";
+        delBtn.title = t("anno.del.title");
         delBtn.addEventListener("click", function (ev) {
           ev.stopPropagation();
           deleteAnnoItem(it);
@@ -2607,7 +2615,7 @@
   // 通过 /api/share/rois 取该 token 列表，按 slide+ts+几何匹配）
   function resolveAnnoIndex(it) {
     var token = it.token;
-    if (!token) return Promise.reject(new Error("缺少 token"));
+    if (!token) return Promise.reject(new Error(t("anno.no.token")));
     // annotations 接口的条目可能不带 slide（旧数据），用当前切片名兜底
     var slideName = it.slide || (state.slide ? state.slide.name : null);
     return apiFetch("/api/share/rois")
@@ -2634,7 +2642,7 @@
                 rr.points.length === it.points.length) { match = rr; break; }
           }
         }
-        if (!match) throw new Error("未找到对应标注");
+        if (!match) throw new Error(t("anno.not.found"));
         return match.index;
       });
   }
@@ -2650,7 +2658,7 @@
   // 切换某标注的「公开」状态（策展）
   function toggleAnnoShared(it, btnEl, rowEl) {
     var token = it.token;
-    if (!token) { toast("缺少来源 token", "error"); return; }
+    if (!token) { toast(t("anno.no.src.token"), "error"); return; }
     var target = !it.shared;
     btnEl.disabled = true;
     resolveIndexFast(it)
@@ -2661,7 +2669,7 @@
           body: JSON.stringify({ shared: target }),
         }).then(function (r) {
           if (!r.ok) return r.json().then(function (j) {
-            throw new Error(j.error || ("更新失败 " + r.status));
+            throw new Error(j.error || (t("anno.update.fail") + " " + r.status));
           });
           return r.json();
         });
@@ -2670,12 +2678,12 @@
         it.shared = target;
         btnEl.classList.toggle("on", target);
         btnEl.textContent = target ? "🌐" : "👁";
-        btnEl.title = target ? "已公开展示给所有分享用户（点击取消公开）"
-                             : "未公开（点击公开展示给所有分享用户）";
+        btnEl.title = target ? t("anno.shared.on.title")
+                             : t("anno.shared.off.title");
         if (rowEl) rowEl.classList.toggle("anno-private", !target);
-        toast(target ? "已设为公开" : "已取消公开", "success");
+        toast(target ? t("anno.set.public") : t("anno.set.private"), "success");
       })
-      .catch(function (e) { toast("更新失败: " + e.message, "error"); })
+      .catch(function (e) { toast(t("anno.update.fail3", { e: e.message }), "error"); })
       .finally(function () { btnEl.disabled = false; });
   }
 
@@ -2738,7 +2746,7 @@
     var wrap = $("anno-edit-wrap");
     if (!wrap) return;
     var typ = it.type || "rect";
-    var titleText = typ === "arrow" ? "编辑箭头" : (typ === "freehand" ? "编辑描图" : "编辑选区");
+    var titleText = typ === "arrow" ? t("edit.title.arrow") : (typ === "freehand" ? t("edit.title.free") : t("edit.title.rect"));
     wrap.innerHTML = "";
     var card = document.createElement("div");
     card.className = "anno-edit-card";
@@ -2749,7 +2757,7 @@
     var ta = document.createElement("textarea");
     ta.className = "aec-note";
     ta.maxLength = 500;
-    ta.placeholder = "备注（可选，气泡显示）";
+    ta.placeholder = t("edit.note.ph");
     ta.value = it.note || "";
     ta.rows = 2;
     card.appendChild(ta);
@@ -2758,11 +2766,11 @@
     if (editing) {
       // 编辑态：保存 / 取消 / 删除
       var saveB = document.createElement("button");
-      saveB.className = "btn primary small"; saveB.textContent = "保存";
+      saveB.className = "btn primary small"; saveB.textContent = t("edit.save");
       var cancelB = document.createElement("button");
-      cancelB.className = "btn secondary small"; cancelB.textContent = "取消";
+      cancelB.className = "btn secondary small"; cancelB.textContent = t("edit.cancel");
       var delB = document.createElement("button");
-      delB.className = "btn danger small"; delB.textContent = "删除";
+      delB.className = "btn danger small"; delB.textContent = t("edit.del");
       ops.appendChild(delB); ops.appendChild(cancelB); ops.appendChild(saveB);
       card.appendChild(ops);
       wrap.appendChild(card);
@@ -2780,12 +2788,12 @@
     } else {
       // 非编辑态：✎ 编辑 / 保存 / 删除
       var editB = document.createElement("button");
-      editB.className = "btn small"; editB.textContent = "✎ 编辑";
-      editB.title = "进入可拖动编辑态";
+      editB.className = "btn small"; editB.textContent = t("edit.enter");
+      editB.title = t("edit.enter.title");
       var saveB2 = document.createElement("button");
-      saveB2.className = "btn primary small"; saveB2.textContent = "保存";
+      saveB2.className = "btn primary small"; saveB2.textContent = t("edit.save");
       var delB2 = document.createElement("button");
-      delB2.className = "btn danger small"; delB2.textContent = "删除";
+      delB2.className = "btn danger small"; delB2.textContent = t("edit.del");
       ops.appendChild(delB2); ops.appendChild(editB); ops.appendChild(saveB2);
       card.appendChild(ops);
       wrap.appendChild(card);
@@ -2850,12 +2858,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         }).then(function (r) {
-          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "保存失败"); });
+          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
           return r.json();
         });
       })
       .then(function () {
-        toast("已保存修改", "success");
+        toast(t("edit.saved"), "success");
         editItem = null;
         editing = false;
         closeEditCard();
@@ -2865,7 +2873,7 @@
           renderUnfiled();
         });
       })
-      .catch(function (e) { toast("保存失败: " + e.message, "error"); });
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
   }
 
   function cancelAdminEdit(it) {
@@ -2937,7 +2945,7 @@
       rebuildFlatItems();
       redrawAnnoCanvas();
       if (annoPanelOpen) renderAnnoPanel((currentAnnotations || {}).annotations || []);
-      toast("已删除标注", "success");
+      toast(t("del.anno.done"), "success");
       // ---- 后台异步同步（不阻塞上面的即时反馈）----
       refreshCurrentAnnotations();
       // 全量索引只影响项目/未归类行的计数徽章，后台慢慢同步即可
@@ -2960,18 +2968,18 @@
                 // 重试仍 404 → 服务端已无此标注，删除幂等，视为成功
                 if (res2.status === 404) return { treated: true, alreadyGone: true };
                 // 其他错误冒泡到 catch
-                throw new Error("删除失败 (" + res2.status + ")");
+                throw new Error(t("del.fail") + " (" + res2.status + ")");
               })
               .catch(function (e) {
-                // resolveAnnoIndex 抛"未找到对应标注" → 服务端已无此标注，视为成功
-                if (e && /未找到对应标注/.test(e.message)) {
+                // resolveAnnoIndex 抛"未找到对应标注"/"Annotation not found" → 服务端已无此标注，视为成功
+                if (e && /未找到对应标注|Annotation not found|not found/i.test(e.message)) {
                   return { treated: true, alreadyGone: true };
                 }
                 throw e; // 其余错误继续冒泡
               });
           }
           // 非 404 错误：报错并在 catch 中刷新恢复
-          throw new Error("删除失败 (" + res.status + ")");
+          throw new Error(t("del.fail") + " (" + res.status + ")");
         });
       })
       .then(function (outcome) {
@@ -2979,7 +2987,7 @@
         applyAnnoRemoved();
       })
       .catch(function (e) {
-        toast("删除失败: " + (e && e.message ? e.message : "未知错误"), "error");
+        toast(t("del.fail2", { e: (e && e.message ? e.message : t("del.unknown")) }), "error");
         // 失败恢复：重新拉取真实状态
         refreshCurrentAnnotations();
       });
@@ -2997,21 +3005,21 @@
 
   // ---------- 删除切片 ----------
   function deleteSlide(name) {
-    if (!confirm("确认删除切片 " + name + " ？")) return;
+    if (!confirm(t("del.slide.confirm", { name: name }))) return;
     apiFetch("/api/slide/" + encodeURIComponent(name), { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
         if (state.slide && state.slide.name === name) {
           state.slide = null; state.mppX = null; state.roiMode = null;
-          els.currentSlide.textContent = "未打开切片";
+          els.currentSlide.textContent = t("header.no.slide");
           updateMppSetterVisibility();
           if (roiBox) exitRoi();
           if (viewer) viewer.close();
         }
-        toast("已删除 " + name, "success");
+        toast(t("del.slide.done", { name: name }), "success");
         loadAll();
       })
-      .catch(function (e) { toast("删除失败: " + e.message, "error"); });
+      .catch(function (e) { toast(t("del.slide.fail", { e: e.message }), "error"); });
   }
 
   // ---------- 上传 ----------
@@ -3033,18 +3041,18 @@
     xhr.addEventListener("load", function () {
       els.progressWrap.style.display = "none";
       var data;
-      try { data = JSON.parse(xhr.responseText); } catch (e) { toast("上传响应解析失败", "error"); return; }
+      try { data = JSON.parse(xhr.responseText); } catch (e) { toast(t("upload.parse.fail"), "error"); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
-        toast("上传成功: " + data.name, "success");
+        toast(t("upload.done", { name: data.name }), "success");
         loadAll();
         openSlide(data.name);
       } else {
-        toast("上传失败: " + (data.error || xhr.status), "error");
+        toast(t("upload.fail", { e: (data.error || xhr.status) }), "error");
       }
     });
     xhr.addEventListener("error", function () {
       els.progressWrap.style.display = "none";
-      toast("上传出错（网络）", "error");
+      toast(t("upload.net.fail"), "error");
     });
     xhr.open("POST", "/api/upload");
     xhr.send(formData);
@@ -3140,12 +3148,12 @@
     });
     els.unfiledNewProject.addEventListener("click", function () {
       var slides = Object.keys(slideChecked).filter(function (k) { return slideChecked[k]; });
-      if (slides.length === 0) { toast("请先勾选切片", "error"); return; }
+      if (slides.length === 0) { toast(t("unfiled.need.check"), "error"); return; }
       // 预填并打开表单：这里直接以选中切片创建项目
       toggleNewProjectForm(true);
       // 记录待加入切片，确认时带上
       pendingNewProjectSlides = slides;
-      toast("已选中 " + slides.length + " 张，输入名称后确认", "info");
+      toast(t("unfiled.selected.tip", { n: slides.length }), "info");
     });
 
     // 分享
@@ -3178,7 +3186,7 @@
       // 把掩码回填到 api_key 输入框（占位提示），明文不回填
       if (aiConfig && aiConfig.api_key_mask) {
         els.aiApiKey.value = aiConfig.api_key_mask;
-        els.aiApiKey.placeholder = "与掩码同值=不变，清空=删除";
+        els.aiApiKey.placeholder = t("ai.apikey.ph");
       }
       fillAiTuningFields();
     });
@@ -3188,9 +3196,8 @@
     els.aiStopBtn.addEventListener("click", stopAiRun);
     els.aiTaskJump.addEventListener("click", function () {
       var bbox = currentSelectionBbox();
-      if (!bbox) { toast("请先用 ROI 框选区域或选中一个标注", "info"); return; }
-      var prefix = "重点看 level-0 区域 (x=" + bbox.x + ",y=" + bbox.y +
-                   ",w=" + bbox.w + ",h=" + bbox.h + ")：";
+      if (!bbox) { toast(t("ai.taskjump.need"), "info"); return; }
+      var prefix = t("ai.task.prefix", { x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h });
       var cur = els.aiTask.value || "";
       els.aiTask.value = prefix + cur;
       els.aiTask.focus();
@@ -3204,7 +3211,7 @@
         if (aiRunning) return;
         if (activeAiSession && activeAiSession.kind === "branch" && activeAiSession.annotation_id) {
           var q = (els.aiTask.value || "").trim();
-          if (!q) { toast("请输入追问内容", "info"); return; }
+          if (!q) { toast(t("ai.branch.need.q"), "info"); return; }
           els.aiTask.value = "";
           autoGrowAiTask();
           startBranchRun(activeAiSession.annotation_id, q);
@@ -3249,7 +3256,7 @@
       els.aiConfigWrap.style.display = "none";
       els.aiConfigCollapsed.style.display = "flex";
       els.aiConfigSummary.textContent =
-        (aiConfig.model || "(未设模型)") + " @ " + aiConfig.base_url;
+        (aiConfig.model || t("ai.config.no.model")) + " @ " + aiConfig.base_url;
     } else {
       els.aiConfigWrap.style.display = "block";
       els.aiConfigCollapsed.style.display = "none";
@@ -3287,7 +3294,7 @@
     // 步数上限（必填项）
     var steps = parseInt(els.aiMaxSteps.value, 10);
     if (isNaN(steps) || steps < 1) {
-      toast("步数上限需为 ≥1 的整数", "error");
+      toast(t("ai.steps.invalid"), "error");
       els.aiMaxSteps.focus();
       return;
     }
@@ -3307,7 +3314,7 @@
       var val = pair[1] ? pair[1].value.trim() : "";
       if (val !== "") { payload[pair[0]] = Number(val); }
     });
-    els.aiConfigHint.textContent = "保存中…";
+    els.aiConfigHint.textContent = t("ai.config.saving");
     els.aiConfigSave.disabled = true;
     apiFetch("/api/ai/config", {
       method: "PUT",
@@ -3317,16 +3324,16 @@
       aiConfig = cfg;
       renderAiConfigState();
       els.aiApiKey.value = "";
-      els.aiConfigHint.textContent = "已保存";
-      toast("AI 配置已保存", "success");
+      els.aiConfigHint.textContent = t("ai.config.saved.hint");
+      toast(t("ai.config.saved"), "success");
     }).catch(function (e) {
       els.aiConfigHint.textContent = "";
-      toast("保存失败: " + (e && e.message ? e.message : e), "error");
+      toast(t("ai.config.save.fail", { e: (e && e.message ? e.message : e) }), "error");
     }).then(function () { els.aiConfigSave.disabled = false; });
   }
 
   function openAiPanel() {
-    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
     if (annoPanelOpen) closeAnnoPanel();
     aiPanelOpen = true;
     els.aiPanel.style.display = "flex";
@@ -3353,15 +3360,15 @@
 
   // 开始 AI run（POST /api/ai/run，body.fresh=true，SSE）
   function startAiRun() {
-    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
-    if (aiRunning) { toast("已有任务进行中", "info"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
+    if (aiRunning) { toast(t("ai.busy"), "info"); return; }
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
-      toast("请先配置 AI 服务", "error");
+      toast(t("ai.need.config"), "error");
       els.aiConfigWrap.style.display = "block";
       els.aiConfigCollapsed.style.display = "none";
       return;
     }
-    var DEFAULT_AI_TASK = "客观扫读这张片：先低倍定位，再高倍确认；描述镜下所见，标出值得关注的区域并总结";
+    var DEFAULT_AI_TASK = t("ai.default.task");
     var task = (els.aiTask.value || "").trim() || DEFAULT_AI_TASK;
     if (!(els.aiTask.value || "").trim()) {
       els.aiTask.value = task;
@@ -3406,24 +3413,25 @@
       if (!isCurrentAiSlide(slideName, epoch)) return;
       if (e && e.name === "AbortError") return;
       if (aiAbortCtrl !== runCtrl) return;
-      toast("AI 运行失败: " + (e && e.message ? e.message : e), "error");
-      appendStatusRow(els.aiTrace, "error", "AI 运行失败: " + (e && e.message ? e.message : e));
+      var em = (e && e.message ? e.message : e);
+      toast(t("ai.run.fail", { e: em }), "error");
+      appendStatusRow(els.aiTrace, "error", t("ai.run.fail", { e: em }));
       finishAiRun(runCtrl);
     });
   }
 
   // 继续 paused 的主 run（POST /api/ai/continue，SSE）
   function continueAiRun() {
-    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
-    if (aiRunning) { toast("已有任务进行中", "info"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
+    if (aiRunning) { toast(t("ai.busy"), "info"); return; }
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
-      toast("请先配置 AI 服务", "error");
+      toast(t("ai.need.config"), "error");
       return;
     }
     aiRunning = true;
     aiPaused = false;
     setAiRunningUi(true);
-    appendStatusRow(els.aiTrace, "info", "继续读片…");
+    appendStatusRow(els.aiTrace, "info", t("ai.continue.trace"));
     var slideName = state.slide.name;
     var epoch = aiSlideEpoch;
     aiAbortCtrl = new AbortController();
@@ -3450,21 +3458,22 @@
       if (!isCurrentAiSlide(slideName, epoch)) return;
       if (e && e.name === "AbortError") return;
       if (aiAbortCtrl !== runCtrl) return;
-      toast("继续失败: " + (e && e.message ? e.message : e), "error");
-      appendStatusRow(els.aiTrace, "error", "继续失败: " + (e && e.message ? e.message : e));
+      var cem = (e && e.message ? e.message : e);
+      toast(t("ai.continue.fail", { e: cem }), "error");
+      appendStatusRow(els.aiTrace, "error", t("ai.continue.fail", { e: cem }));
       finishAiRun(runCtrl);
     });
   }
 
   // 新会话（fresh）：归档旧 main 开新；保留当前任务文案，由 startAiRun 发起
   function freshAiRun() {
-    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
-    if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
+    if (aiRunning) { toast(t("ai.busy.stop"), "info"); return; }
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
-      toast("请先配置 AI 服务", "error");
+      toast(t("ai.need.config"), "error");
       return;
     }
-    if (!confirm("归档旧对话开新会话，不影响已落标注与批注对话，确认？")) return;
+    if (!confirm(t("ai.fresh.confirm"))) return;
     startAiRun();
   }
 
@@ -3480,7 +3489,7 @@
     if (aiAbortCtrl) { try { aiAbortCtrl.abort(); } catch (e) {} }
     if (aiStreamCtrl) { try { aiStreamCtrl.abort(); } catch (e) {} }
     aiPaused = true;
-    appendStatusRow(els.aiTrace, "paused", "已停止，可继续");
+    appendStatusRow(els.aiTrace, "paused", t("ai.stopped"));
     finishAiRun();
     // 状态变化（running→paused）→ 刷新切换器。
     refreshAiSessionSwitcher();
@@ -3504,7 +3513,7 @@
       } catch (e) {}
       var title = text.match(/<title[^>]*>([^<]+)<\/title>/i);
       if (title && title[1]) return "HTTP " + resp.status + " " + title[1].replace(/^\d+\s*/, "");
-      if (/<(?:!doctype|html|body)\b/i.test(text)) return "HTTP " + resp.status + " 服务器内部错误";
+      if (/<(?:!doctype|html|body)\b/i.test(text)) return t("ai.http.error", { s: resp.status });
       return text || ("HTTP " + resp.status);
     });
   }
@@ -3642,7 +3651,7 @@
     aiOverlay = [];
     if (els.aiTrace) {
       els.aiTrace.innerHTML =
-        '<div class="ai-trace-empty">发条消息，AI 就开始读片。对话会显示在这里。</div>';
+        '<div class="ai-trace-empty">' + esc(t("ai.trace.empty")) + "</div>";
     }
     // 切换器先清空（restoreAiSession 完成后重新填充）。
     if (els.aiSessionBar) els.aiSessionBar.style.display = "none";
@@ -3666,14 +3675,14 @@
       .then(function (data) {
         if (isMain && slideName != null && !isCurrentAiSlide(slideName, epoch)) return;
         var s = data && data.session;
-        var t = (data && data.transcript) || [];
+        var tx = (data && data.transcript) || [];
         // 清空容器里的旧内容（保留 fork 头部/输入框——只清 stream 区）
         container.innerHTML = "";
-        if (t && t.length) {
-          renderAiTranscript(t, { container: container, emphasis: opts.emphasis || "main",
+        if (tx && tx.length) {
+          renderAiTranscript(tx, { container: container, emphasis: opts.emphasis || "main",
                                   ts: s && s.created_at });
         } else {
-          appendStatusRow(container, "info", "（暂无对话记录）");
+          appendStatusRow(container, "info", t("ai.history.empty"));
         }
         // 事件序号仅在单个 session 内有意义：fork 不得推进 main 游标
         if (s && s.last_event_seq != null) {
@@ -3688,7 +3697,7 @@
       })
       .catch(function () {
         if (isMain && slideName != null && !isCurrentAiSlide(slideName, epoch)) return;
-        appendStatusRow(container, "info", "（对话记录加载失败）");
+        appendStatusRow(container, "info", t("ai.history.fail"));
       });
   }
 
@@ -3728,7 +3737,7 @@
           aiRunning = true;
           aiPaused = false;
           setAiRunningUi(true);
-          appendStatusRow(els.aiTrace, "info", "检测到进行中的读片，恢复事件流…");
+          appendStatusRow(els.aiTrace, "info", t("ai.restore.main"));
           loadAndRenderTranscript(main.id, els.aiTrace, txOpts).then(function () {
             if (isCurrentAiSlide(slideName, epoch)) {
               attachAiStream(main.id, slideName, epoch);
@@ -3741,11 +3750,11 @@
           loadAndRenderTranscript(main.id, els.aiTrace, txOpts).then(function () {
             if (!isCurrentAiSlide(slideName, epoch)) return;
             if (main.status === "paused") {
-              appendStatusRow(els.aiTrace, "paused", "(已暂停，可继续)");
+              appendStatusRow(els.aiTrace, "paused", t("ai.paused.paren"));
             } else if (main.status === "finished") {
-              appendStatusRow(els.aiTrace, "finished", "读片已完成");
+              appendStatusRow(els.aiTrace, "finished", t("ai.finished.trace"));
             } else {
-              appendStatusRow(els.aiTrace, "error", "上次读片异常终止");
+              appendStatusRow(els.aiTrace, "error", t("ai.error.last"));
             }
           });
         }
@@ -3772,7 +3781,7 @@
       if (e && e.name === "AbortError") return;
       if (!isCurrentAiSlide(slideName, epoch)) return;
       // 重挂失败：后台继续，稍后手动"继续"或刷新
-      toast("事件流重挂失败", "error");
+      toast(t("ai.restream.fail"), "error");
     });
   }
 
@@ -3849,7 +3858,7 @@
       var s = aiSessionListCache[k];
       var opt = document.createElement("option");
       opt.value = s.id;
-      var title = s.title || (s.kind === "main" ? "主会话" : "批注分支");
+      var title = s.title || (s.kind === "main" ? t("ai.session.main") : t("ai.session.branch"));
       var badge = s.kind === "main" ? "main" : "branch";
       var status = s.status || "";
       opt.textContent = title + " · " + badge + (status ? " · " + status : "");
@@ -3902,7 +3911,7 @@
       aiRunning = true;
       setAiRunningUi(true);
       appendStatusRow(els.aiTrace, "info",
-        (activeAiSession.kind === "branch" ? "分支会话进行中，恢复事件流…" : "检测到进行中的读片，恢复事件流…"));
+        (activeAiSession.kind === "branch" ? t("ai.restore.branch") : t("ai.restore.main")));
       loadAndRenderTranscript(meta.id, els.aiTrace, txOpts).then(function () {
         if (isCurrentAiSlide(slideName, epoch)) attachAiStream(meta.id, slideName, epoch);
       });
@@ -3912,11 +3921,11 @@
       loadAndRenderTranscript(meta.id, els.aiTrace, txOpts).then(function () {
         if (!isCurrentAiSlide(slideName, epoch)) return;
         if (status === "paused") {
-          appendStatusRow(els.aiTrace, "paused", "(已暂停，可继续)");
+          appendStatusRow(els.aiTrace, "paused", t("ai.paused.paren"));
         } else if (status === "finished") {
-          appendStatusRow(els.aiTrace, "finished", "读片已完成");
+          appendStatusRow(els.aiTrace, "finished", t("ai.finished.trace"));
         } else if (status === "error") {
-          appendStatusRow(els.aiTrace, "error", "上次读片异常终止");
+          appendStatusRow(els.aiTrace, "error", t("ai.error.last"));
         }
       });
     }
@@ -3935,11 +3944,11 @@
   // X-AI-Session-ID 头捕获与 startAiRun 同（branch 同样走 _proxy_sse 注入该头）。
   // =========================================================================
   function startBranchRun(annotationId, question) {
-    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
-    if (!annotationId) { toast("缺少批注 id", "error"); return; }
-    if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
+    if (!annotationId) { toast(t("ai.no.fork.id"), "error"); return; }
+    if (aiRunning) { toast(t("ai.busy.stop"), "info"); return; }
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
-      toast("请先配置 AI 服务", "error");
+      toast(t("ai.need.config"), "error");
       els.aiConfigWrap.style.display = "block";
       els.aiConfigCollapsed.style.display = "none";
       return;
@@ -3960,7 +3969,7 @@
       appendMsgTs(els.aiTrace, new Date());
       appendChatBubble(els.aiTrace, "user", question.trim());
     }
-    appendStatusRow(els.aiTrace, "info", "正在开启分支会话…");
+    appendStatusRow(els.aiTrace, "info", t("ai.branch.opening"));
     setThinkingRow(mainAiCtx);
 
     aiRunning = true;
@@ -3980,7 +3989,7 @@
       var sid = resp.headers.get("X-AI-Session-ID");
       if (sid) aiSessionId = sid;
       if (resp.status === 410) {
-        appendStatusRow(els.aiTrace, "error", "该批注已删除，无法开分支");
+        appendStatusRow(els.aiTrace, "error", t("ai.branch.deleted"));
         finishAiRun(runCtrl);
         throw new Error("gone");
       }
@@ -3993,8 +4002,9 @@
       if (e && e.name === "AbortError") return;
       if (e && e.message === "gone") return;
       if (aiAbortCtrl !== runCtrl) return;
-      toast("分支会话失败: " + (e && e.message ? e.message : e), "error");
-      appendStatusRow(els.aiTrace, "error", "分支会话失败: " + (e && e.message ? e.message : e));
+      var bem = (e && e.message ? e.message : e);
+      toast(t("ai.branch.fail", { e: bem }), "error");
+      appendStatusRow(els.aiTrace, "error", t("ai.branch.fail", { e: bem }));
       finishAiRun(runCtrl);
     });
   }
@@ -4002,11 +4012,11 @@
   // 批注条 ⑂ 按钮入口（§任务2）：确保 AI 面板打开 → 若该标注已有 branch 则复用（切换活跃，
   // 恢复 transcript；running 则挂流），否则 POST /api/ai/branch 新建并流式渲染进主对话区。
   function openBranchFromAnno(annotationId) {
-    if (!state.slide) { toast("请先打开一个切片", "info"); return; }
-    if (!annotationId) { toast("缺少批注 id", "error"); return; }
-    if (aiRunning) { toast("已有任务进行中，请先停止", "info"); return; }
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
+    if (!annotationId) { toast(t("ai.no.fork.id"), "error"); return; }
+    if (aiRunning) { toast(t("ai.busy.stop"), "info"); return; }
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
-      toast("请先配置 AI 服务", "error");
+      toast(t("ai.need.config"), "error");
       openAiPanel();
       els.aiConfigWrap.style.display = "block";
       els.aiConfigCollapsed.style.display = "none";
@@ -4042,7 +4052,7 @@
       })
       .catch(function (e) {
         if (!isCurrentAiSlide(slideName, epoch)) return;
-        toast("开分支失败: " + (e && e.message ? e.message : e), "error");
+        toast(t("ai.branch.fail2", { e: (e && e.message ? e.message : e) }), "error");
       });
   }
 
@@ -4063,22 +4073,22 @@
     if (type === "slide_opened") {
       if (p.viewport) {
         aiOverlay = [{ x: p.viewport.x, y: p.viewport.y, w: p.viewport.w, h: p.viewport.h,
-                       magnification: "概览" }];
+                       magnification: t("ai.mag.overview") }];
         redrawAnnoCanvas();
       }
-      appendStatusRow(container, "info", "已打开切片 " + (p.slide || "") + "，开始读片…");
+      appendStatusRow(container, "info", t("ai.slide.opened", { name: (p.slide || "") }));
       return;
     }
     if (type === "session_resumed" || type === "fork_resumed" || type === "fork_created") {
       appendStatusRow(container, "info",
-        type === "fork_created" ? "批注对话已建立" : "会话已恢复");
+        type === "fork_created" ? t("ai.fork.created") : t("ai.session.restored"));
       return;
     }
     if (type === "branch_created" || type === "branch_resumed") {
       // 分支会话建立/恢复：落定 activeAiSession（事件带 session_id/annotation_id），刷新切换器。
       // 仅在主面板（!ctx.isFork）生效；fork 小框不会收到 branch 事件。
       appendStatusRow(container, "info",
-        type === "branch_created" ? "分支会话已建立" : "分支会话已恢复");
+        type === "branch_created" ? t("ai.branch.created") : t("ai.branch.restored"));
       if (!ctx.isFork) {
         var bSid = (p && p.session_id) || aiSessionId;
         if (bSid) {
@@ -4109,7 +4119,7 @@
           "(" + fmtNum(p.x) + "," + fmtNum(p.y) + ") @ " +
           (p.magnification || "") + (p.reason ? " · " + p.reason : ""));
       } else if (p.tool === "snapshot") {
-        appendToolCall(container, "snapshot", "抓取当前视野");
+        appendToolCall(container, "snapshot", t("ai.tool.snapshot"));
       } else if (p.tool === "finish" || p.tool === "mark_observation" ||
                  p.tool === "complete_snapshot_review" || p.tool === "create_annotation") {
         // 结果会以附件/状态呈现，过程区不重复刷工具名
@@ -4136,9 +4146,9 @@
     if (type === "snapshot_reviewed") {
       clearThinkingRow(ctx);
       var disp = p.disposition || "";
-      var title = (disp === "annotated") ? "已判读（已标注）"
-                : (disp === "no_annotation") ? "已判读（无需标注）"
-                : "已判读";
+      var title = (disp === "annotated") ? t("ai.review.annotated")
+                : (disp === "no_annotation") ? t("ai.review.no.anno")
+                : t("ai.review.done");
       appendReviewCard(title, p.summary || "",
                        disp === "no_annotation" ? (p.no_annotation_reason || "") : "",
                        container);
@@ -4156,15 +4166,16 @@
     if (type === "session_compacted") {
       clearThinkingRow(ctx);
       if (p && p.reason === "context_length_exceeded") {
-        appendToolCall(container, "compact", "上下文已满，已压缩并继续");
+        appendToolCall(container, "compact", t("ai.compact.full"));
       } else {
-        appendToolCall(container, "compact", "上下文已压缩，继续读片…");
+        appendToolCall(container, "compact", t("ai.compact.cont"));
       }
       return;
     }
     if (type === "agent_paused") {
       clearThinkingRow(ctx);
-      appendStatusRow(container, "paused", "已暂停，可继续（" + (p.summary || "") + "）");
+      // p.summary 为后端 SSE summary 文案（保留原文，不进 i18n）
+      appendStatusRow(container, "paused", t("ai.paused.summary", { s: (p.summary || "") }));
       if (!ctx.isFork) {
         aiPaused = true;
         finishAiRun();
@@ -4174,7 +4185,8 @@
     }
     if (type === "agent_finished") {
       clearThinkingRow(ctx);
-      appendStatusRow(container, "finished", p.summary || "(完成)");
+      // p.summary 为后端 SSE summary 文案（保留原文，不进 i18n）
+      appendStatusRow(container, "finished", p.summary || t("ai.finished.fallback"));
       if (!ctx.isFork) {
         redrawAnnoCanvas();
         finishAiRun();
@@ -4188,7 +4200,8 @@
     }
     if (type === "agent_error") {
       clearThinkingRow(ctx);
-      appendStatusRow(container, "error", p.error || "出错");
+      // p.error 为后端 SSE 错误文案（保留原文，不进 i18n）
+      appendStatusRow(container, "error", p.error || t("ai.error.fallback"));
       if (!ctx.isFork) {
         finishAiRun();
         refreshAiSessionSwitcher();
@@ -4202,9 +4215,9 @@
   function handleAiEventReset(payload, slideName, epoch) {
     if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
     resetAiTrace();
-    appendStatusRow(els.aiTrace, "info", "对话历史过长，正在刷新到最新状态…");
+    appendStatusRow(els.aiTrace, "info", t("ai.history.long.refresh"));
     if (!aiSessionId) {
-      toast("对话历史过长，已刷新到最新状态", "info");
+      toast(t("ai.history.long.done"), "info");
       return;
     }
     var sid = aiSessionId;
@@ -4213,23 +4226,23 @@
       .then(function (data) {
         if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
         var s = data && data.session;
-        var t = data && data.transcript;
+        var tx = data && data.transcript;
         resetAiTrace();  // 清掉刷新期间追加的 live 行，以全量 transcript 为准
-        if (t && t.length) {
-          renderAiTranscript(t);
+        if (tx && tx.length) {
+          renderAiTranscript(tx);
         } else {
-          appendStatusRow(els.aiTrace, "info", "对话历史过长，已刷新到最新状态");
+          appendStatusRow(els.aiTrace, "info", t("ai.history.long.done"));
         }
         // event_reset 只发生在 main 流：推进 main 游标
         if (s && s.last_event_seq != null) {
           mainAiCtx.lastSeq = Math.max(mainAiCtx.lastSeq || 0, Number(s.last_event_seq) || 0);
         }
-        toast("已刷新到最新状态", "success");
+        toast(t("ai.refreshed"), "success");
       })
       .catch(function () {
         if (slideName != null && epoch != null && !isCurrentAiSlide(slideName, epoch)) return;
-        appendStatusRow(els.aiTrace, "info", "对话历史过长，已刷新到最新状态");
-        toast("对话历史过长，已刷新到最新状态", "info");
+        appendStatusRow(els.aiTrace, "info", t("ai.history.long.done.trace"));
+        toast(t("ai.history.long.done"), "info");
       });
   }
 
@@ -4281,9 +4294,9 @@
             if (!tcOk) continue;
             var disp = args.disposition || "";
             appendReviewCard(
-              disp === "annotated" ? "已判读（已标注）"
-              : disp === "no_annotation" ? "已判读（无需标注）"
-              : "已判读",
+              disp === "annotated" ? t("ai.review.annotated")
+              : disp === "no_annotation" ? t("ai.review.no.anno")
+              : t("ai.review.done"),
               args.summary || "",
               disp === "no_annotation" ? (args.no_annotation_reason || "") : "",
               target);
@@ -4295,12 +4308,12 @@
           } else if (nm === "create_annotation") {
             if (!tcOk) continue;
             appendAnnotationCard({
-              label: args.label || "AI 建议",
+              label: args.label || t("ai.anno.default.label"),
               note: args.note || "",
               x: args.x, y: args.y, side_px: args.side_px,
             }, target, { showFork: false });
           } else if (nm === "snapshot") {
-            appendToolCall(target, "snapshot", "抓取当前视野");
+            appendToolCall(target, "snapshot", t("ai.tool.snapshot"));
           } else if (nm === "finish") {
             // finish 总结已在 assistant 文本 / 状态行
           } else {
@@ -4358,7 +4371,7 @@
       for (var i = 0; i < c.length; i++) {
         var p = c[i] || {};
         if (p.type === "text" && p.text) out.push(p.text);
-        else if (p.type === "image_ref" || p.type === "image_url") out.push("（图像）");
+        else if (p.type === "image_ref" || p.type === "image_url") out.push(t("ai.image.ref"));
       }
       return out.join(" ");
     }
@@ -4393,21 +4406,21 @@
   }
 
   function inlineMarkdown(s) {
-    var t = escHtml(s);
+    var md = escHtml(s);
     // code 先占位，避免内部 * _ 被二次处理
     var codes = [];
-    t = t.replace(/`([^`]+)`/g, function (_, code) {
+    md = md.replace(/`([^`]+)`/g, function (_, code) {
       codes.push("<code>" + code + "</code>");
       return "\u0000C" + (codes.length - 1) + "\u0000";
     });
-    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    md = md.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-    t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    t = t.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
-    t = t.replace(/__([^_]+)__/g, "<strong>$1</strong>");
-    t = t.replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1<em>$2</em>");
-    t = t.replace(/\u0000C(\d+)\u0000/g, function (_, i) { return codes[Number(i)] || ""; });
-    return t;
+    md = md.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    md = md.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+    md = md.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    md = md.replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1<em>$2</em>");
+    md = md.replace(/\u0000C(\d+)\u0000/g, function (_, i) { return codes[Number(i)] || ""; });
+    return md;
   }
 
   function renderMarkdown(src) {
@@ -4534,22 +4547,37 @@
       b.classList.add("read");
       var r = document.createElement("div");
       r.className = "ai-read-receipt";
-      r.textContent = fmtMsgTs(new Date()) + " 已读";
+      r.textContent = fmtMsgTs(new Date()) + " " + t("ai.bubble.read");
       if (b.nextSibling) container.insertBefore(r, b.nextSibling);
       else container.appendChild(r);
     }
   }
 
-  // iMessage 顶部时间分隔文案：今天→「周X HH:MM」，今年→「M月D日 周X HH:MM」，否则带年份
+  // iMessage 顶部时间分隔文案：按当前界面语言走 Intl 本地化
+  // 中文：周X HH:MM / M月D日 周X HH:MM / YYYY年M月D日 周X HH:MM
+  // 英文：EEE HH:MM / MMM d, EEE HH:MM / MMM d yyyy, EEE HH:MM
   function fmtMsgTs(d) {
-    var WD = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    var lang = (window.HP_I18N && window.HP_I18N.getLang()) || "zh";
+    var locale = lang === "zh" ? "zh-CN" : "en-US";
     var now = new Date();
     var hm = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
     var sameDay = d.toDateString() === now.toDateString();
-    if (sameDay) return WD[d.getDay()] + " " + hm;
-    var md = (d.getMonth() + 1) + "月" + d.getDate() + "日 " + WD[d.getDay()] + " " + hm;
-    if (d.getFullYear() === now.getFullYear()) return md;
-    return d.getFullYear() + "年" + md;
+    try {
+      var wd = new Intl.DateTimeFormat(locale, { weekday: "short" }).format(d);
+      if (sameDay) return wd + " " + hm;
+      if (d.getFullYear() === now.getFullYear()) {
+        var datePart = lang === "zh"
+          ? (d.getMonth() + 1) + "月" + d.getDate() + "日"
+          : new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(d);
+        return datePart + " " + wd + " " + hm;
+      }
+      var fullPart = lang === "zh"
+        ? d.getFullYear() + "年" + (d.getMonth() + 1) + "月" + d.getDate() + "日"
+        : new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", year: "numeric" }).format(d);
+      return fullPart + " " + wd + " " + hm;
+    } catch (e) {
+      return d.toLocaleString();
+    }
   }
 
   // 会话区插入时间分隔行（ts 可为 epoch 秒/毫秒或 Date）
@@ -4631,13 +4659,13 @@
 
   function toolCallLabel(name) {
     var map = {
-      goto: "Used goto",
-      snapshot: "Used snapshot",
-      result: "Tool result",
-      context: "Context update",
-      compact: "Compacted context",
+      goto: "tool.goto",
+      snapshot: "tool.snapshot",
+      result: "tool.result",
+      context: "tool.context",
+      compact: "tool.compact",
     };
-    return map[name] || ("Used " + (name || "tool"));
+    return t(map[name] || "tool.fallback", { n: (name || "tool") });
   }
 
   // 兼容旧调用
@@ -4661,7 +4689,7 @@
     if (!el || !bbox || bbox.x == null || !bbox.w) return;
     el.dataset.bbox = JSON.stringify(bbox);
     el.style.cursor = "pointer";
-    el.title = "点击跳转到该区域";
+    el.title = t("ai.attach.jump.title");
     el.addEventListener("click", function () {
       try {
         var bb = JSON.parse(el.dataset.bbox || "{}");
@@ -4681,8 +4709,8 @@
     card.className = "ai-attach snapshot";
     var title = document.createElement("div");
     title.className = "ai-attach-title";
-    title.textContent = "快照" + (opts.magnification != null && opts.magnification !== ""
-      ? " · " + fmtAiMag(opts.magnification) : "") + " · 点击跳转";
+    title.textContent = t("ai.snapshot.title") + (opts.magnification != null && opts.magnification !== ""
+      ? " · " + fmtAiMag(opts.magnification) : "") + t("ai.snapshot.jump");
     card.appendChild(title);
     bindSnapshotJump(card, opts.bbox || {});
     container.appendChild(card);
@@ -4698,7 +4726,7 @@
     card.className = "ai-attach observation";
     var title = document.createElement("div");
     title.className = "ai-attach-title";
-    title.textContent = p.label || "观察";
+    title.textContent = p.label || t("ai.observation.default");
     card.appendChild(title);
     if (p.note) {
       var body = document.createElement("div");
@@ -4710,7 +4738,7 @@
     if (reason && String(reason).trim()) {
       var sub = document.createElement("div");
       sub.className = "ai-attach-sub";
-      sub.textContent = "未落标注：" + reason;
+      sub.textContent = t("ai.observation.no.anno", { s: reason });
       card.appendChild(sub);
     }
     target.appendChild(card);
@@ -4737,7 +4765,7 @@
     if (reason && String(reason).trim()) {
       var sub = document.createElement("div");
       sub.className = "ai-attach-sub";
-      sub.textContent = "原因：" + reason;
+      sub.textContent = t("ai.observation.reason", { s: reason });
       card.appendChild(sub);
     }
     target.appendChild(card);
@@ -4754,7 +4782,7 @@
     card.className = "ai-attach annotation";
     var title = document.createElement("div");
     title.className = "ai-attach-title";
-    title.textContent = p.label || "AI 建议";
+    title.textContent = p.label || t("ai.anno.default.label");
     card.appendChild(title);
     var parts = [];
     if (p.note) parts.push(p.note);
@@ -4791,15 +4819,16 @@
   // 把 tool 结果文本里的内部细节（snapshot_id / tool_call_id / pending 措辞）
   // 转成用户可读，避免暴露 call_xxx / toolu_xxx 这类内部 id（任务1：守卫信息可读化）。
   function friendlyToolResult(text) {
-    var t = String(text || "");
+    var rt = String(text || "");
     // OpenAI call_* / Anthropic toolu_* → 抽象成"该操作未关联到当前快照"
-    if (/(?:call_|toolu_)[A-Za-z0-9_-]{4,}/.test(t) && /snapshot_id|pending|必须引用|不匹配/.test(t)) {
-      return "该观察未关联到当前快照，已忽略（请先抓取并消化快照）";
+    // 注：正则里的中文来自 AI 模型产出文本（保留原文，不进 i18n）
+    if (/(?:call_|toolu_)[A-Za-z0-9_-]{4,}/.test(rt) && /snapshot_id|pending|必须引用|不匹配/.test(rt)) {
+      return t("tool.unlinked");
     }
     // 仅暴露 snapshot_id 的行也折叠（覆盖 call_ / toolu_）
-    t = t.replace(/snapshot_id[（(]?\s*[:：]?\s*(?:call_|toolu_)[A-Za-z0-9_-]+[)）]?/gi, "");
-    t = t.replace(/(?:call_|toolu_)[A-Za-z0-9_-]{4,}/g, "");
-    return truncateStr(t.trim(), 200);
+    rt = rt.replace(/snapshot_id[（(]?\s*[:：]?\s*(?:call_|toolu_)[A-Za-z0-9_-]+[)）]?/gi, "");
+    rt = rt.replace(/(?:call_|toolu_)[A-Za-z0-9_-]{4,}/g, "");
+    return truncateStr(rt.trim(), 200);
   }
 
   function truncateStr(s, n) {
@@ -4825,7 +4854,7 @@
     row.textContent = text;
     if (cls === "snapshot") {
       row.style.cursor = "pointer";
-      row.title = "点击跳转到该区域";
+      row.title = t("ai.attach.jump.title");
       row.addEventListener("click", function () {
         try {
           var bb = JSON.parse(row.dataset.bbox || "{}");
@@ -4857,7 +4886,7 @@
     var btn = document.createElement("button");
     btn.className = "ai-fork-btn";
     btn.textContent = "💬";
-    btn.title = "就此标注提问";
+    btn.title = t("ai.fork.btn.title");
     btn.addEventListener("click", function (e) {
       e.stopPropagation();
       openForkChat(annotationId, row);
@@ -4879,7 +4908,7 @@
     wrap.className = "fork-chat";
     var head = document.createElement("div");
     head.className = "fork-chat-head";
-    head.textContent = "💬 批注对话";
+    head.textContent = t("ai.fork.chat.head");
     var close = document.createElement("button");
     close.className = "icon-btn close";
     close.textContent = "×";
@@ -4887,15 +4916,15 @@
     head.appendChild(close);
     var stream = document.createElement("div");
     stream.className = "fork-chat-stream";
-    stream.innerHTML = '<div class="ai-trace-empty">就此标注提问…</div>';
+    stream.innerHTML = '<div class="ai-trace-empty">' + esc(t("ai.fork.stream.empty")) + "</div>";
     var inputRow = document.createElement("div");
     inputRow.className = "fork-chat-input";
     var input = document.createElement("input");
     input.type = "text";
-    input.placeholder = "问：这个区域是什么？";
+    input.placeholder = t("ai.fork.input.ph");
     var send = document.createElement("button");
     send.className = "btn primary small";
-    send.textContent = "发送";
+    send.textContent = t("ai.fork.send");
     send.addEventListener("click", function () {
       sendForkQuestion(annotationId, input.value, stream, wrap);
     });
@@ -4955,7 +4984,7 @@
       credentials: "same-origin",
     }).then(function (resp) {
       if (resp.status === 410) {
-        appendStatusRow(streamEl, "error", "该标注已删除，对话已归档（只读）");
+        appendStatusRow(streamEl, "error", t("ai.fork.deleted"));
         if (wrapEl) wrapEl.classList.add("fork-readonly");
         throw new Error("gone");
       }
@@ -4966,7 +4995,7 @@
       return pumpForkSse(resp.body.getReader(), streamEl, wrapEl);
     }).catch(function (e) {
       if (e && e.message === "gone") return;
-      appendStatusRow(streamEl, "error", "发送失败: " + (e && e.message ? e.message : e));
+      appendStatusRow(streamEl, "error", t("ai.fork.send.fail", { e: (e && e.message ? e.message : e) }));
     });
   }
 
@@ -5060,7 +5089,7 @@
     clearAiEmpty(target);
     ctx.thinkingEl = document.createElement("div");
     ctx.thinkingEl.className = "ai-chat-thinking";
-    ctx.thinkingEl.setAttribute("aria-label", "思考中…");
+    ctx.thinkingEl.setAttribute("aria-label", t("ai.thinking.aria"));
     for (var i = 0; i < 3; i++) {
       var dot = document.createElement("span");
       dot.className = "dot";
@@ -5100,4 +5129,30 @@
   } else {
     init();
   }
+
+  // 语言切换：重渲染当前可见的动态面板（动态文本走 t()，重渲染即换语言）。
+  // 静态 [data-i18n] 节点由 i18n.js 的 applyLang 直接刷新，这里只处理 JS 渲染的部分。
+  document.addEventListener("hp-lang-change", function () {
+    try {
+      // 项目 / 未归类 / 分享列表（只要数据已加载就重渲）
+      if (allProjects && allProjects.length >= 0) renderProjects(allProjects);
+      renderUnfiled();
+      if (allSharesCache) renderShareList(allSharesCache);
+    } catch (e) {}
+    try {
+      // 标注面板（打开时才重渲）
+      if (annoPanelOpen && currentAnnotations) {
+        renderAnnoPanel(currentAnnotations.annotations || []);
+      }
+    } catch (e) {}
+    try {
+      // AI 配置摘要 / 会话切换器（已配置时重渲）
+      if (aiConfig) {
+        if (typeof renderAiConfigState === "function") renderAiConfigState();
+        if (aiSessionListCache && typeof renderAiSessionOptions === "function") {
+          renderAiSessionOptions(aiSessionListCache, !!aiConfig);
+        }
+      }
+    } catch (e) {}
+  });
 })();

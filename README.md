@@ -1,15 +1,22 @@
-# SVS Viewer · 病理切片查看与分享平台
+# HistoPilot · 病理切片智能导航
 
 [English](#english) | [中文](#中文)
 
-一个自托管的全切片病理图像（WSI）查看器：在内网以"项目"管理 SVS/TIFF 等切片，
-框选固定物理尺寸（6×6mm / 6.5×6.5mm）的 ROI 并导出全分辨率截图，
-还能生成**限时、只读**的 HTTPS 分享链接发给外部用户；外部用户署名标注 ROI，
-标注实时回传内网供管理员查看。
+**HistoPilot** 是一个**早期实验项目（early-stage demo）**，探索 agent 在大型病理切片（WSI）上的
+**自主导航**问题：goto 跳转、渐进变倍、坐标语义理解。在导航之外，附带一套简易的
+**读片 / 阅片 / 分享**功能——WSI 查看（OpenSeadragon）、固定物理尺寸 ROI 框选与导出、
+限时只读分享、AI 读片助手（pi sidecar，lite/branch 分级会话）与批注对话。
 
-A self-hosted whole-slide pathology image viewer with project-based slide management,
-physical-size ROI selection (6mm / 6.5mm) and full-resolution export, plus time-limited,
-view-only share links with named ROI annotations that flow back to admins.
+> 注：容器镜像名、内部路径与仓库名仍为 `svs-viewer`（沿用既有部署，未改）。
+
+**HistoPilot** is an **early-stage demo** exploring **autonomous agent navigation** over
+whole-slide pathology images (WSI): goto jumps, progressive zoom, and coordinate semantics.
+Alongside navigation it ships a lightweight **reading / review / sharing** layer — WSI viewing
+(OpenSeadragon), fixed physical-size ROI boxing & export, time-limited view-only shares, an AI
+reading assistant (pi sidecar, lite/branch graded sessions), and fork chats.
+
+> Note: the container image name, internal paths and repo name remain `svs-viewer` (existing
+> deployment, unchanged).
 
 ![share page](docs/screenshot-share.jpg)
 

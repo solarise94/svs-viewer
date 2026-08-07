@@ -3,21 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>病理切片查看</title>
-  <link rel="stylesheet" href="/static/share.css?v=20260801c" />
+  <title>HistoPilot · Pathology Slide Viewer</title>
+  <link rel="stylesheet" href="/static/share.css?v=20260807i18n2" />
+  <!-- 中英双语切换（必须在 share.js 之前加载） -->
+  <script src="/static/i18n.js?v=20260807i18n2"></script>
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
 <body>
   <!-- 无效 token 遮罩 -->
   <div id="invalid-mask" class="invalid-mask" style="display:none;">
-    <div class="invalid-text">链接无效或已过期</div>
+    <div class="invalid-text" data-i18n="share.invalid">链接无效或已过期</div>
   </div>
 
   <!-- 顶栏：macOS unified titlebar（白/微透明 + blur） -->
   <header id="app-header">
-    <span class="header-title">病理切片查看</span>
-    <span id="current-slide" class="header-current">加载中…</span>
+    <span class="header-title" data-i18n="share.title">病理切片查看</span>
+    <span id="current-slide" class="header-current" data-i18n="header.loading">加载中…</span>
+    <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
   </header>
 
   <!-- 切片切换栏（多张时显示）：横向滚动圆角 pill -->
@@ -28,40 +31,40 @@
     <!-- 第一行（桌面＝原第一行；移动端＝底部主栏） -->
     <div class="tb-row tb-main">
       <div class="btn-group">
-        <button id="zoom-out" class="icon-btn" title="缩小" aria-label="缩小">−</button>
-        <button id="zoom-in" class="icon-btn" title="放大" aria-label="放大">+</button>
+        <button id="zoom-out" class="icon-btn" data-i18n-title="tb.zoom.out" aria-label="缩小" data-i18n-aria="tb.zoom.out">−</button>
+        <button id="zoom-in" class="icon-btn" data-i18n-title="tb.zoom.in" aria-label="放大" data-i18n-aria="tb.zoom.in">+</button>
       </div>
 
       <!-- 视图变换：旋转/镜像/复位 —— 常驻主栏（桌面内联、移动端底栏直接可达） -->
       <div class="btn-group view-tools">
-        <button id="rotate-btn" class="icon-btn" title="顺时针旋转 90°" aria-label="旋转">↻</button>
-        <button id="flip-btn" class="icon-btn" title="水平翻转（镜像）" aria-label="镜像">⇋</button>
-        <button id="reset-btn" class="tool-btn" title="复位">Reset</button>
+        <button id="rotate-btn" class="icon-btn" data-i18n-title="tb.rotate" aria-label="旋转" data-i18n-aria="tb.rotate">↻</button>
+        <button id="flip-btn" class="icon-btn" data-i18n-title="tb.flip" aria-label="镜像" data-i18n-aria="tb.flip">⇋</button>
+        <button id="reset-btn" class="tool-btn" data-i18n-title="tb.reset" data-i18n="tb.reset.label">Reset</button>
       </div>
 
       <!-- ROI 分段控件（macOS 分段样式；仅桌面端显示） -->
-      <div class="seg-control roi-group" role="group" aria-label="ROI 分段">
+      <div class="seg-control roi-group" role="group" aria-label="ROI 分段" data-i18n-aria="tb.roi.group">
         <button id="roi-6" class="seg roi-btn" data-size="6">6mm</button>
         <button id="roi-6-5" class="seg roi-btn" data-size="6.5">6.5mm</button>
       </div>
       <!-- 移动端 ROI 滑块分段（桌面隐藏）：滑动拇指 + 点选切换尺寸，再点退出 -->
-      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸">
+      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸" data-i18n-aria="tb.roi.mark.group">
         <span class="roi-slider-thumb" aria-hidden="true"></span>
-        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记">6</button>
-        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记">6.5</button>
+        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记" data-i18n-title="tb.roi.mark.6">6</button>
+        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记" data-i18n-title="tb.roi.mark.6.5">6.5</button>
       </div>
 
       <!-- 标注绘制工具 -->
       <div class="btn-group anno-tools">
-        <button id="anno-arrow-btn" class="tool-btn" title="绘制箭头标注">↗</button>
-        <button id="anno-free-btn" class="tool-btn" title="绘制描图标注">〰</button>
+        <button id="anno-arrow-btn" class="tool-btn" data-i18n-title="tb.anno.arrow.title">↗</button>
+        <button id="anno-free-btn" class="tool-btn" data-i18n-title="tb.anno.free.title">〰</button>
       </div>
 
       <!-- 标记：打开选区面板 -->
-      <button id="roi-panel-toggle" class="tool-btn">标记</button>
+      <button id="roi-panel-toggle" class="tool-btn" data-i18n="tb.anno.open">标记</button>
 
       <!-- 显示/隐藏全部标记：移动端已并入选区面板头部；桌面端在此内联保留 -->
-      <button id="anno-all-btn" class="tool-btn active" title="显示/隐藏标记">标记</button>
+      <button id="anno-all-btn" class="tool-btn active" data-i18n-title="share.roi.panel.toggle.title" data-i18n="share.roi.panel.toggle">标记</button>
 
       <div class="spacer"></div>
       <span id="zoom-badge" class="zoom-badge">—</span>
@@ -72,19 +75,18 @@
       <!-- 上下文动作条：桌面 display:contents（内联到第二行）；移动端仅在 ROI/绘制激活时显示 -->
       <div class="tbb-context" id="tbb-context">
         <input id="roi-label" type="text" maxlength="40"
-               class="roi-label-input" placeholder="标记人/标签（如 张三 / 病理号）"
-               title="保存选区前请填写标记人或标签" autocomplete="off" />
+               class="roi-label-input" data-i18n-ph="share.roi.label.ph" data-i18n-title="share.roi.label.title"
+               placeholder="标记人/标签（如 张三 / 病理号）" autocomplete="off" />
         <input id="roi-note" type="text" maxlength="500"
-               class="roi-note-input" placeholder="备注（可选，气泡显示）"
-               title="保存选区时的备注，以气泡形式显示在标记旁"
-               autocomplete="off" />
-        <button id="save-roi-btn" class="tool-btn primary" disabled>保存选区</button>
-        <button id="export-btn" class="tool-btn secondary" disabled>导出图片</button>
+               class="roi-note-input" data-i18n-ph="share.roi.note.ph" data-i18n-title="share.roi.note.title"
+               placeholder="备注（可选，气泡显示）" autocomplete="off" />
+        <button id="save-roi-btn" class="tool-btn primary" disabled data-i18n="share.save.roi">保存选区</button>
+        <button id="export-btn" class="tool-btn secondary" disabled data-i18n="share.export">导出图片</button>
         <!-- mpp 手动设置区（仅 mpp 缺失/估算时由 JS 显示）：⋯ 移除后改置于此，
              桌面内联、移动端随上下文条出现 -->
         <div id="mpp-setter" class="mpp-setter" style="display:none;">
-          <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
-          <button id="mpp-set-btn" class="tool-btn">设置</button>
+          <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" data-i18n-ph="tb.mpp.ph" data-i18n-title="tb.mpp.title" />
+          <button id="mpp-set-btn" class="tool-btn" data-i18n="tb.mpp.set">设置</button>
         </div>
       </div>
     </div>
@@ -102,16 +104,16 @@
   <div id="roi-panel" class="roi-panel" style="display:none;">
     <div class="roi-panel-handle"></div>
     <div class="roi-panel-header">
-      <span>已保存选区</span>
+      <span data-i18n="share.roi.panel.title">已保存选区</span>
       <div class="roi-panel-header-actions">
         <!-- 显示/隐藏全部标记：与 state.showAnno 联动（active = 显示全部） -->
-        <button id="anno-all-toggle" class="panel-eye-btn active" title="显示/隐藏全部标记" aria-label="显示/隐藏全部标记" aria-pressed="true">👁</button>
-        <button id="roi-panel-close" class="roi-panel-close" aria-label="关闭">×</button>
+        <button id="anno-all-toggle" class="panel-eye-btn active" data-i18n-title="share.roi.panel.toggle.title" aria-label="显示/隐藏全部标记" aria-pressed="true">👁</button>
+        <button id="roi-panel-close" class="roi-panel-close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
       </div>
     </div>
     <div id="roi-panel-edit" class="roi-panel-edit" style="display:none;"></div>
     <div id="roi-panel-list" class="roi-panel-list">
-      <div class="roi-panel-empty">暂无选区</div>
+      <div class="roi-panel-empty" data-i18n="share.roi.panel.empty">暂无选区</div>
     </div>
   </div>
 
@@ -121,6 +123,6 @@
   <script>
     window.__SHARE_TOKEN__ = "{{ token }}";
   </script>
-  <script src="/static/share.js?v=20260801c"></script>
+  <script src="/static/share.js?v=20260807i18n2"></script>
 </body>
 </html>

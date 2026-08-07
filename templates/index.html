@@ -3,79 +3,85 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260807branch" />
+  <title>HistoPilot</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260807i18n2" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
+  <!-- 中英双语切换（必须在 app.js 之前加载，提供 window.HP_I18N） -->
+  <script src="/static/i18n.js?v=20260807i18n2"></script>
 </head>
 <body>
   <!-- 统一标题栏 + 工具栏（macOS unified titlebar-toolbar） -->
   <header id="app-header">
     <!-- 菜单按钮：仅手机端显示，打开侧栏抽屉 -->
-    <button id="menu-btn" class="icon-btn menu-btn" aria-label="菜单">☰</button>
+    <button id="menu-btn" class="icon-btn menu-btn" aria-label="菜单" data-i18n-title="tb.menu">☰</button>
     <div class="title-group">
-      <span class="header-title">SVS 病理图像查看器</span>
+      <span class="header-title" data-i18n="app.title">HistoPilot</span>
       <span class="title-sep">·</span>
-      <span id="current-slide" class="header-current">未打开切片</span>
+      <span class="header-subtitle" data-i18n="app.subtitle">病理切片智能导航</span>
+      <span class="title-sep">·</span>
+      <span id="current-slide" class="header-current" data-i18n="header.no.slide">未打开切片</span>
     </div>
     <!-- 移动端缩放徽章：顶部栏右侧（底部 ⋯ 不再放倍率） -->
     <span id="header-zoom-badge" class="zoom-badge header-zoom-badge">—</span>
+    <!-- 中英双语切换按钮 -->
+    <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
 
     <div id="toolbar">
       <!-- 缩放 -->
       <div class="btn-group">
-        <button id="zoom-out" class="icon-btn" title="缩小" aria-label="缩小">−</button>
-        <button id="zoom-in" class="icon-btn" title="放大" aria-label="放大">+</button>
+        <button id="zoom-out" class="icon-btn" data-i18n-title="tb.zoom.out" aria-label="缩小" data-i18n-aria="tb.zoom.out">−</button>
+        <button id="zoom-in" class="icon-btn" data-i18n-title="tb.zoom.in" aria-label="放大" data-i18n-aria="tb.zoom.in">+</button>
       </div>
 
       <!-- 视图变换：旋转/镜像/复位 —— 常驻主栏（桌面内联、移动端底栏直接可达） -->
       <div class="btn-group view-tools">
-        <button id="rotate-btn" class="icon-btn" title="顺时针旋转 90°" aria-label="旋转">↻</button>
-        <button id="flip-btn" class="icon-btn" title="水平翻转（镜像）" aria-label="镜像">⇋</button>
-        <button id="reset-btn" class="tool-btn" title="复位">Reset</button>
+        <button id="rotate-btn" class="icon-btn" data-i18n-title="tb.rotate" aria-label="旋转">↻</button>
+        <button id="flip-btn" class="icon-btn" data-i18n-title="tb.flip" aria-label="镜像">⇋</button>
+        <button id="reset-btn" class="tool-btn" data-i18n-title="tb.reset" data-i18n="tb.reset.label">Reset</button>
       </div>
 
       <!-- ROI 分段控件（NSSegmentedControl 风格；仅桌面端显示） -->
-      <div class="seg-control roi-group" role="group" aria-label="ROI 分段">
+      <div class="seg-control roi-group" role="group" aria-label="ROI 分段" data-i18n-aria="tb.roi.group">
         <button id="roi-6" class="seg roi-btn" data-size="6"><span class="tb-txt">ROI </span>6mm</button>
         <button id="roi-6-5" class="seg roi-btn" data-size="6.5"><span class="tb-txt">ROI </span>6.5mm</button>
       </div>
       <!-- 移动端 ROI 滑块分段（桌面隐藏）：滑动拇指 + 点选切换尺寸，再点退出 -->
-      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸">
+      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸" data-i18n-aria="tb.roi.mark.group">
         <span class="roi-slider-thumb" aria-hidden="true"></span>
-        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记">6</button>
-        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记">6.5</button>
+        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记" data-i18n-title="tb.roi.mark.6">6</button>
+        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记" data-i18n-title="tb.roi.mark.6.5">6.5</button>
       </div>
 
       <!-- 标注绘制工具：箭头 / 描图（与 ROI 模式互斥） -->
       <div class="btn-group anno-tools">
-        <button id="anno-arrow-btn" class="tool-btn" title="绘制箭头标注" disabled>↗<span class="tb-txt"> 箭头</span></button>
-        <button id="anno-free-btn" class="tool-btn" title="绘制描图标注" disabled>〰<span class="tb-txt"> 描图</span></button>
+        <button id="anno-arrow-btn" class="tool-btn" data-i18n-title="tb.anno.arrow.title" disabled><span aria-hidden="true">↗</span><span class="tb-txt" data-i18n="tb.anno.arrow"> 箭头</span></button>
+        <button id="anno-free-btn" class="tool-btn" data-i18n-title="tb.anno.free.title" disabled><span aria-hidden="true">〰</span><span class="tb-txt" data-i18n="tb.anno.free"> 描图</span></button>
       </div>
 
       <!-- 标记：打开当前切片标注面板 -->
-      <button id="anno-btn" class="tool-btn" disabled>标记</button>
+      <button id="anno-btn" class="tool-btn" data-i18n="tb.anno.open" disabled>标记</button>
 
       <!-- AI 读片助手（仅管理员，打开后 enable） -->
-      <button id="ai-btn" class="tool-btn ai-btn" disabled title="AI 读片助手（管理员）">✨ AI</button>
+      <button id="ai-btn" class="tool-btn ai-btn" data-i18n-title="tb.ai.title" disabled title="AI 读片助手（管理员）"><span data-i18n="tb.ai">✨ AI</span></button>
 
       <!-- 显示全部标记：移动端已并入标注面板头部；桌面端在此内联保留 -->
-      <button id="anno-all-btn" class="tool-btn" disabled>显示全部标记</button>
+      <button id="anno-all-btn" class="tool-btn" data-i18n="tb.anno.show.all" disabled>显示全部标记</button>
 
       <!-- 上下文动作条：桌面 display:contents（内联）；移动端仅在 ROI/绘制激活时显示 -->
       <div class="tbb-context" id="tbb-context">
         <!-- 标注人（管理员标注用，默认"管理员"） -->
         <input id="anno-label-input" type="text" maxlength="40"
-               class="anno-label-input" placeholder="默认 管理员"
-               title="标注人（留空则用「管理员」）" autocomplete="off" />
+               class="anno-label-input" data-i18n-ph="tb.anno.label.ph" data-i18n-title="tb.anno.label.title"
+               placeholder="默认 管理员" autocomplete="off" />
         <!-- 保存当前矩形选区为标注（仅 ROI 模式可用，与「保存图片」区分） -->
-        <button id="save-anno-btn" class="tool-btn anno-save" disabled title="把当前矩形选区保存为标注">保存标记</button>
+        <button id="save-anno-btn" class="tool-btn anno-save" data-i18n-title="tb.save.anno.title" data-i18n="tb.save.anno" disabled>保存标记</button>
         <!-- 主操作 -->
-        <button id="save-btn" class="tool-btn primary" disabled>保存图片</button>
+        <button id="save-btn" class="tool-btn primary" data-i18n="tb.save.img" disabled>保存图片</button>
         <!-- mpp 手动设置区（仅 mpp 缺失/估算时由 JS 显示）：⋯ 移除后改置于此 -->
         <div id="mpp-setter" class="mpp-setter" style="display:none;">
-          <input id="mpp-input" type="number" step="0.01" min="0.01" placeholder="mpp" title="手动输入 µm/px" />
-          <button id="mpp-set-btn" class="tool-btn">设置</button>
+          <input id="mpp-input" type="number" step="0.01" min="0.01" data-i18n-ph="tb.mpp.ph" data-i18n-title="tb.mpp.title" placeholder="mpp" />
+          <button id="mpp-set-btn" class="tool-btn" data-i18n="tb.mpp.set">设置</button>
         </div>
       </div>
 
@@ -84,9 +90,9 @@
       <span id="zoom-badge" class="zoom-badge">—</span>
 
       <!-- ⋯ 溢出（仅移动端显示）：装 AI 读片助手 + 缩放徽章，避免挤爆底栏 -->
-      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多">⋯</button>
+      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多" data-i18n-title="tb.more">⋯</button>
       <div id="tbb-more" class="tbb-more" role="menu">
-        <button id="tbb-more-ai" class="tool-btn" title="AI 读片助手（管理员）">✨ AI 读片</button>
+        <button id="tbb-more-ai" class="tool-btn" data-i18n-title="tb.ai.title" data-i18n="tb.ai.more">✨ AI 读片</button>
       </div>
     </div>
   </header>
@@ -98,8 +104,8 @@
     <!-- 左侧边栏：Finder 源列表风 -->
     <aside id="sidebar">
       <div class="sidebar-top">
-        <button id="upload-btn" class="btn primary block">上传切片</button>
-        <button id="new-project-btn" class="btn secondary block">＋ 新建项目</button>
+        <button id="upload-btn" class="btn primary block" data-i18n="sb.upload">上传切片</button>
+        <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
         <input id="file-input" type="file"
                accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide,.zip"
                hidden />
@@ -110,18 +116,18 @@
 
         <!-- 内联新建项目表单 -->
         <div id="new-project-form" class="new-project-form" style="display:none;">
-          <input id="np-name" type="text" maxlength="60" placeholder="项目名称" autocomplete="off" />
-          <input id="np-note" type="text" maxlength="200" placeholder="备注（可选）" autocomplete="off" />
+          <input id="np-name" type="text" maxlength="60" data-i18n-ph="sb.np.name.ph" placeholder="项目名称" autocomplete="off" />
+          <input id="np-note" type="text" maxlength="200" data-i18n-ph="sb.np.note.ph" placeholder="备注（可选）" autocomplete="off" />
           <div class="np-actions">
-            <button id="np-confirm" class="btn primary small">确认</button>
-            <button id="np-cancel" class="btn secondary small">取消</button>
+            <button id="np-confirm" class="btn primary small" data-i18n="sb.np.confirm">确认</button>
+            <button id="np-cancel" class="btn secondary small" data-i18n="sb.np.cancel">取消</button>
           </div>
         </div>
       </div>
 
       <div class="sidebar-scroll">
         <!-- 分区：项目 -->
-        <div class="section-head">项目</div>
+        <div class="section-head" data-i18n="sb.section.projects">项目</div>
         <!-- 项目列表 -->
         <div id="project-list" class="project-list">
           <!-- 由 JS 动态渲染 -->
@@ -131,14 +137,14 @@
         <div id="unfiled-section" class="section">
           <div class="section-head row" id="unfiled-toggle">
             <span class="caret">▾</span>
-            <span class="section-title">未归类切片</span>
+            <span class="section-title" data-i18n="sb.section.unfiled">未归类切片</span>
             <span id="unfiled-count" class="count-badge">0</span>
           </div>
           <div id="unfiled-body" class="section-body">
             <div id="unfiled-list" class="unfiled-list"></div>
             <div class="unfiled-ops">
-              <button id="unfiled-new-project" class="btn secondary small">新建项目(含选中)</button>
-              <button id="unfiled-share" class="btn primary small">分享选中</button>
+              <button id="unfiled-new-project" class="btn secondary small" data-i18n="sb.unfiled.new.project">新建项目(含选中)</button>
+              <button id="unfiled-share" class="btn primary small" data-i18n="sb.unfiled.share">分享选中</button>
             </div>
           </div>
         </div>
@@ -147,32 +153,32 @@
         <div class="section">
           <div class="section-head row" id="share-mgr-toggle">
             <span class="caret">▾</span>
-            <span class="section-title">分享管理</span>
+            <span class="section-title" data-i18n="sb.section.share">分享管理</span>
           </div>
           <!-- 创建分享控件 -->
           <div id="share-mgr-body" class="section-body">
             <div class="share-row">
               <select id="share-expires-select" class="select">
-                <option value="6">6 小时</option>
-                <option value="24" selected>24 小时</option>
-                <option value="72">3 天</option>
-                <option value="168">7 天</option>
-                <option value="custom">自定义</option>
+                <option value="6" data-i18n="sb.share.expires.6">6 小时</option>
+                <option value="24" selected data-i18n="sb.share.expires.24">24 小时</option>
+                <option value="72" data-i18n="sb.share.expires.72">3 天</option>
+                <option value="168" data-i18n="sb.share.expires.168">7 天</option>
+                <option value="custom" data-i18n="sb.share.expires.custom">自定义</option>
               </select>
               <input id="share-expires-custom" class="input" type="number"
-                     min="0.1" max="720" step="0.1" placeholder="小时" style="display:none;" />
-              <select id="share-roi-size-select" class="select" title="矩形标记可选尺寸">
-                <option value="both" selected>标记：两者</option>
-                <option value="6">仅 6mm</option>
-                <option value="6.5">仅 6.5mm</option>
+                     min="0.1" max="720" step="0.1" data-i18n-ph="sb.share.hours.ph" placeholder="小时" style="display:none;" />
+              <select id="share-roi-size-select" class="select" data-i18n-title="sb.share.roi.title" title="矩形标记可选尺寸">
+                <option value="both" selected data-i18n="sb.share.roi.both">标记：两者</option>
+                <option value="6" data-i18n="sb.share.roi.6">仅 6mm</option>
+                <option value="6.5" data-i18n="sb.share.roi.6.5">仅 6.5mm</option>
               </select>
             </div>
-            <button id="share-create-btn" class="btn primary block">分享选中切片</button>
+            <button id="share-create-btn" class="btn primary block" data-i18n="sb.share.create">分享选中切片</button>
 
             <!-- 创建结果 -->
             <div id="share-result" class="share-result" style="display:none;">
               <input id="share-result-url" class="share-result-url" readonly />
-              <button id="share-result-copy" class="btn primary small">复制</button>
+              <button id="share-result-copy" class="btn primary small" data-i18n="sb.share.copy">复制</button>
             </div>
 
             <!-- 分享列表 -->
@@ -182,7 +188,7 @@
       </div>
 
       <div class="sidebar-bottom">
-        <a id="logout-btn" class="logout-link" href="/logout" hidden>退出登录</a>
+        <a id="logout-btn" class="logout-link" href="/logout" data-i18n="toast.logout" hidden>退出登录</a>
       </div>
     </aside>
 
@@ -193,20 +199,20 @@
       <canvas id="anno-canvas" class="anno-canvas"></canvas>
       <!-- 拖拽上传提示遮罩 -->
       <div id="drop-overlay" class="drop-overlay">
-        <div class="drop-text">松开以上传切片</div>
+        <div class="drop-text" data-i18n="drop.text">松开以上传切片</div>
       </div>
 
       <!-- 切片选择浮层（添加切片到项目） -->
       <div id="slide-picker-mask" class="picker-mask" style="display:none;">
         <div class="picker-dialog">
           <div class="picker-title">
-            <span id="picker-title-text">添加切片到项目</span>
-            <button id="picker-close" class="icon-btn close" aria-label="关闭">×</button>
+            <span id="picker-title-text" data-i18n="picker.title">添加切片到项目</span>
+            <button id="picker-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
           </div>
           <div id="picker-list" class="picker-list"></div>
           <div class="picker-footer">
-            <span id="picker-selected-count" class="picker-count">已选 0</span>
-            <button id="picker-confirm" class="btn primary">确认添加</button>
+            <span id="picker-selected-count" class="picker-count" data-i18n="picker.selected" data-i18n-vars="n:0">已选 0</span>
+            <button id="picker-confirm" class="btn primary" data-i18n="picker.confirm">确认添加</button>
           </div>
         </div>
       </div>
@@ -214,110 +220,110 @@
       <!-- 标注面板（查看器右侧/底部） -->
       <div id="anno-panel" class="anno-panel" style="display:none;">
         <div class="anno-panel-header">
-          <span id="anno-panel-title">标注</span>
+          <span id="anno-panel-title" data-i18n="anno.panel.title">标注</span>
           <div class="anno-panel-header-actions">
             <!-- 显示/隐藏全部标记：与 state.showAnno 联动（active = 显示全部） -->
-            <button id="anno-all-toggle" class="panel-eye-btn" title="显示/隐藏全部标记" aria-label="显示/隐藏全部标记" aria-pressed="false">👁</button>
-            <button id="anno-panel-close" class="icon-btn close" aria-label="关闭">×</button>
+            <button id="anno-all-toggle" class="panel-eye-btn" data-i18n-title="anno.panel.toggle.title" title="显示/隐藏全部标记" aria-label="显示/隐藏全部标记" aria-pressed="false">👁</button>
+            <button id="anno-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
           </div>
         </div>
         <div id="anno-edit-wrap" class="anno-edit-wrap" style="display:none;"></div>
         <div id="anno-panel-list" class="anno-panel-list">
-          <div class="anno-panel-empty">暂无标注</div>
+          <div class="anno-panel-empty" data-i18n="anno.panel.empty">暂无标注</div>
         </div>
       </div>
 
       <!-- AI 读片助手面板（管理员） -->
       <div id="ai-panel" class="ai-panel" style="display:none;">
         <div class="ai-panel-header">
-          <span id="ai-panel-title">✨ AI 读片助手</span>
+          <span id="ai-panel-title" data-i18n="ai.panel.title">✨ AI 读片助手</span>
           <div class="ai-panel-header-actions">
-            <button id="ai-panel-close" class="icon-btn close" aria-label="关闭">×</button>
+            <button id="ai-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
           </div>
         </div>
 
         <!-- 1. 设置区（未配置时展开） -->
         <div id="ai-config-wrap" class="ai-config-wrap">
-          <div class="ai-config-title">AI 服务配置</div>
+          <div class="ai-config-title" data-i18n="ai.config.title">AI 服务配置</div>
           <label class="ai-field">
-            <span>Base URL</span>
+            <span data-i18n="ai.field.baseurl">Base URL</span>
             <input id="ai-base-url" type="text" placeholder="https://api.openai.com/v1"
                    autocomplete="off" />
           </label>
           <label class="ai-field">
-            <span>API Key</span>
+            <span data-i18n="ai.field.apikey">API Key</span>
             <input id="ai-api-key" type="password" placeholder="sk-..."
                    autocomplete="off" />
           </label>
           <label class="ai-field">
-            <span>模型</span>
+            <span data-i18n="ai.field.model">模型</span>
             <input id="ai-model" type="text" placeholder="gpt-4o"
                    autocomplete="off" />
           </label>
           <label class="ai-field">
-            <span>步数上限</span>
+            <span data-i18n="ai.field.maxsteps">步数上限</span>
             <input id="ai-max-steps" type="number" min="1" max="500" placeholder="50"
-                   title="单轮步数上限（到顶暂停可继续）" autocomplete="off" />
+                   data-i18n-title="ai.field.maxsteps.title" title="单轮步数上限（到顶暂停可继续）" autocomplete="off" />
           </label>
           <label class="ai-field">
-            <span>协议</span>
-            <select id="ai-api-protocol" title="openai 走 /chat/completions；anthropic 直连 /v1/messages">
-              <option value="openai">openai（兼容端点）</option>
-              <option value="anthropic">anthropic（直连）</option>
+            <span data-i18n="ai.field.protocol">协议</span>
+            <select id="ai-api-protocol" data-i18n-title="ai.protocol.title" title="openai 走 /chat/completions；anthropic 直连 /v1/messages">
+              <option value="openai" data-i18n="ai.protocol.openai">openai（兼容端点）</option>
+              <option value="anthropic" data-i18n="ai.protocol.anthropic">anthropic（直连）</option>
             </select>
           </label>
           <!-- 高级调优参数（折叠，§8.1，非必须） -->
           <details class="ai-advanced">
-            <summary>高级调优</summary>
-            <label class="ai-field"><span>上下文窗口 tokens</span>
+            <summary data-i18n="ai.advanced.summary">高级调优</summary>
+            <label class="ai-field"><span data-i18n="ai.advanced.ctx">上下文窗口 tokens</span>
               <input id="ai-ctx-window" type="number" min="10000" placeholder="272000" /></label>
-            <label class="ai-field"><span>摘要预留 tokens</span>
+            <label class="ai-field"><span data-i18n="ai.advanced.reserve">摘要预留 tokens</span>
               <input id="ai-reserve" type="number" min="0" placeholder="16000" /></label>
-            <label class="ai-field"><span>安全余量 tokens</span>
+            <label class="ai-field"><span data-i18n="ai.advanced.safety">安全余量 tokens</span>
               <input id="ai-safety-margin" type="number" min="0" placeholder="8192" /></label>
-            <label class="ai-field"><span>压缩后保留 tokens</span>
+            <label class="ai-field"><span data-i18n="ai.advanced.keep">压缩后保留 tokens</span>
               <input id="ai-keep-recent" type="number" min="1000" placeholder="20000" /></label>
-            <label class="ai-field"><span>批注活跃上限</span>
+            <label class="ai-field"><span data-i18n="ai.advanced.fork">批注活跃上限</span>
               <input id="ai-fork-limit" type="number" min="1" placeholder="20" /></label>
-            <label class="ai-field"><span>租约 TTL（秒）</span>
+            <label class="ai-field"><span data-i18n="ai.advanced.lease">租约 TTL（秒）</span>
               <input id="ai-lease-ttl" type="number" min="30" placeholder="150" /></label>
           </details>
           <div class="ai-config-actions">
-            <button id="ai-config-save" class="btn primary small">保存配置</button>
+            <button id="ai-config-save" class="btn primary small" data-i18n="ai.config.save">保存配置</button>
             <span id="ai-config-hint" class="ai-config-hint"></span>
           </div>
         </div>
         <!-- 已配置时折叠，留"重新配置"小链 -->
         <div id="ai-config-collapsed" class="ai-config-collapsed" style="display:none;">
           <span id="ai-config-summary" class="ai-config-summary"></span>
-          <button id="ai-reconfig-btn" class="link-btn">重新配置</button>
+          <button id="ai-reconfig-btn" class="link-btn" data-i18n="ai.reconfig">重新配置</button>
         </div>
 
         <!-- 会话切换器：列出本切片 main + branch 会话（fork 不进列表） -->
         <!-- 仅已配置时显示；切换活跃会话（main 走 run/continue/cancel，branch 走 resume/追问） -->
         <div id="ai-session-bar" class="ai-session-bar" style="display:none;">
-          <span class="ai-session-bar-label">会话</span>
-          <select id="ai-session-select" class="ai-session-select" title="切换本切片的主/分支会话"></select>
+          <span class="ai-session-bar-label" data-i18n="ai.session.label">会话</span>
+          <select id="ai-session-select" class="ai-session-select" data-i18n-title="ai.session.switch.title" title="切换本切片的主/分支会话"></select>
         </div>
 
         <!-- 对话区（实时 / 历史恢复 / fork 共用同一套气泡渲染） -->
         <div id="ai-trace" class="ai-trace">
-          <div class="ai-trace-empty">发条消息，AI 就开始读片。对话会显示在这里。</div>
+          <div class="ai-trace-empty" data-i18n="ai.trace.empty">发条消息，AI 就开始读片。对话会显示在这里。</div>
         </div>
 
         <!-- 底部输入（iMessage 输入栏） -->
         <div class="ai-composer">
           <div id="ai-composer-aux" class="ai-composer-aux" style="display:none;">
-            <button id="ai-continue-btn" class="btn small" style="display:none;">▶ 继续</button>
-            <button id="ai-fresh-btn" class="btn small" style="display:none;" title="归档旧对话开新，不影响标注与批注">🔄 新会话</button>
+            <button id="ai-continue-btn" class="btn small" style="display:none;" data-i18n="ai.continue">▶ 继续</button>
+            <button id="ai-fresh-btn" class="btn small" style="display:none;" data-i18n-title="ai.fresh.title" data-i18n="ai.fresh" title="归档旧对话开新，不影响标注与批注">🔄 新会话</button>
           </div>
           <div class="ai-composer-bar">
-            <button id="ai-task-jump" class="ai-plus-btn" title="把当前 ROI/选中标注的坐标写进任务" aria-label="判读当前选区">+</button>
+            <button id="ai-task-jump" class="ai-plus-btn" data-i18n-title="ai.taskjump.title" title="把当前 ROI/选中标注的坐标写进任务" aria-label="判读当前选区" data-i18n-aria="ai.taskjump.aria">+</button>
             <textarea id="ai-task" class="ai-task" rows="1"></textarea>
-            <button id="ai-stop-btn" class="ai-send-btn stop" style="display:none;" title="停止读片" aria-label="停止">
+            <button id="ai-stop-btn" class="ai-send-btn stop" style="display:none;" data-i18n-title="ai.stop.title" title="停止读片" aria-label="停止" data-i18n-aria="ai.stop.aria">
               <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>
             </button>
-            <button id="ai-start-btn" class="ai-send-btn" title="开始读片" aria-label="开始">
+            <button id="ai-start-btn" class="ai-send-btn" data-i18n-title="ai.start.title" title="开始读片" aria-label="开始" data-i18n-aria="ai.start.aria">
               <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
                 <path d="M10 15V4.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
                 <path d="M5 9l5-5 5 5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -335,6 +341,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260807branch"></script>
+  <script src="/static/app.js?v=20260807i18n2"></script>
 </body>
 </html>
