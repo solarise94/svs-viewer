@@ -8,6 +8,10 @@
  *
  * Env:
  *   AI_SIDECAR_PORT   listen port (default 8055)
+ *   AI_SIDECAR_HOST   listen host (default 127.0.0.1). 容器里设 0.0.0.0：
+ *                     分享门户容器（svs-share，combined_app 同端口也挂
+ *                     /api/ai/*）需要跨容器经 podman 内网访问本 sidecar；
+ *                     不发布宿主端口，8055 只在容器网络内可达。
  *   AI_FLASK_URL      Flask callback base URL (default http://127.0.0.1:8000)
  *   SHARE_DATA_DIR    data dir (sessions live under <dir>/ai_sessions)
  *   AI_INTERNAL_TOKEN shared callback token (else read from data dir)
@@ -42,7 +46,7 @@ async function main(): Promise<void> {
 	const runner = new AgentRunner(store, bus, flask);
 
 	const port = parseInt(process.env.AI_SIDECAR_PORT || "", 10) || 8055;
-	const host = "127.0.0.1";
+	const host = process.env.AI_SIDECAR_HOST || "127.0.0.1";
 	const server = new SidecarServer({ host, port, store, bus, flask, runner });
 	await server.start();
 	console.log(`[sidecar] listening on http://${host}:${port}`);

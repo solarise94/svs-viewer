@@ -72,6 +72,7 @@ ENV PORT=8000 \
     UPLOAD_DIR=/data/uploads \
     SHARE_DATA_DIR=/data/share \
     AI_SIDECAR_PORT=8055 \
+    AI_SIDECAR_HOST=0.0.0.0 \
     AI_FLASK_URL=http://127.0.0.1:8000 \
     AI_SIDECAR_URL=http://127.0.0.1:8055
 
