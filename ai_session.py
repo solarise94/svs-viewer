@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "reserve_tokens": 16000,
     "safety_margin": 8192,
     "keep_recent_tokens": 20000,
+    "keep_recent_images": 6,
     "fork_active_limit": 20,
     "lease_ttl": 150.0,
     "event_buffer": 200,

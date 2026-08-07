@@ -1246,6 +1246,17 @@ def api_ai_config():
     # 会话调优参数（数字类型，§8.1）
     for k in ai_session.DEFAULT_CONFIG:
         if k in body:
+            # keep_recent_images 必须是正整数（<=0 / 非法忽略并 400，
+            # 与其它字段的拒绝风格一致）。
+            if k == "keep_recent_images":
+                try:
+                    iv = int(body[k])
+                except (TypeError, ValueError):
+                    return jsonify(error="keep_recent_images 需为整数"), 400
+                if iv <= 0:
+                    return jsonify(error="keep_recent_images 需为正整数"), 400
+                cfg[k] = iv
+                continue
             try:
                 cfg[k] = float(body[k]) if isinstance(body[k], float) else int(body[k])
             except (TypeError, ValueError):

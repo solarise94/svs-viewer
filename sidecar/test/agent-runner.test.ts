@@ -377,3 +377,214 @@ describe("AgentRunner.runMain — transient error retry", () => {
 		expect((retries[0]!.payload as { reason: string }).reason).toMatch(/reconnection 1\/3/);
 	}, 30000);
 });
+
+// =========================================================================== //
+// Compaction (Step 4): threshold trigger, spot-index injection, summary-failure
+// non-fatal, and the context_length_exceeded force-compact fallback.
+// =========================================================================== //
+
+/** A fake Models.completeSimple that returns a scripted summary. */
+function fakeCompactionModels(summary: string, opts: { fail?: boolean; calls?: { count: number } } = {}): { completeSimple: (m: unknown, c: unknown, o?: unknown) => Promise<AssistantMessage> } {
+	return {
+		completeSimple: async () => {
+			if (opts.calls) opts.calls.count += 1;
+			return {
+				role: "assistant",
+				content: [{ type: "text", text: opts.fail ? "" : summary }],
+				api: "openai-completions",
+				provider: "cpa-gateway",
+				model: "test-model",
+				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: opts.fail ? "error" : "stop",
+				errorMessage: opts.fail ? "summarization failed" : undefined,
+				timestamp: Date.now(),
+			} as AssistantMessage;
+		},
+	};
+}
+
+describe("AgentRunner.runMain — compaction (Step 4)", () => {
+	it("triggers a threshold compaction at turn_end, emits session_compacted, and the summary enters the message stream", async () => {
+		// Tiny context window + reserve so the first turn's usage+trailing
+		// estimate crosses the threshold. Turn 0 = goto (tool call, not terminal),
+		// turn 1 = finish. The compaction fires after turn 0's turn_end.
+		const calls = { count: 0 };
+		const compactionModels = fakeCompactionModels("## Goal\ncompacted history\n", { calls });
+		const { fn } = makeFakeStreamFn([
+			{ toolCalls: [{ id: "tc-goto", name: "goto", arguments: { x: 2000, y: 1500, level: 2 } }] },
+			{ toolCalls: [{ id: "tc-fin", name: "finish", arguments: { summary: "done" } }] },
+		]);
+		const h: Harness = await newHarness(fn, { compactionModels });
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, context_window_tokens: 10, reserve_tokens: 2, keep_recent_tokens: 3 },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		expect(status).toBe("finished");
+
+		// session_compacted was emitted with tokens_before/after.
+		const compacted = h.events.filter((e) => e.type === "session_compacted");
+		expect(compacted.length).toBeGreaterThanOrEqual(1);
+		const pl = compacted[0]!.payload as Record<string, unknown>;
+		expect(pl.tokens_before).toBeGreaterThan(0);
+		expect(typeof pl.tokens_after).toBe("number");
+		// The summarizer was actually called.
+		expect(calls.count).toBeGreaterThanOrEqual(1);
+
+		// The transcript persisted on disk contains a compactionSummary message
+		// carrying the generated summary (so the next request carries it → no
+		// amnesia).
+		const data = await h.store.readSession(sessionId);
+		const roles = (data!.messages as Array<{ role?: string }>).map((m) => m.role);
+		expect(roles).toContain("compactionSummary");
+		const summaryMsg = data!.messages.find((m) => (m as { role?: string }).role === "compactionSummary") as { summary?: string };
+		expect(summaryMsg?.summary).toContain("compacted history");
+
+		// compaction_entries log recorded the run.
+		expect(data!.compaction_entries.length).toBeGreaterThanOrEqual(1);
+	}, 30000);
+
+	it("injects the spot-index snapshot after compaction (spot_cursor advances)", async () => {
+		// Seed a visible spot so buildSpotIndexMessage produces a message.
+		const compactionModels = fakeCompactionModels("summary");
+		const { fn } = makeFakeStreamFn([
+			{ toolCalls: [{ id: "tc-goto", name: "goto", arguments: { x: 2000, y: 1500, level: 2 } }] },
+			{ toolCalls: [{ id: "tc-fin", name: "finish", arguments: { summary: "done" } }] },
+		]);
+		const h: Harness = await newHarness(fn, { compactionModels });
+		// Add a visible spot the flask mock will return.
+		h.mock.spotChanges.push({ annotation_id: "spot-1", deleted: false, x: 100, y: 200, side_px: 50, note: "seen", change_seq: 1 });
+		h.mock.currentSeq = 1;
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, context_window_tokens: 10, reserve_tokens: 2, keep_recent_tokens: 3 },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		await waitForSettle(h.store, sessionId, 30000);
+		const data = await h.store.readSession(sessionId);
+		// The spot-index user message text (post-compaction) is present.
+		const texts = (data!.messages as Array<{ content?: unknown }>)
+			.flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+			.map((b) => (b as { text?: string }).text || "");
+		expect(texts.some((t) => t.includes("当前切片标注库快照（待复核线索，非诊断事实）"))).toBe(true);
+		expect(texts.some((t) => t.includes("goto 请对准中心"))).toBe(true);
+		// spot_cursor advanced to the current seq.
+		expect(data!.spot_cursor).toBe(1);
+	}, 30000);
+
+	it("does not break the run when the summarizer fails (non-fatal)", async () => {
+		const calls = { count: 0 };
+		const compactionModels = fakeCompactionModels("", { fail: true, calls });
+		const { fn } = makeFakeStreamFn([
+			{ toolCalls: [{ id: "tc-goto", name: "goto", arguments: { x: 2000, y: 1500, level: 2 } }] },
+			{ toolCalls: [{ id: "tc-fin", name: "finish", arguments: { summary: "done" } }] },
+		]);
+		const h: Harness = await newHarness(fn, { compactionModels });
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, context_window_tokens: 10, reserve_tokens: 2, keep_recent_tokens: 3 },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		// Run still finishes (compaction failure is non-fatal).
+		expect(status).toBe("finished");
+		// The summarizer was attempted.
+		expect(calls.count).toBeGreaterThanOrEqual(1);
+		// No session_compacted event (compaction did not succeed).
+		const compacted = h.events.filter((e) => e.type === "session_compacted");
+		expect(compacted.length).toBe(0);
+		// No compactionSummary in the transcript.
+		const data = await h.store.readSession(sessionId);
+		const roles = (data!.messages as Array<{ role?: string }>).map((m) => m.role);
+		expect(roles).not.toContain("compactionSummary");
+	}, 30000);
+
+	it("force-compacts and retries once when the model returns context_length_exceeded, emitting session_compacted{reason}", async () => {
+		const calls = { count: 0 };
+		const compactionModels = fakeCompactionModels("force-summary", { calls });
+		// Turn 0 errors with context_length_exceeded; the wrapper force-compacts
+		// and retries. The retry lands on the same turn index (assistantCount=0
+		// still), so script[0] is re-used — but we want the retry to succeed, so
+		// we rely on the wrapper's one-shot retry calling realStreamFn again with
+		// the compacted context (assistantCount is still 0 → script[0] again).
+		// To make the retry succeed, script[0] must NOT error on the second call.
+		// makeFakeStreamFn's injectError fires whenever assistantCount===atTurn,
+		// which would loop forever. So we use a custom fake that errors only once.
+		let errored = false;
+		const fn = function (_model: unknown, context: unknown) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				const ctx = context as { messages?: Array<{ role?: string }> };
+				const assistantCount = (ctx.messages || []).filter((m) => m.role === "assistant").length;
+				if (assistantCount === 0 && !errored) {
+					errored = true;
+					const errAssistant = makeRawAssistant([{ type: "text", text: "" }], "error");
+					errAssistant.errorMessage = "this request hit the context_length_exceeded limit";
+					stream.push({ type: "error", reason: "error", error: errAssistant });
+					stream.end(errAssistant);
+					return;
+				}
+				// Success path: finish on turn 0 (post-compact retry) or beyond.
+				const content: AssistantMessage["content"] = [{ type: "toolCall", id: "tc-fin", name: "finish", arguments: { summary: "done" } as never } as never];
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "start", partial: makeRawAssistant([], "pending") });
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const h: Harness = await newHarness(fn as never, { compactionModels });
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, context_window_tokens: 10, reserve_tokens: 2, keep_recent_tokens: 3 },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		// The force-compact succeeded and the retry finished.
+		expect(status).toBe("finished");
+		// session_compacted carries the context_length_exceeded reason.
+		const compacted = h.events.filter((e) => e.type === "session_compacted");
+		expect(compacted.length).toBeGreaterThanOrEqual(1);
+		const pl = compacted.find((e) => (e.payload as { reason?: string }).reason === "context_length_exceeded");
+		expect(pl).toBeDefined();
+		expect(calls.count).toBeGreaterThanOrEqual(1);
+	}, 30000);
+
+	it("treats a second context_length_exceeded (after compact) as terminal → agent_error", async () => {
+		const compactionModels = fakeCompactionModels("force-summary");
+		// Always error with context_length_exceeded, every call. The wrapper
+		// force-compacts once then retries; the retry errors again → terminal.
+		// A larger window is used so the threshold path doesn't double-compact
+		// (only the force-compact from the error path runs).
+		const fn = function (_model: unknown, _context: unknown) {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				const errAssistant = makeRawAssistant([{ type: "text", text: "" }], "error");
+				errAssistant.errorMessage = "context_length_exceeded";
+				stream.push({ type: "error", reason: "error", error: errAssistant });
+				stream.end(errAssistant);
+			})();
+			return stream;
+		};
+		const h: Harness = await newHarness(fn as never, { compactionModels });
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, context_window_tokens: 500, reserve_tokens: 50, keep_recent_tokens: 200 },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		expect(status).toBe("error");
+		// At least one force-compact (reason: context_length_exceeded), then agent_error.
+		const compacted = h.events.filter((e) => e.type === "session_compacted");
+		expect(compacted.length).toBeGreaterThanOrEqual(1);
+		expect(compacted.some((e) => (e.payload as { reason?: string }).reason === "context_length_exceeded")).toBe(true);
+		const errs = h.events.filter((e) => e.type === "agent_error");
+		expect(errs.length).toBeGreaterThanOrEqual(1);
+	}, 30000);
+});

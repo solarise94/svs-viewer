@@ -24,9 +24,10 @@
  * in the background and reports completion via the event bus (the SSE stream
  * tails the bus and the session status).
  */
-import { Agent, type AgentEvent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentEvent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
 	AssistantMessage,
+	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Message,
 	Usage,
@@ -54,6 +55,19 @@ import {
 export { SessionConflict };
 import type { FlaskClient, RegionResult, RoiDict } from "./flask-client.js";
 import { SessionEventBus } from "./events.js";
+import {
+	buildSpotIndexMessage,
+	checkShouldCompact,
+	persistCompaction,
+	prevCompactionInputs,
+	resolveCompactionSettings,
+	runCompaction,
+	type ResolvedCompactionSettings,
+} from "./compaction.js";
+import {
+	makeTransformContext,
+	resolveTransformSettings,
+} from "./transform-context.js";
 
 // =========================================================================== //
 // Public config / option types
@@ -68,6 +82,14 @@ export interface RunConfig extends AiEngineConfig {
 	max_steps?: number;
 	/** Active fork limit before oldest non-running fork is archived (app.py:1917). */
 	fork_active_limit?: number;
+	/** Max materialized images retained per request by transformContext (default 6). */
+	keep_recent_images?: number;
+	/** Tokens reserved for summary prompt + output in compaction (default 16384). */
+	reserve_tokens?: number;
+	/** Approximate recent-context tokens kept after compaction (default 20000). */
+	keep_recent_tokens?: number;
+	/** Legacy field (ai_session.py safety_margin); accepted but unused. */
+	safety_margin?: number;
 }
 
 /** Common run arguments. `config` is required. */
@@ -80,6 +102,12 @@ export interface RunArgs {
 export interface AgentRunnerOverrides {
 	/** Override the streamFn used by the pi Agent (tests pass a fake). */
 	streamFn?: (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream;
+	/**
+	 * Override the Models used by compaction's summarizer (tests pass a fake
+	 * completeSimple). When unset, compaction uses the model's real registered
+	 * catalog (buildModel). Production never sets this.
+	 */
+	compactionModels?: { completeSimple: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> };
 }
 
 // =========================================================================== //
@@ -419,8 +447,17 @@ export class AgentRunner {
 		initialMessages: PersistedAgentMessage[],
 		_continued: boolean,
 	): Promise<void> {
-		const { model } = buildModel(config);
+		const { models, model } = buildModel(config);
 		const maxSteps = Math.max(1, Math.floor(config.max_steps ?? 50));
+
+		// Compaction + transform settings, resolved once per run.
+		const compactionSettings = resolveCompactionSettings(config);
+		const transformSettings = resolveTransformSettings(config);
+
+		// Session-level mutable: the first snapshot's toolCallId, used by
+		// transformContext to protect the whole-slide overview from eviction.
+		// Set when the first snapshot_captured event fires for this run.
+		const firstSnapshotToolCallIdRef = { value: <string | null>null };
 
 		// Tools + tool context (tools.ts). emit routes domain events to the bus.
 		const toolCtx: ToolContext = {
@@ -432,15 +469,85 @@ export class AgentRunner {
 			flask: this.flask,
 			emit: (type, payload) => {
 				// Fire-and-forget; emit is async but tools need not await each.
+				// Track the first snapshot so transformContext can protect it.
+				if (type === "snapshot_captured" && firstSnapshotToolCallIdRef.value === null) {
+					const sid = (payload as { snapshot_id?: string } | undefined)?.snapshot_id;
+					if (sid) firstSnapshotToolCallIdRef.value = sid;
+				}
 				void this.bus.emit(sessionId, type, payload);
 			},
 			cfg: config as unknown as Record<string, unknown>,
 		};
 		const tools = createTools(toolCtx);
 
-		// StreamFn with transient-error retry (ai_agent.py:597-608).
+		// transformContext hook: materialize image_ref + evict old images. Bound
+		// to this run's flask/slide/settings/first-snapshot id.
+		const transformContext = makeTransformContext({
+			flask: this.flask,
+			slide,
+			slideInfo,
+			settings: transformSettings,
+			firstSnapshotToolCallIdRef,
+		});
+
+		/**
+		 * Run a compaction pass against the agent's current messages, apply the
+		 * result in place (compactionSummary + retained tail + spot-index),
+		 * emit session_compacted, and persist. Used by both the turn_end
+		 * threshold path and the context_length_exceeded fallback. Returns the
+		 * new message list on success, or null if compaction was a no-op or
+		 * failed (the fallback treats null as "give up").
+		 */
+		const runCompactionPass = async (reason?: string): Promise<AgentMessage[] | null> => {
+			const data = await this.store.readSession(sessionId);
+			if (!data) return null;
+			const prev = prevCompactionInputs(data);
+			const msgs = agent.state.messages.slice();
+			const outcome = await runCompaction({
+				messages: msgs,
+				settings: compactionSettings,
+				models: (this.overrides.compactionModels as never) ?? models,
+				model,
+				prevSummary: prev.summary,
+				prevRetainedTail: prev.retainedTail,
+				prevTokensBefore: prev.tokensBefore,
+			});
+			if (!outcome) return null;
+
+			// Append a spot-index user message after the summary + retained tail
+			// (ai_session.py:954 _inject_spot_index), updating spot_cursor.
+			let finalMessages = outcome.messages.slice();
+			const spot = await buildSpotIndexMessage(this.flask, slide);
+			if (spot) {
+				finalMessages = [...finalMessages, spot.message];
+			}
+			// Apply to the agent's message state (replace in place).
+			(agent.state as { messages: unknown[] }).messages = finalMessages;
+			// Persist + emit session_compacted.
+			await persistCompaction(this.store, sessionId, outcome, finalMessages, reason);
+			await this.store.withLock(sessionId, async (d) => {
+				if (!d) return null;
+				if (spot) d.spot_cursor = spot.newCursor;
+				d.updated_at = Math.floor(Date.now() / 1000);
+				await this.store.writeSession(sessionId, d);
+				return d;
+			});
+			await this.bus.emit(sessionId, "session_compacted", {
+				tokens_before: outcome.tokensBefore,
+				tokens_after: outcome.tokensAfter,
+				...(reason ? { reason } : {}),
+			});
+			return finalMessages;
+		};
+
+		// StreamFn with transient-error retry + context_length_exceeded fallback
+		// (ai_agent.py:582-608). The fallback force-compacts then retries once.
+		// transformContext is passed in so the in-wrapper retry (which bypasses
+		// pi's per-request transform) still strips image_ref blocks. The fatal
+		// "second context-exceeded" case is detected in the message_end handler
+		// (pi surfaces the streamFn's terminal error there), not here.
 		const stepRef = { current: -1 };
-		const streamFn = this.makeRetryingStreamFn(sessionId, config, stepRef);
+		const streamFn = this.makeRetryingStreamFn(sessionId, config, stepRef, runCompactionPass, transformContext);
 
 		// Run-state machine for event mapping.
 		const runState: RunState = {
@@ -467,6 +574,7 @@ export class AgentRunner {
 
 		const agent = new Agent({
 			streamFn: streamFn as Agent["streamFunction"],
+			transformContext,
 			getApiKey: () => config.api_key,
 			initialState: {
 				model: model as never,
@@ -493,8 +601,30 @@ export class AgentRunner {
 		// the loop with the nudge as a new user turn — exactly mirroring
 		// Python's `append user msg + continue`.
 
+		/**
+		 * Threshold compaction check (ai_session.py:908 maybe_compact). Called at
+		 * turn_end: estimate context tokens off the agent's current messages
+		 * (pi's usage+trailing estimator, fixing the old Python one-turn lag) and
+		 * compact when over `context_window - reserve_tokens`.
+		 *
+		 * Only fires when the turn did not already settle into a terminal/paused
+		 * state (no point compacting a run that's about to stop).
+		 */
+		const maybeCompact = async (): Promise<void> => {
+			if (runState.finished || runState.paused || runState.errored || runState.hitMaxSteps) return;
+			const check = checkShouldCompact(agent.state.messages.slice(), compactionSettings);
+			if (!check.should) return;
+			// Compact failure is non-fatal: log + continue with the un-compacted
+			// context (no session_compacted event emitted).
+			try {
+				await runCompactionPass();
+			} catch (e) {
+				console.warn(`[compaction] threshold compact failed for ${sessionId}: ${(e as Error)?.message || e}`);
+			}
+		};
+
 		const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
-			await this.handleAgentEvent(sessionId, event, runState, stepRef, agent);
+			await this.handleAgentEvent(sessionId, event, runState, stepRef, agent, maybeCompact);
 		});
 
 		try {
@@ -531,6 +661,7 @@ export class AgentRunner {
 		runState: RunState,
 		stepRef: { current: number },
 		agent: Agent,
+		maybeCompact: () => Promise<void>,
 	): Promise<void> {
 		switch (event.type) {
 			case "turn_start": {
@@ -549,6 +680,24 @@ export class AgentRunner {
 				if (event.message.role === "assistant") {
 					const msg = event.message as AssistantMessage;
 					runState.lastAssistant = msg;
+					// Fatal post-compact context-exceeded (ai_agent.py:594-596):
+					// if the streamFn already force-compacted once (recorded in
+					// compaction_entries) and the model STILL returns a context-
+					// length error, the run cannot recover → agent_error. Detected
+					// here (not in the streamFn wrapper) because pi surfaces the
+					// streamFn's terminal error as an assistant message_end whose
+					// stopReason is "error".
+					if (msg.stopReason === "error" && isContextExceeded(msg.errorMessage || "")) {
+						const data = await this.store.readSession(sessionId);
+						const alreadyCompacted = (data?.compaction_entries || []).length > 0;
+						if (alreadyCompacted && !runState.errored) {
+							runState.errored = true;
+							await this.bus.emit(sessionId, "agent_error", {
+								error: `调用模型失败：${msg.errorMessage || "context_length_exceeded"}`,
+								step: stepRef.current,
+							});
+						}
+					}
 					// length → paused (ai_agent.py:637-646). pi already fails the
 					// (possibly truncated) tool calls; we just pause.
 					if (msg.stopReason === "length") {
@@ -599,6 +748,10 @@ export class AgentRunner {
 						}
 					}
 				}
+				// Threshold compaction (ai_session.py:908 maybe_compact). Runs
+				// after the turn fully settles (usage recorded, finish detected).
+				// No-op when the turn ended the run or compaction isn't needed.
+				await maybeCompact();
 				break;
 			}
 			case "agent_end": {
@@ -710,19 +863,24 @@ export class AgentRunner {
 	// Retrying streamFn wrapper (ai_agent.py:597-608)
 	// =========================================================================== //
 	/**
-	 * Wrap a real streamFn so transient errors (SSL/timeout/429/5xx) retry up
-	 * to 3 times with 2/4/8s backoff, emitting `agent_retrying` each attempt.
-	 * Context-window errors are NOT retried (Step 4 adds compaction); other
-	 * errors pass through unchanged.
+	 * Wrap a real streamFn so:
+	 *   - transient errors (SSL/timeout/429/5xx) retry up to 3 times with
+	 *     2/4/8s backoff, emitting `agent_retrying` each attempt;
+	 *   - context-window errors (ai_agent.py:582-596) trigger a one-shot
+	 *     force-compact (skipping the threshold check) then retry the call once
+	 *     with the re-materialized messages; a second failure is terminal.
 	 *
-	 * The wrapper consumes each underlying stream to completion; on a transient
+	 * The wrapper consumes each underlying stream to completion; on a retryable
 	 * error it starts a fresh stream. The wrapper itself returns a single
-	 * combined AssistantMessageEventStream.
+	 * combined AssistantMessageEventStream. Events from the failed first stream
+	 * are forwarded (so the UI sees the attempt), then superseded by the retry.
 	 */
 	private makeRetryingStreamFn(
 		sessionId: string,
 		config: RunConfig,
 		stepRef: { current: number },
+		forceCompact: (reason?: string) => Promise<AgentMessage[] | null>,
+		transformContext: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
 	): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
 		const realStreamFn = (this.overrides.streamFn ??
 			// Default: bind the openai-completions streamSimple for the built
@@ -739,10 +897,12 @@ export class AgentRunner {
 			const out = createAssistantMessageEventStream();
 			void (async () => {
 				const maxTransient = 3;
+				let compacted = false; // one-shot context-exceeded guard
+				let currentContext = context;
 				for (let attempt = 0; ; attempt++) {
 					let stream: AssistantMessageEventStream;
 					try {
-						stream = realStreamFn(model, context, options);
+						stream = realStreamFn(model, currentContext, options);
 					} catch (e) {
 						// streamFn contract says it must not throw, but be defensive.
 						out.push({
@@ -755,34 +915,79 @@ export class AgentRunner {
 					}
 					let finalMessage: AssistantMessage | null = null;
 					let eventType: "done" | "error" | null = null;
+					let terminalEvent: AssistantMessageEvent | null = null;
 					try {
 						for await (const ev of stream) {
 							if (ev.type === "done") {
 								finalMessage = ev.message;
 								eventType = "done";
+								terminalEvent = ev; // hold back; decide below
 							} else if (ev.type === "error") {
 								finalMessage = ev.error;
 								eventType = "error";
+								terminalEvent = ev; // hold back; decide below
+							} else {
+								// Forward non-terminal events (text_delta, etc.) live so
+								// streaming stays responsive.
+								out.push(ev);
 							}
-							out.push(ev);
-							// On done/error we stop forwarding further events
-							// from this underlying stream; the for-await will
-							// end naturally.
+							// On done/error we stop forwarding further events from this
+							// underlying stream; the for-await will end naturally.
 						}
 					} catch (e) {
 						finalMessage = makeErrorAssistant(String((e as Error)?.message || e));
 						eventType = "error";
+						terminalEvent = { type: "error", reason: "error", error: finalMessage };
 					}
 
 					if (eventType === "done") {
+						// Forward the held-back done event, then end.
+						if (terminalEvent) out.push(terminalEvent);
 						out.end(finalMessage!);
 						return;
 					}
 					if (eventType === "error" && finalMessage) {
 						const errMsg = finalMessage.errorMessage || "";
-						if (isContextExceeded(errMsg)) {
-							// Not retried here (Step 4 compaction). Forward as-is.
+						// Helper to forward the held-back terminal error event then end.
+						const forwardTerminalError = (): void => {
+							out.push(terminalEvent as AssistantMessageEvent);
 							out.end(finalMessage);
+						};
+						// Context-window exceeded: force-compact once, rebuild the
+						// context from the compacted messages, retry once. A second
+						// failure (or compact failure) is terminal.
+						if (isContextExceeded(errMsg) && !compacted) {
+							compacted = true;
+							let newMessages: AgentMessage[] | null = null;
+							try {
+								newMessages = await forceCompact("context_length_exceeded");
+							} catch (e) {
+								console.warn(`[compaction] force-compact threw for ${sessionId}: ${(e as Error)?.message || e}`);
+							}
+							if (newMessages) {
+								// Re-materialize the context: forceCompact rewrote
+								// agent.state.messages in place AND returned the new
+								// list. The retry bypasses pi's per-request
+								// transformContext, so we run it inline here to keep
+								// the image_ref-elimination contract (any image_ref
+								// in the compacted tail must become a real image or
+								// a text fallback before the LLM sees it).
+								const transformed = await transformContext(newMessages).catch(() => newMessages);
+								currentContext = { ...(currentContext as object), messages: transformed };
+								attempt = -1; // next iteration → attempt 0 again
+								continue;
+							}
+							// compact failed → forward the error; the message_end
+							// handler treats a context-exceeded error after a
+							// compaction as terminal agent_error.
+							forwardTerminalError();
+							return;
+						}
+						if (isContextExceeded(errMsg)) {
+							// Already compacted once and still over → forward; the
+							// message_end handler emits the terminal agent_error
+							// (ai_agent.py:594-596).
+							forwardTerminalError();
 							return;
 						}
 						if (isTransientError(errMsg) && attempt < maxTransient) {
@@ -797,10 +1002,11 @@ export class AgentRunner {
 							await sleep(delay * 1000);
 							continue; // retry the model call
 						}
-						out.end(finalMessage);
+						forwardTerminalError();
 						return;
 					}
 					// Stream ended without a terminal event (shouldn't happen).
+					out.push({ type: "error", reason: "error", error: makeErrorAssistant("Stream ended without a terminal event") });
 					out.end(makeErrorAssistant("Stream ended without a terminal event"));
 					return;
 				}

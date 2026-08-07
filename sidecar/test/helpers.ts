@@ -252,7 +252,10 @@ export interface Harness {
 
 let rootTmp = "";
 
-export async function newHarness(fakeStreamFn: (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream): Promise<Harness> {
+export async function newHarness(
+	fakeStreamFn: (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream,
+	overrides: { compactionModels?: { completeSimple: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> } } = {},
+): Promise<Harness> {
 	if (!rootTmp) {
 		rootTmp = await fs.mkdtemp(join(tmpdir(), "svs-step3-"));
 	}
@@ -261,7 +264,10 @@ export async function newHarness(fakeStreamFn: (model: unknown, context: unknown
 	const store = new SessionStore({ sessionsDir: dir });
 	const bus = new SessionEventBus(store);
 	const mock = makeMockFlask();
-	const runner = new AgentRunner(store, bus, mock as unknown as FlaskClient, { streamFn: fakeStreamFn as never });
+	const runner = new AgentRunner(store, bus, mock as unknown as FlaskClient, {
+		streamFn: fakeStreamFn as never,
+		...(overrides.compactionModels ? { compactionModels: overrides.compactionModels } : {}),
+	});
 	const events: Array<{ seq: number; type: string; payload: Record<string, unknown> }> = [];
 	const watch = (sessionId: string) => {
 		bus.subscribe(sessionId, (seq, type, payload) => {
