@@ -54,6 +54,24 @@ cleanup() {
 trap cleanup TERM INT
 
 # --------------------------------------------------------------------------- #
+# 0) 预生成 internal 回调共享 token。
+# 启动顺序是 sidecar 先于 Flask，但 token 文件由 Flask 首 boot 才创建——
+# sidecar 启动时读不到会直接 ENOENT 退出（鸡生蛋问题）。这里在起 sidecar
+# 前确保文件存在；Flask 的 _load_or_create_ai_internal_token 会读到同一文件。
+# --------------------------------------------------------------------------- #
+SHARE_DATA_DIR="${SHARE_DATA_DIR:-/data/share}"
+if [ -z "${AI_INTERNAL_TOKEN:-}" ]; then
+    TOKEN_FILE="$SHARE_DATA_DIR/ai_internal.token"
+    if [ ! -f "$TOKEN_FILE" ]; then
+        mkdir -p "$SHARE_DATA_DIR" 2>/dev/null || true
+        # python3 生成 32 字节 hex（容器内必有 python3；进程替换避免落盘中间态）。
+        python3 -c 'import secrets; print(secrets.token_hex(32))' > "$TOKEN_FILE" \
+            && chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+        echo "[entry] generated ai_internal.token" >&2
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
 # 1) 起 sidecar（后台）
 # --------------------------------------------------------------------------- #
 echo "[entry] starting AI sidecar ($SIDECAR_BIN)" >&2
@@ -68,8 +86,9 @@ HEALTHZ_URL="${SIDECAR_URL%/}/healthz"
 READY=0
 i=0
 while [ "$i" -lt 60 ]; do
-    # node 退出码 0 表示 /healthz 返回 200。
-    if node -e '
+    # node 退出码 0 表示 /healthz 返回 200。env 必须作为命令前缀
+    # （写在 -e 脚本后面会变成 argv 而非环境变量，探活恒失败）。
+    if SVS_HEALTHZ_URL="$HEALTHZ_URL" node -e '
         const http = require("http");
         const url = new URL(process.env.SVS_HEALTHZ_URL);
         const req = http.get(
@@ -78,7 +97,7 @@ while [ "$i" -lt 60 ]; do
         );
         req.on("error", () => process.exit(1));
         req.on("timeout", () => { req.destroy(); process.exit(1); });
-    ' SVS_HEALTHZ_URL="$HEALTHZ_URL" 2>/dev/null; then
+    ' 2>/dev/null; then
         READY=1
         break
     fi

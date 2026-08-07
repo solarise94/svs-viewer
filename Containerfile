@@ -61,7 +61,7 @@ COPY --from=builder /build/package.json /app/sidecar/package.json
 
 # Flask 应用源码（注意：旧 ai_agent.py / ai_session.py / ai_protocol.py 已在
 # pi 迁移中删除，此处不再 COPY）。
-COPY app.py share_server.py share_store.py slide_io.py slide_cache.py ./
+COPY app.py share_server.py share_store.py slide_io.py slide_cache.py share_entry.sh ./
 COPY docker_entry.sh ./
 RUN chmod +x docker_entry.sh
 COPY templates/ templates/
