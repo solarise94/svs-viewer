@@ -129,6 +129,68 @@ def _load_or_create_secret_key() -> str:
 
 app.secret_key = _load_or_create_secret_key()
 
+
+# --------------------------------------------------------------------------- #
+# AI sidecar 共享 token（internal 回调端点鉴权，pi 迁移 Step 2）
+# --------------------------------------------------------------------------- #
+# sidecar（Node）进程与本进程内部回调用同一 token 互信：env AI_INTERNAL_TOKEN
+# 优先；缺省则读/生成 SHARE_DATA_DIR/ai_internal.token（0600，32 字节 hex）。
+# sidecar 进程用同一规则解析 token（env 优先，否则读同一文件）。
+def _load_or_create_ai_internal_token() -> str:
+    """优先 env AI_INTERNAL_TOKEN；否则在数据目录下持久化随机 token（0600）。
+
+    与 secret key 同样用 fcntl 排他锁包裹「检查+生成+写」，保证多 worker
+    首次生成时只写一次、其余 worker 读到同一 token。
+    """
+    env_tok = os.environ.get("AI_INTERNAL_TOKEN")
+    if env_tok:
+        return env_tok
+    data_dir = _data_dir_for_secret()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    tok_file = data_dir / "ai_internal.token"
+
+    def _read_or_create_locked():
+        if tok_file.is_file():
+            try:
+                return tok_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+        tok = secrets.token_hex(32)
+        tok_file.write_text(tok, encoding="utf-8")
+        try:
+            os.chmod(tok_file, 0o600)
+        except OSError:
+            pass
+        return tok
+
+    try:
+        import fcntl
+
+        lock_file = data_dir / "ai_internal.lock"
+        with open(lock_file, "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                return _read_or_create_locked()
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        return _read_or_create_locked()
+
+
+AI_INTERNAL_TOKEN = _load_or_create_ai_internal_token()
+
+
+def _require_internal():
+    """internal 回调端点鉴权：校验 header X-AI-Internal-Token，失败 401。
+
+    internal 端点不走管理员 session 鉴权（_require_auth 放行 /internal/ 前缀）。
+    """
+    tok = (request.headers.get("X-AI-Internal-Token") or "").strip()
+    if not tok or not hmac.compare_digest(tok, AI_INTERNAL_TOKEN):
+        return jsonify(error="invalid_internal_token"), 401
+    return None
+
+
 # 防爆破：内存 dict 按 IP 计数 {ip: {"fails": int, "locked_until": float}}
 _auth_attempts: dict = {}
 _AUTH_FAIL_LIMIT = 5
@@ -176,6 +238,9 @@ def _require_auth():
     path = request.path
     # 放行登录页与静态资源
     if path == "/login" or path.startswith("/static/"):
+        return None
+    # internal 回调端点由 _require_internal 单独鉴权（共享 token），不走管理员 session
+    if path.startswith("/internal/"):
         return None
     if path.startswith("/api/"):
         return jsonify(error="auth_required"), 401
@@ -1387,6 +1452,185 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
         "src": {"x": x2, "y": y2, "w": w2, "h": h2},
         "magnification": mag,
     }
+
+
+# --------------------------------------------------------------------------- #
+# AI sidecar internal 回调端点（pi 迁移 Step 2）
+#
+# 这些端点供 Node sidecar 回调本进程读图/落标注/取变更/取切片信息，复用
+# 上面的内部函数（_read_region_b64 / share_store.add_roi 等），不复制逻辑。
+# 全部用 _require_internal 校验 X-AI-Internal-Token（共享 token 互信），不走
+# 管理员 session 鉴权。参数校验缺失/非法 → 400 JSON {error}。
+# --------------------------------------------------------------------------- #
+@app.route("/internal/ai/region", methods=["POST"])
+def internal_ai_region():
+    """sidecar 取 level-0 区域图（含青色坐标刻度尺）。
+
+    body: {slide, x, y, w, h, out_w?, out_h?}（level-0 整数）。
+    返回 {image_base64, mime, width, height, src, magnification}（与
+    /api/slide/<name>/region 响应同构）。
+    """
+    auth = _require_internal()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    if not isinstance(slide, str) or not slide:
+        return jsonify(error="slide 参数缺失"), 400
+
+    def _parse_int(key):
+        v = body.get(key)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    x = _parse_int("x")
+    y = _parse_int("y")
+    w = _parse_int("w")
+    h = _parse_int("h")
+    if x is None or y is None or w is None or h is None:
+        return jsonify(error="x/y/w/h 参数需为整数"), 400
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return jsonify(error="参数越界（0<=x,y，0<w,h）"), 400
+    out_w = _parse_int("out_w")
+    out_h = _parse_int("out_h")
+
+    safe = _safe_name(slide)
+    entry = _get_slide(safe)
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        mpp = meta.get("mpp_x")
+    if not out_w or out_w <= 0:
+        out_w = 1568
+    if not out_h or out_h <= 0:
+        out_h = 1568
+    r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp)
+    return jsonify({
+        "image_base64": r["image_base64"],
+        "mime": r["mime"],
+        "width": r["width"],
+        "height": r["height"],
+        "src": r["src"],
+        "magnification": r["magnification"],
+    })
+
+
+@app.route("/internal/ai/annotate", methods=["POST"])
+def internal_ai_annotate():
+    """sidecar 落矩形标注（写入标注库，管理员可见可编辑）。
+
+    body: {slide, label, x, y, side_px, note, effect_key, session_id}。
+    调 share_store.add_roi(ADMIN_TOKEN, ...)（含 _effect_key 幂等、source="ai"）。
+    返回 add_roi 的 roi dict（含 annotation_id/index）。
+    """
+    auth = _require_internal()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    label = body.get("label")
+    if not isinstance(slide, str) or not slide:
+        return jsonify(error="slide 参数缺失"), 400
+    if not isinstance(label, str) or not label.strip():
+        return jsonify(error="label 参数缺失"), 400
+
+    def _parse_num(key):
+        v = body.get(key)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_int(key):
+        v = body.get(key)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    x = _parse_num("x")
+    y = _parse_num("y")
+    side_px = _parse_int("side_px")
+    if x is None or y is None or side_px is None:
+        return jsonify(error="x/y/side_px 参数需为数值"), 400
+    if x < 0 or y < 0:
+        return jsonify(error="坐标需 ≥0"), 400
+    if side_px < 1 or side_px > 40000:
+        return jsonify(error="side_px 需在 1~40000 之间"), 400
+    note = body.get("note") or ""
+    effect_key = body.get("effect_key") or ""
+    session_id = body.get("session_id") or ""
+    # slide 文件名合法性（_safe_name 失败会 abort 400/404）
+    _safe_name(slide)
+    try:
+        roi = share_store.add_roi(
+            share_store.ADMIN_TOKEN, slide, label, type="rect", note=note,
+            x=int(x), y=int(y), side_px=side_px,
+            source="ai", created_by_session_id=session_id,
+            _effect_key=effect_key or None,
+        )
+    except ValueError as e:
+        return jsonify(error="落标注失败：{}".format(e)), 400
+    return jsonify(roi)
+
+
+@app.route("/internal/ai/spots", methods=["GET"])
+def internal_ai_spots():
+    """sidecar 增量取切片变更（含 tombstone）。
+
+    query: slide（必填）、after_seq（缺省 0）。
+    返回 {changes: [...], current_seq: int}（share_store.list_changes /
+    current_change_seq）。
+    """
+    auth = _require_internal()
+    if auth:
+        return auth
+    slide = request.args.get("slide", "")
+    if not slide:
+        return jsonify(error="slide 参数缺失"), 400
+    try:
+        after_seq = float(request.args.get("after_seq", "0") or "0")
+    except (TypeError, ValueError):
+        after_seq = 0
+    changes = share_store.list_changes(slide, after_seq)
+    current_seq = share_store.current_change_seq(slide)
+    return jsonify({"changes": changes, "current_seq": current_seq})
+
+
+@app.route("/internal/ai/slide_info", methods=["GET"])
+def internal_ai_slide_info():
+    """sidecar 取切片尺寸/金字塔/mpp/指纹。
+
+    query: slide（必填）。复用 _ai_slide_ctx 的取数逻辑（width/height/
+    level_downsamples/mpp）与 _slide_fingerprint。slide 不存在 → 404。
+    """
+    auth = _require_internal()
+    if auth:
+        return auth
+    slide = request.args.get("slide", "")
+    if not slide:
+        return jsonify(error="slide 参数缺失"), 400
+    safe = _safe_name(slide)
+    entry = _get_slide(safe)
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        width, height = osr.dimensions
+        try:
+            level_downsamples = tuple(osr.level_downsamples)
+        except Exception:  # noqa: BLE001
+            level_downsamples = (1.0,)
+        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        mpp = meta.get("mpp_x")
+    fingerprint = _slide_fingerprint(safe)
+    return jsonify({
+        "width": width,
+        "height": height,
+        "level_downsamples": list(level_downsamples),
+        "mpp": mpp,
+        "fingerprint": fingerprint,
+    })
 
 
 @app.route("/api/ai/run", methods=["POST"])
